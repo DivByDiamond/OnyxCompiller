@@ -1,3 +1,27 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-RISC--V%2064--bit-green" alt="RISC-V 64">
+  <img src="https://img.shields.io/badge/MMU-Sv39-yellow" alt="Sv39 MMU">
+  <img src="https://img.shields.io/badge/license-GPL--3.0-red" alt="GPL-3.0">
+</p>
+
+<h1 align="center">OnyxKernel</h1>
+
+<p align="center">
+<pre class="not-prose" style="text-align:center;font-family:monospace;">
+    ███████                                     
+  ███▒▒▒▒▒███                                   
+ ███     ▒▒███ ████████   █████ ████ █████ █████
+▒███      ▒███▒▒███▒▒███ ▒▒███ ▒███ ▒▒███ ▒▒███ 
+▒███      ▒███ ▒███ ▒███  ▒███ ▒███  ▒▒▒█████▒  
+▒▒███     ███  ▒███ ▒███  ▒███ ▒███   ███▒▒▒███ 
+ ▒▒▒███████▒   ████ █████ ▒▒███████  █████ █████
+   ▒▒▒▒▒▒▒    ▒▒▒▒ ▒▒▒▒▒   ▒▒▒▒▒███ ▒▒▒▒▒ ▒▒▒▒▒ 
+                           ███ ▒███             
+                          ▒▒██████              
+                           ▒▒▒▒▒▒               
+</pre>
+</p>
+
 # OnyxCC — C/C++ → RISC-V64 → .onx compiler for OnyxOS
 
 **Status:** MVP — компилирует runnable hello-world `.onx` для OnyxOS.
