@@ -104,6 +104,11 @@ int vprintf_internal(int fd, const char *fmt, va_list ap) {
             }
             fmt++;
         }
+        /* is_short is parsed for %h / %hh support; short values are
+         * currently promoted to int by the variadic ABI so no special
+         * handling is needed in the switch below. Kept for future
+         * half-word write support. */
+        (void)is_short;
 
         char spec = *fmt++;
         switch (spec) {
