@@ -418,6 +418,11 @@ type_t *parse_type_spec(lexer_t *lx) {
     bool is_short = false, is_long = false, is_longlong = false;
     bool is_const = false, is_volatile = false;
     type_t *base = NULL;
+    /* is_signed is parsed for future sign-aware codegen; currently all
+     * integer types are treated as their storage size with the sign bit
+     * taken from the base type. Kept here so the parser accepts the full
+     * C99 type-specifier grammar. */
+    (void)is_signed;
 
     for (;;) {
         switch (lx->cur.kind) {
@@ -716,6 +721,10 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
     int nargs = 0;
     int arg_regs[8] = {RV_A0, RV_A1, RV_A2, RV_A3, RV_A4, RV_A5, RV_A6, RV_A7};
     val_t args[8];
+    /* args[] preserves the evaluated argument values so a future stack-
+     * argument path (for calls with > 8 args) can spill them without
+     * re-evaluating side-effecting expressions. Currently unused. */
+    (void)args;
 
     if (lx->cur.kind != T_RPAREN) {
         for (;;) {
