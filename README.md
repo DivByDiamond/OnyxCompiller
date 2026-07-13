@@ -62,19 +62,28 @@ OnyxOS и умеет собирать сам себя, а также всю user
 ## Что НЕ работает (пока)
 
 - ❌ C++ фронтенд (структура заголовков готова, парсера нет)
-- ✅ Полная variadic arguments (`...`) — `va_start` / `va_arg` / `va_end` builtins,
-  a0–a7 save area в прологе variadic-функции
 - ❌ Линковка нескольких `.c` файлов в один `.onx` (MVP — один translation unit)
-- ❌ Float/double в codegen (типы есть, инструкции F/D не эмитятся)
-- ✅ `switch`/`case`/`default` — linear compare chain, `break` поддержан
-- ✅ `goto` и labels — как backward, так и forward jumps
-- ✅ `&&`/`||` с short-circuit семантикой (исправлен баг, когда RHS парсился
-  дважды и ломал поток токенов)
 - ❌ Глобальные инициализаторы с массивами/строками (только скаляры)
 - ❌ Compound literals, designated initializers
 - ❌ Inline assembly (заменено на `__ecallN` builtins)
 - ❌ Self-hosting: компилятор пока что не может скомпилировать сам себя
   (требует доработки парсера — не хватает нескольких C-конструкций)
+
+### Что УЖЕ работает (вопреки более ранним версиям этого README)
+
+Ранние версии этого README заявляли switch/case, goto и float/double
+как "не работает". На самом деле они реализованы:
+
+- ✅ `switch`/`case`/`default` — linear compare chain, `break` поддержан
+  (gen.c:2466)
+- ✅ `goto` и labels — как backward, так и forward jumps
+  (gen.c:2357, label table в gen.c:99)
+- ✅ Float/double в codegen (F/D расширения RISC-V) — fadd/fsub/fmul/fdiv,
+  fld/fsd, fmv.w.x/fmv.x.w, fcvt.s.l/fcvt.l.s/fcvt.d.l/fcvt.l.d/
+  fcvt.s.d/fcvt.d.s (riscv64.c:318-375)
+- ✅ Полная variadic arguments (`...`) — `va_start` / `va_arg` / `va_end` builtins,
+  a0–a7 save area в прологе variadic-функции
+- ✅ `&&`/`||` с short-circuit семантикой
 
 ## Архитектура
 
@@ -204,11 +213,11 @@ onyxcc -I /usr/onyxc/include -DDEBUG=1 -o prog.onx prog.c
 ## Roadmap
 
 ### v0.2 — Self-hosting foundation
-- [ ] Полная поддержка `switch`/`case`
-- [ ] `goto` и метки
+- [x] Полная поддержка `switch`/`case`  ✅ (gen.c:2466)
+- [x] `goto` и метки  ✅ (gen.c:2357)
 - [ ] Полноценные глобальные инициализаторы (массивы, строки)
-- [ ] Variadic arguments (для `printf`-семейства)
-- [ ] Float/double в codegen (F/D расширения RISC-V)
+- [x] Variadic arguments (для `printf`-семейства)  ✅
+- [x] Float/double в codegen (F/D расширения RISC-V)  ✅ (riscv64.c:318-375)
 - [ ] Линковка нескольких `.c` в один `.onx`
 - [ ] **Milestone:** onyxcc компилирует сам себя
 
