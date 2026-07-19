@@ -63,11 +63,9 @@ OnyxOS и умеет собирать сам себя, а также всю user
 
 - ❌ C++ фронтенд (структура заголовков готова, парсера нет)
 - ❌ Линковка нескольких `.c` файлов в один `.onx` (MVP — один translation unit)
-- ❌ Глобальные инициализаторы с массивами/строками (только скаляры)
 - ❌ Compound literals, designated initializers
 - ❌ Inline assembly (заменено на `__ecallN` builtins)
-- ❌ Self-hosting: компилятор пока что не может скомпилировать сам себя
-  (требует доработки парсера — не хватает нескольких C-конструкций)
+- ❌ Запуск на реальном Milk-V Duo S (проверено только в QEMU через OnyxOS)
 
 ### Что УЖЕ работает (вопреки более ранним версиям этого README)
 
@@ -186,13 +184,17 @@ cd ../OnyxKernel && cargo build --release -p onyx_tools
 cd ../OnyxCC && make onyxcc-onx
 ```
 
-### На OnyxOS (self-hosting, TODO)
+### Self-hosting (stage-1 — работает!)
 
-Когда компилятор станет полностью self-hosting:
+Компилятор может скомпилировать сам себя (stage-1, все 11 source-файлов):
 
 ```bash
-onyxcc -I /usr/onyxc/include -o program.onx program.c
+make selfhost-test   # компиляция всех исходников → /dev/null (проверка)
+make selfhost        # компиляция → onyxcc_self.onx (178KB)
 ```
+
+Результат — `onyxcc_self.onx`, бинарник OnyxCC, скомпилированный самим OnyxCC.
+Для запуска требуется OnyxOS (QEMU или Milk-V Duo S).
 
 ## Использование
 
@@ -212,11 +214,12 @@ onyxcc -I /usr/onyxc/include -DDEBUG=1 -o prog.onx prog.c
 
 ## Roadmap
 
-### v0.2 — Self-hosting foundation
-- [x] Полная поддержка `switch`/`case`  ✅ (gen.c:2466)
-- [x] `goto` и метки  ✅ (gen.c:2357)
-- [ ] Полноценные глобальные инициализаторы (массивы, строки)
+### v0.2 — Self-hosting foundation ✅
+- [x] Полная поддержка `switch`/`case`  ✅
+- [x] `goto` и метки  ✅
+- [x] Глобальные инициализаторы (массивы, строки, struct arrays)  ✅
 - [x] Variadic arguments (для `printf`-семейства)  ✅
+- [x] Self-hosting: компилятор компилирует сам себя (stage-1)  ✅
 - [x] Float/double в codegen (F/D расширения RISC-V)  ✅ (riscv64.c:318-375)
 - [ ] Линковка нескольких `.c` в один `.onx`
 - [ ] **Milestone:** onyxcc компилирует сам себя

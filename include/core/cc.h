@@ -11,10 +11,6 @@
 #ifndef CC_H
 #define CC_H
 
-#include <stdint.h>
-#include <stddef.h>
-#include <stdbool.h>
-
 #include "onx.h"
 
 /* ---- Limits ------------------------------------------------------------ */

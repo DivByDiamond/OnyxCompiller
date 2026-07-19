@@ -7,6 +7,8 @@
 #   make onyxcc-onx      # convert onyxcc.riscv.elf → onyxcc.onx
 #   make all-targets     # all of the above
 #   make libonyxc        # build libonyxc (host verification)
+#   make selfhost-test   # compile onyxcc sources with onyxcc (stage-1 verification)
+#   make selfhost        # full onyxcc self-build → onyxcc_self.onx (experimental)
 #   make test            # compile and dump hello.onx header
 #   make clean
 #
@@ -43,7 +45,9 @@ RISCV_FLAGS  = --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d -mcmodel=m
 	-ffreestanding -nostdlib -fno-builtin -Iinclude -Wall -Wno-unused-function \
 	-Wno-unused-variable -Wno-unused-but-set-variable -Wno-incompatible-pointer-types
 
-.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets
+SELFHOST_FLAGS = -DCC_FREESTANDING -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
+
+.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost
 
 all: $(ONYXCC)
 
@@ -97,6 +101,19 @@ all-targets: $(ONYXCC) hello onyxcc-onx
 	@echo "  OnyxOS binary:  onyxcc.onx"
 	@echo "  Test program:   tests/hello_full.onx"
 
+# Self-hosting test: compile onyxcc's own sources using onyxcc itself.
+# This verifies the compiler can compile its own code (stage-1).
+selfhost-test: $(ONYXCC)
+	@echo "=== Self-hosting test: compiling onyxcc sources with onyxcc ==="
+	./$(ONYXCC) $(SELFHOST_FLAGS) -o /dev/null $(ONYXCC_SRCS)
+	@echo "=== All source files compiled successfully ==="
+
+# Full self-hosting build (stage-1): produces an .onx binary.
+selfhost: $(ONYXCC)
+	./$(ONYXCC) $(SELFHOST_FLAGS) -o onyxcc_self.onx -e _start $(ONYXCC_SRCS) src/core/shim.c
+	@echo "--- onyxcc_self.onx ready ---"
+	@ls -la onyxcc_self.onx
+
 clean:
-	rm -f $(ONYXCC) $(ONYXCC_OBJS) src/core/*.o src/front/*.o src/back/*.o src/arch/*.o tests/*.onx onyxcc.riscv.elf onyxcc.onx
+	rm -f $(ONYXCC) $(ONYXCC_OBJS) src/core/*.o src/front/*.o src/back/*.o src/arch/*.o tests/*.onx onyxcc.riscv.elf onyxcc.onx onyxcc_self.onx
 	rm -rf cc/
