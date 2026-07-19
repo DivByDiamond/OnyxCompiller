@@ -37,7 +37,9 @@
 #ifndef ONYX_ONX_H
 #define ONYX_ONX_H
 
+#ifndef CC_FREESTANDING
 #include <stdint.h>
+#endif
 
 #define ONX_MAGIC            0x31584E4Fu   /* 'ONX1' LE */
 #define ONX_VERSION_1        1u

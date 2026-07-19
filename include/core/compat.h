@@ -7,32 +7,45 @@
  * On OnyxOS (freestanding build with clang + -nostdlib):
  *   - Use the shim in src/shim.c which provides minimal libc.
  *   - Declare our own struct option and getopt_long prototype.
+ *
+ * When CC_FREESTANDING is defined (self-hosting), the freestanding path
+ * is taken regardless of the host platform.
  */
 #ifndef CC_COMPAT_H
 #define CC_COMPAT_H
 
-#ifdef __linux__
-/* Pull in POSIX strdup / getopt_long */
-#ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200809L
-#endif
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-#include <ctype.h>
-#include <getopt.h>
-#else
-/* Freestanding build — declare what we use. */
-#include <stddef.h>
-#include <stdint.h>
-#include <stdarg.h>
+#if defined(CC_FREESTANDING) || !defined(__linux__)
+/* Freestanding build — provide types directly, no system headers. */
+typedef unsigned long size_t;
+typedef long ssize_t;
+typedef signed char int8_t;
+typedef short int16_t;
+typedef int int32_t;
+typedef long long int64_t;
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef long intptr_t;
+typedef unsigned long uintptr_t;
+#define NULL ((void*)0)
+#define UINT64_MAX 18446744073709551615ULL
 
-typedef struct { int dummy; } FILE;
+/* bool */
+#define bool _Bool
+#define true 1
+#define false 0
+
+/* va_list — use __builtin_va_* (handled by gen.c builtin handlers) */
+typedef __builtin_va_list va_list;
+#define va_start(v,l) __builtin_va_start(v,l)
+#define va_end(v)     __builtin_va_end(v)
+#define va_arg(v,l)   __builtin_va_arg(v,l)
+#define va_copy(d,s)  __builtin_va_copy(d,s)
+
+typedef struct { int fd; } FILE;
 extern FILE *stderr;
 extern FILE *stdout;
-
-typedef unsigned long size_t;
 
 /* stdio */
 FILE *fopen(const char *path, const char *mode);
@@ -106,6 +119,20 @@ extern int optind;
 int getopt_long(int argc, char *const argv[], const char *optstring,
                 const struct option *longopts, int *longindex);
 
-#endif /* __linux__ */
+#else
+/* Linux build — use system libc */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <ctype.h>
+#include <getopt.h>
+#endif
 
 #endif /* CC_COMPAT_H */

@@ -15,10 +15,7 @@
  * Layout matches what the OnyxKernel loader expects: entry=_start at
  * CC_TEXT_VADDR=0x10000, R+X text segment, then R rodata, then R+W data+bss.
  */
-#include <stdint.h>
-#include <stddef.h>
-#include <stdarg.h>
-#include <stdbool.h>
+#include "core/compat.h"
 
 /* ---- OnyxOS syscalls ---- */
 #define SYS_write 1
