@@ -47,7 +47,7 @@ RISCV_FLAGS  = --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d -mcmodel=m
 
 SELFHOST_FLAGS = -DCC_FREESTANDING -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
 
-.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost
+.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner
 
 all: $(ONYXCC)
 
@@ -113,6 +113,9 @@ selfhost: $(ONYXCC)
 	./$(ONYXCC) $(SELFHOST_FLAGS) -o onyxcc_self.onx -e _start $(ONYXCC_SRCS) src/core/shim.c
 	@echo "--- onyxcc_self.onx ready ---"
 	@ls -la onyxcc_self.onx
+
+test-runner: $(ONYXCC)
+	@bash scripts/test_runner.sh
 
 clean:
 	rm -f $(ONYXCC) $(ONYXCC_OBJS) src/core/*.o src/front/*.o src/back/*.o src/arch/*.o tests/*.onx onyxcc.riscv.elf onyxcc.onx onyxcc_self.onx
