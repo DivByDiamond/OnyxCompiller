@@ -3,7 +3,7 @@ set -euo pipefail
 
 TIMEOUT_SEC=10
 
-# OnyxCC test runner — compiles all tests/*.c and reports PASS/FAIL.
+# OnyxCC test runner - compiles all tests/*.c and reports PASS/FAIL.
 
 ONYXCC="./onyxcc"
 TEST_DIR="tests"
@@ -48,9 +48,9 @@ for src in "${test_files[@]}"; do
 
     if [ "$rc" -eq 124 ]; then
         fail=$((fail + 1))
-        failures="${failures}  FAIL  $name — timed out (>${TIMEOUT_SEC}s)\n"
+        failures="${failures}  FAIL  $name - timed out (>${TIMEOUT_SEC}s)\n"
         if [ "$VERBOSE" = true ]; then
-            echo "  FAIL  $name — timed out (>${TIMEOUT_SEC}s)"
+            echo "  FAIL  $name - timed out (>${TIMEOUT_SEC}s)"
         fi
         continue
     fi
@@ -64,17 +64,17 @@ for src in "${test_files[@]}"; do
         else
             fail=$((fail + 1))
             msg="no output file produced"
-            failures="${failures}  FAIL  $name — $msg\n"
+            failures="${failures}  FAIL  $name - $msg\n"
             if [ "$VERBOSE" = true ]; then
-                echo "  FAIL  $name — $msg"
+                echo "  FAIL  $name - $msg"
             fi
         fi
     else
         fail=$((fail + 1))
         first_line=$(echo "$stderr" | head -1)
-        failures="${failures}  FAIL  $name — $first_line\n"
+        failures="${failures}  FAIL  $name - $first_line\n"
         if [ "$VERBOSE" = true ]; then
-            echo "  FAIL  $name — $first_line"
+            echo "  FAIL  $name - $first_line"
         fi
     fi
 done
