@@ -1,21 +1,19 @@
 /*
- * libonyxc — minimal C library for OnyxOS userspace (v0.4).
+ * libonyxc — C library for OnyxOS userspace (v0.5).
  *
- * Design goals:
- *   - Tiny (target: < 30 KiB compiled .onx)
- *   - musl-inspired API surface, but smaller
- *   - Direct syscall wrappers, no fancy buffering
- *   - Suitable for self-hosting onyxcc
+ * This is the umbrella header. Including <onyxc.h> pulls in:
+ *   - errno.h, fcntl.h, time.h, unistd.h, signal.h, limits.h
+ *   - FILE* opaque type and stdio prototypes
+ *   - struct stat / struct tm / struct sigaction definitions
+ *   - Raw _onyx_* syscall declarations
+ *   - String, ctype, stdlib function prototypes
  *
- * Headers in include/ mirror standard locations.
- *
- * v0.4 changes:
- *   - Added wrappers for all v0.4 kernel syscalls (50–77).
- *   - start.c now reads argc/argv/envp from the kernel-supplied stack frame.
- *   - getenv/setenv/unsetenv/abort/abs added to stdlib.
- *   - Fixed sbrk error check in stdlib.c (was comparing against -1 as a
- *     pointer, which is now correct thanks to _onyx_sbrk's normalization).
- *   - Added stat/fstat struct definitions and prototypes.
+ * v0.5: FILE* buffered I/O, sprintf/snprintf/sscanf, errno/strerror/perror,
+ *   time functions, signal helpers, more stdlib (strtoul, strtoll, strtoull,
+ *   strtod, qsort, bsearch, labs, llabs, atexit, itoa), more string
+ *   (strnlen, strncat, strrchr, strstr, strcasecmp, strpbrk, strcspn, strspn,
+ *   strtok_r, memchr), and unistd wrappers (truncate, symlink, readlink,
+ *   fsync, access, chmod, fchmod, chown, setuid, setgid, getentropy).
  */
 #ifndef LIBONYXC_H
 #define LIBONYXC_H
@@ -25,12 +23,13 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-/* ── Standard file descriptors ────────────────────────────────────────── */
+/* ── Standard file descriptors (also defined in unistd.h, but kept here
+ *    for backwards compatibility with code that doesn't include unistd.h). */
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 
-/* ── Linux-compatible struct stat (matches kernel UserStat) ───────────── */
+/* ── Linux-compatible struct stat (matches kernel UserStat). */
 struct stat {
     uint64_t st_dev;
     uint64_t st_ino;
@@ -52,32 +51,23 @@ struct stat {
     int64_t  __unused[3];
 };
 
-/* ── Standard struct timeval / timespec / timespec ────────────────────── */
-struct timeval {
-    long tv_sec;
-    long tv_usec;
-};
-struct timespec {
-    long tv_sec;
-    long tv_nsec;
-};
+/* ── FILE stream — opaque to user code; full definition in stdio.c. */
+struct __FILE_s;
+typedef struct __FILE_s FILE;
 
-/* ── sigaction (minimal — handler pointer + mask + flags) ─────────────── */
-typedef void (*sighandler_t)(int);
-struct sigaction {
-    union {
-        void (*sa_handler)(int);
-        void (*sa_sigaction)(int, void *, void *);
-    };
-    unsigned long sa_mask;
-    unsigned long sa_flags;
-    void (*sa_restorer)(void);
-};
+extern FILE *stdin;
+extern FILE *stdout;
+extern FILE *stderr;
 
-/* ── Raw syscall wrappers (libonyxc/src/syscalls.c) ───────────────────── */
+/* ── errno — defined as `(*___errno_location())` so library code can
+ *    write to it without user code needing a global. */
+extern int *___errno_location(void);
+#define errno (*(___errno_location()))
+
+/* ── Standard syscall declarations (defined in syscalls.c). */
 long _onyx_write(int fd, const void *buf, size_t n);
 long _onyx_read(int fd, void *buf, size_t n);
-void _onyx_exit(int code) __attribute__((noreturn));
+void _onyx_exit(int code);
 long _onyx_yield(void);
 long _onyx_getpid(void);
 long _onyx_getppid(void);
@@ -102,7 +92,6 @@ long _onyx_create(const char *path, int mode, long reserved);
 long _onyx_mkdir(const char *path);
 long _onyx_unlink(const char *path);
 long _onyx_rename(const char *oldp, const char *newp);
-long _onyx_truncate(const char *path);
 long _onyx_truncate2(const char *path, long length);
 long _onyx_ftruncate(int fd, long length);
 long _onyx_chmod(const char *path, int mode);
@@ -116,30 +105,27 @@ long _onyx_fcntl(int fd, int cmd, long arg);
 long _onyx_ioctl(int fd, long request, long arg);
 long _onyx_isatty(int fd);
 long _onyx_fsync(int fd);
-long _onyx_mmap(long addr, long len, long prot, long flags, long fd, long off);
-long _onyx_munmap(long addr, long len);
-long _onyx_mprotect(long addr, long len, long prot);
 long _onyx_getuid(void);
 long _onyx_getgid(void);
 long _onyx_setuid(int uid);
 long _onyx_setgid(int gid);
-long _onyx_setpgid(int pid, int pgid);
-long _onyx_getpgid(int pid);
-long _onyx_setsid(void);
-long _onyx_gettimeofday(void *tv);
-long _onyx_clock_gettime(long clk_id, void *ts);
-long _onyx_clock_getres(long clk_id, void *res);
-long _onyx_nanosleep(const void *req, void *rem);
-long _onyx_utimens(const char *path, const void *times);
+long _onyx_readlink(const char *path, char *buf, size_t bufsiz);
+long _onyx_symlink(const char *target, const char *linkpath);
+long _onyx_chown(const char *path, int uid, int gid);
+long _onyx_getentropy(void *buf, size_t len);
 long _onyx_kill(int pid, int sig);
-long _onyx_sigmask(int how, int sig);
 long _onyx_sigaction(int sig, const void *act, void *oldact);
 long _onyx_sigprocmask(int how, const void *set, void *oldset);
 long _onyx_sigreturn(void);
 long _onyx_uname(void *buf);
-long _onyx_getentropy(void *buf, size_t len);
-long _onyx_readlink(const char *path, char *buf, size_t bufsiz);
-long _onyx_symlink(const char *target, const char *linkpath);
+long _onyx_clock_gettime(long clk_id, void *ts);
+long _onyx_clock_getres(long clk_id, void *res);
+long _onyx_nanosleep(const void *req, void *rem);
+long _onyx_gettimeofday(void *tv);
+long _onyx_setpgid(int pid, int pgid);
+long _onyx_getpgid(int pid);
+long _onyx_setsid(void);
+long _onyx_utimens(const char *path, const void *times);
 long _onyx_chan_create(void);
 long _onyx_chan_create_named(const char *n);
 long _onyx_chan_open(const char *name);
@@ -152,42 +138,102 @@ long _onyx_snapshot_rollback(int id);
 long _onyx_snapshot_list(void *buf, size_t len);
 long _onyx_write_fd(int fd, const void *buf, size_t n);
 
-/* ── stdio ────────────────────────────────────────────────────────────── */
-int printf(const char *fmt, ...);
-int fprintf(void *fp, const char *fmt, ...);  /* fp ignored in MVP */
-int puts(const char *s);
-int putchar(int c);
-int fflush(void *fp);
+/* ── stdio (FILE*-based buffered I/O, v0.5). */
+int   printf(const char *fmt, ...);
+int   fprintf(FILE *fp, const char *fmt, ...);
+int   vfprintf(FILE *fp, const char *fmt, va_list ap);
+int   vprintf(const char *fmt, va_list ap);
+int   sprintf(char *buf, const char *fmt, ...);
+int   snprintf(char *buf, size_t cap, const char *fmt, ...);
+int   vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap);
+int   vsprintf(char *buf, const char *fmt, va_list ap);
+int   scanf(const char *fmt, ...);
+int   fscanf(FILE *fp, const char *fmt, ...);
+int   sscanf(const char *buf, const char *fmt, ...);
+int   vsscanf(const char *buf, const char *fmt, va_list ap);
+int   vfscanf(FILE *fp, const char *fmt, va_list ap);
+
+int   puts(const char *s);
+int   putchar(int c);
+int   fflush(FILE *fp);
+
+FILE *fopen(const char *path, const char *mode);
+int   fclose(FILE *fp);
+size_t fread(void *buf, size_t sz, size_t count, FILE *fp);
+size_t fwrite(const void *buf, size_t sz, size_t count, FILE *fp);
+char *fgets(char *buf, int size, FILE *fp);
+int   fputs(const char *s, FILE *fp);
+int   fgetc(FILE *fp);
+int   fputc(int ch, FILE *fp);
+int   getc(FILE *fp);
+int   putc(int ch, FILE *fp);
+int   getchar(void);
+long  getline(char **lineptr, size_t *n, FILE *fp);
+long  getdelim(char **lineptr, size_t *n, int delim, FILE *fp);
+int   fseek(FILE *fp, long offset, int whence);
+long  ftell(FILE *fp);
+int   feof(FILE *fp);
+int   ferror(FILE *fp);
+void  clearerr(FILE *fp);
+void  rewind(FILE *fp);
+int   fileno(FILE *fp);
+int   remove(const char *path);
+int   rename(const char *oldp, const char *newp);
+FILE *tmpfile(void);
+char *tmpnam(char *buf);
+
 size_t strlen(const char *s);
 
-/* ── stdlib ───────────────────────────────────────────────────────────── */
+/* ── stdlib. */
 void *malloc(size_t n);
 void  free(void *p);
 void *calloc(size_t n, size_t sz);
 void *realloc(void *p, size_t n);
-void  exit(int code) __attribute__((noreturn));
-void  abort(void) __attribute__((noreturn));
+void  exit(int code);
+void  abort(void);
 int   abs(int n);
 int   atoi(const char *s);
 long  strtol(const char *s, char **endp, int base);
+unsigned long strtoul(const char *s, char **endp, int base);
+long long strtoll(const char *s, char **endp, int base);
+unsigned long long strtoull(const char *s, char **endp, int base);
+double strtod(const char *s, char **endp);
 char *getenv(const char *name);
 int   setenv(const char *name, const char *value, int overwrite);
 int   unsetenv(const char *name);
+long   labs(long n);
+long long llabs(long long n);
+char  *itoa(int v, char *buf, int base);
+int    atexit(void (*fn)(void));
+int    atexit_run_handlers(void);
+int    atexit_count_get(void);
+char **environ_get(void);
 
-/* ── string ───────────────────────────────────────────────────────────── */
+/* ── string. */
 char *strcpy(char *d, const char *s);
 char *strncpy(char *d, const char *s, size_t n);
 int   strcmp(const char *a, const char *b);
 int   strncmp(const char *a, const char *b, size_t n);
 char *strcat(char *d, const char *s);
+char *strncat(char *d, const char *s, size_t n);
 char *strchr(const char *s, int c);
+char *strrchr(const char *s, int c);
 char *strdup(const char *s);
-void *memcpy(void *d, const void *s, size_t n);
-void *memset(void *d, int c, size_t n);
-void *memmove(void *d, const void *s, size_t n);
+size_t strnlen(const char *s, size_t n);
+char  *strstr(const char *haystack, const char *needle);
+int    strcasecmp(const char *a, const char *b);
+int    strncasecmp(const char *a, const char *b, size_t n);
+char  *strpbrk(const char *s, const char *accept);
+size_t strcspn(const char *s, const char *reject);
+size_t strspn(const char *s, const char *accept);
+char  *strtok_r(char *str, const char *delim, char **saveptr);
+void  *memcpy(void *d, const void *s, size_t n);
+void  *memset(void *d, int c, size_t n);
+void  *memmove(void *d, const void *s, size_t n);
 int   memcmp(const void *a, const void *b, size_t n);
+void  *memchr(const void *s, int c, size_t n);
 
-/* ── ctype ────────────────────────────────────────────────────────────── */
+/* ── ctype. */
 int isalpha(int c);
 int isdigit(int c);
 int isspace(int c);
@@ -195,97 +241,27 @@ int isupper(int c);
 int islower(int c);
 int isxdigit(int c);
 int isalnum(int c);
+int ispunct(int c);
+int isprint(int c);
+int iscntrl(int c);
+int isgraph(int c);
 int tolower(int c);
 int toupper(int c);
 
-/* ── unistd-flavoured helpers (thin wrappers over syscalls) ───────────── */
-static inline int open(const char *path, int flags, int mode) {
-    return (int)_onyx_open(path, flags, mode);
-}
-static inline int close(int fd) {
-    return (int)_onyx_close(fd);
-}
-static inline long read(int fd, void *buf, size_t n) {
-    return _onyx_read(fd, buf, n);
-}
-static inline long write(int fd, const void *buf, size_t n) {
-    return _onyx_write(fd, buf, n);
-}
-static inline long lseek(int fd, long off, int whence) {
-    return _onyx_lseek(fd, off, whence);
-}
-static inline int stat(const char *path, struct stat *st) {
-    return (int)_onyx_stat(path, st);
-}
-static inline int fstat(int fd, struct stat *st) {
-    return (int)_onyx_fstat(fd, st);
-}
-static inline int unlink(const char *path) {
-    return (int)_onyx_unlink(path);
-}
-static inline int rmdir(const char *path) {
-    /* OnyxFS doesn't distinguish; unlink works for directories too. */
-    return (int)_onyx_unlink(path);
-}
-static inline int chdir(const char *path) {
-    return (int)_onyx_chdir(path);
-}
-static inline char *getcwd(char *buf, size_t len) {
-    long r = _onyx_getcwd(buf, len);
-    return r < 0 ? NULL : buf;
-}
-static inline int isatty(int fd) {
-    return (int)_onyx_isatty(fd);
-}
-static inline int fork(void) {
-    return (int)_onyx_fork();
-}
-static inline int execv(const char *path, char *const *argv) {
-    return (int)_onyx_exec(path, argv);
-}
-static inline int execve(const char *path, char *const *argv, char *const *envp) {
-    return (int)_onyx_execve(path, argv, envp);
-}
-static inline int getpid(void) {
-    return (int)_onyx_getpid();
-}
-static inline int getppid(void) {
-    return (int)_onyx_getppid();
-}
-static inline int getuid(void) {
-    return (int)_onyx_getuid();
-}
-static inline int getgid(void) {
-    return (int)_onyx_getgid();
-}
-static inline int dup(int oldfd) {
-    return (int)_onyx_dup(oldfd);
-}
-static inline int pipe(int *pipefd) {
-    return (int)_onyx_pipe(pipefd);
-}
-static inline int fcntl(int fd, int cmd, long arg) {
-    return (int)_onyx_fcntl(fd, cmd, arg);
-}
-static inline int ioctl(int fd, long req, long arg) {
-    return (int)_onyx_ioctl(fd, req, arg);
-}
-static inline void *sbrk(long inc) {
-    return _onyx_sbrk(inc);
-}
+/* ── strerror / perror (v0.5). */
+char *strerror(int err);
+void  perror(const char *s);
 
-/* ── Signals ──────────────────────────────────────────────────────────── */
-static inline int kill(int pid, int sig) {
-    return (int)_onyx_kill(pid, sig);
-}
-static inline int raise(int sig) {
-    return (int)_onyx_kill((int)_onyx_getpid(), sig);
-}
-static inline int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact) {
-    return (int)_onyx_sigaction(sig, act, oldact);
-}
-static inline int sigprocmask(int how, const void *set, void *oldset) {
-    return (int)_onyx_sigprocmask(how, set, oldset);
-}
+/* ── Sort / search (v0.5). */
+void  qsort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *));
+void  *bsearch(const void *key, const void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *));
+
+/* ── Standard headers — pull in everything else. */
+#include <errno.h>
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
+#include <signal.h>
+#include <limits.h>
 
 #endif /* LIBONYXC_H */
