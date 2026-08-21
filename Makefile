@@ -35,6 +35,7 @@ ONYXCC_OBJS = $(ONYXCC_SRCS:.c=.o)
 
 ONYXCC = onyxcc
 LIBONYXC = libonyxc/libonyxc.a
+ONYXLD = onyx-ld
 
 # Cross-compilation toolchain for OnyxOS build.
 CLANG        ?= clang-19
@@ -47,9 +48,19 @@ RISCV_FLAGS  = --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d -mcmodel=m
 
 SELFHOST_FLAGS = -DCC_FREESTANDING -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
 
-.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner
+.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld
 
-all: $(ONYXCC)
+all: $(ONYXCC) $(ONYXLD)
+
+# ── onyx-ld — OnyxOS linker ──────────────────────────────────────────
+# Reads .o object files (and .a archives) and produces a .onx binary.
+# Compiled natively on Linux/x86_64 for use as a host-side tool.
+ONYXLD_SRCS = src/tools/onyx-ld.c
+
+$(ONYXLD): $(ONYXLD_SRCS) include/sys/onyxo.h
+	$(CC) $(CFLAGS) -Iinclude -Iinclude/sys -o $@ $(ONYXLD_SRCS) $(LDFLAGS)
+	@ls -la $@
+	@echo "--- onyx-ld ready"
 
 $(ONYXCC): $(ONYXCC_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
