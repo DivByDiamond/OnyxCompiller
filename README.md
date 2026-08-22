@@ -1,3 +1,5 @@
+[![OnyxCompiller CI](https://github.com/DivByDiamond/OnyxCompiller/actions/workflows/ci.yml/badge.svg)](https://github.com/DivByDiamond/OnyxCompiller/actions/workflows/ci.yml)
+
 <p align="center">
   <img src="https://img.shields.io/badge/platform-RISC--V%2064--bit-green" alt="RISC-V 64">
   <img src="https://img.shields.io/badge/MMU-Sv39-yellow" alt="Sv39 MMU">
