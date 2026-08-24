@@ -160,6 +160,7 @@ void rv_ret(void);
 void rv_mv(int rd, int rs);
 void rv_neg(int rd, int rs);
 void rv_not(int rd, int rs);
+void rv_xori(int rd, int rs, int imm);
 void rv_seqz(int rd, int rs);
 void rv_snez(int rd, int rs);
 
