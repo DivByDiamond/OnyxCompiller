@@ -429,31 +429,19 @@ static int vformat_run(fmt_ctx_t *c, const char *fmt, va_list ap) {
                 if (d < 0) { fmt_emit(c, '-'); d = -d; }
                 long long ip = (long long)d;
                 double fp = d - (double)ip;
-                int prec0 = sp.precision >= 0 ? sp.precision : 6;
-                if (prec0 > 0) {
-                    /* Round first, then print the (possibly carried) integer
-                     * part — avoids 2.5 printing as 2.49. */
-                    double scale = 1.0;
-                    for (int i = 0; i < prec0; i++) scale *= 10.0;
-                    double fr = (d - (double)ip) * scale;
-                    long long frac = (long long)(fr + 0.5);
-                    if (frac >= (long long)scale) {
-                        ip += 1;
-                        frac -= (long long)scale;
-                    }
-                    fmt_emit_uint(c, (unsigned long long)ip, 10, 0);
+                fmt_emit_uint(c, (unsigned long long)ip, 10, 0);
+                int prec = sp.precision >= 0 ? sp.precision : 6;
+                if (prec > 0) {
                     fmt_emit(c, '.');
-                    char digs[24];
-                    int nd = 0;
-                    for (int i = 0; i < prec0; i++) {
-                        digs[nd++] = (char)('0' + (frac % 10));
-                        frac /= 10;
+                    for (int i = 0; i < prec; i++) {
+                        fp *= 10.0;
+                        int digit = (int)fp;
+                        if (digit < 0) digit = 0;
+                        if (digit > 9) digit = 9;
+                        fmt_emit(c, '0' + digit);
+                        fp -= digit;
                     }
-                    while (nd > 0) fmt_emit(c, digs[--nd]);
-                } else {
-                    fmt_emit_uint(c, (unsigned long long)ip, 10, 0);
                 }
-                break;
                 break;
             }
             default:

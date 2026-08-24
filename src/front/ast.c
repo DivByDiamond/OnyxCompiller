@@ -102,7 +102,6 @@ int symtab_install_local(const char *name, sym_kind_t kind, type_t *type, int sc
     g_locals[idx].kind = kind;
     g_locals[idx].type = type;
     g_locals[idx].scope = scope;
-    g_locals[idx].alias_global = -1;
     return idx;
 }
 

@@ -20,17 +20,16 @@ CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-stringo
 LDFLAGS ?=
 
 ONYXCC_SRCS = \
-	src/core/main.c \
-	src/core/util.c \
-	src/front/lexer.c \
-	src/back/pp.c \
-	src/core/types.c \
-	src/front/ast.c \
-	src/front/parse.c \
-	src/front/decl.c \
-	src/back/gen.c \
-	src/arch/riscv64.c \
-	src/back/emit.c
+    src/core/main.c \
+    src/core/util.c \
+    src/front/lexer.c \
+    src/back/pp.c \
+    src/core/types.c \
+    src/front/ast.c \
+    src/front/parse.c \
+    src/back/gen.c \
+    src/arch/riscv64.c \
+    src/back/emit.c
 
 ONYXCC_OBJS = $(ONYXCC_SRCS:.c=.o)
 
@@ -47,7 +46,7 @@ RISCV_FLAGS  = --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d -mcmodel=m
 	-ffreestanding -nostdlib -fno-builtin -Iinclude -Wall -Wno-unused-function \
 	-Wno-unused-variable -Wno-unused-but-set-variable -Wno-incompatible-pointer-types
 
-SELFHOST_FLAGS = -DCC_FREESTANDING -N -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
+SELFHOST_FLAGS = -DCC_FREESTANDING -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
 
 .PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld
 
@@ -66,10 +65,7 @@ $(ONYXLD): $(ONYXLD_SRCS) include/sys/onyxo.h
 $(ONYXCC): $(ONYXCC_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-# Header deps (manual — keeps the build honest without -MMD complexity).
-CCHEADERS = $(wildcard include/*.h include/*/*.h)
-
-%.o: %.c $(CCHEADERS)
+%.o: %.c
 	$(CC) $(CFLAGS) -Iinclude -Iinclude/core -Iinclude/front -Iinclude/back -Iinclude/arch -Iinclude/sys -c -o $@ $<
 
 # Cross-compile onyxcc itself to RISC-V64 ELF (for OnyxOS).
