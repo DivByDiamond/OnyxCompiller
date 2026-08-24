@@ -39,6 +39,7 @@
 
 #ifndef CC_FREESTANDING
 #include <stdint.h>
+#include <stddef.h>
 #endif
 
 #define ONX_MAGIC            0x31584E4Fu   /* 'ONX1' LE */

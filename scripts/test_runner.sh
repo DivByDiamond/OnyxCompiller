@@ -8,7 +8,7 @@ TIMEOUT_SEC=10
 ONYXCC="./onyxcc"
 TEST_DIR="tests"
 TMPDIR="/tmp/onyxcc_test"
-INCLUDES="-I libonyxc/include/core -I libonyxc/include/io -I libonyxc/include/ctype -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys"
+INCLUDES="-N -I libonyxc/include/core -I libonyxc/include/io -I libonyxc/include/ctype -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys"
 VERBOSE=false
 
 while getopts "v" opt; do
