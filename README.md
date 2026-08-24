@@ -36,8 +36,9 @@
 
 # OnyxCC — C/C++ → RISC-V64 → .onx compiler for OnyxOS
 
-**Status:** v0.5 — self-hosting (stage-1) achieved, multi-file compilation works,
-`onyx-ld` linker готов к приёму `.o` объектных файлов и `.a` архивов.
+**Status:** v0.6 — полноценная разработка userspace-софта: автолинковка libonyxc,
+function-like макросы, termios/math/assert в libc, FP-арифметика с varargs,
+интеграционные тесты запуска (onx-run эмулятор), 64/64 компиляция + 10/10 runtime.
 Компилятор собирается как:
   - native Linux-бинарник (для разработки вне ОС)
   - `.onx` для запуска внутри OnyxOS (self-hosting)
@@ -74,6 +75,31 @@ Stage-1 уже достигнут: `make selfhost` собирает `onyxcc_self
 - ✅ Глобальные инициализаторы массивов/строк (включая brace-elided)
 - ✅ libonyxc v0.5: `_start`, `printf`/`fprintf`/`sprintf`/`snprintf`/`sscanf`, `FILE*` buffered I/O (`fopen`/`fread`/`fwrite`/`fgets`/`fputs`/`fseek`/`ftell`/`feof`/`getline`), `errno`/`strerror`/`perror`, `time`/`gmtime`/`strftime`/`clock_gettime`/`nanosleep`, signal sets (`sigaction`/`sigprocmask`), `qsort`/`bsearch`, более 30 string functions, full ctype
 - ✅ **`onyx-ld` linker** (src/tools/onyx-ld.c) — отдельный тул для линковки `.o` объектников (формат `ONYO`) и `.a` архивов (стандартный Unix `ar`) в финальный `.onx`. Поддерживает RISC-V релокации: `R_ONYO_64`/`R_ONYO_32`/`R_ONYO_HI20`/`R_ONYO_LO12_I`/`R_ONYO_LO12_S`/`R_ONYO_PCREL_HI20`/`R_ONYO_PCREL_LO12_I`/`R_ONYO_PCREL_LO12_S`/`R_ONYO_JAL`/`R_ONYO_BRANCH`.
+
+## Что нового в v0.6
+
+- ✅ **Автолинковка libonyxc** — `onyxcc -o prog.onx prog.c` просто работает:
+  libc подхватывается автоматически (start/syscalls/stdio/stdlib/string/
+  ctype/time/termios/math), include-пути регистрируются сами.
+  `-nostdlib` / `-N` отключает.
+- ✅ **Function-like макросы** — `#x` (stringize), `a##b` (paste),
+  `__VA_ARGS__`, GNU-расширение `, ##__VA_ARGS__`.
+- ✅ **Указатели на функции** — параметы, локальные/глобальные переменные,
+  struct-поля, typedef'ы, касты, `va_arg(ap, int (*)(void))`.
+- ✅ **Float/double полностью** — F/D-кодировки по спеке, FP-параметры в
+  fa0-fa7, FP varargs (отдельная save-area), тернарники/составные
+  присваивания, `double`-возврат, int↔double конверсии.
+- ✅ **Критические фиксы кодгена** — фрейм (fp=верх фрейма, эпилоги
+  патчатся), spill-система для lhs/rhs, порядок загрузки операндов,
+  switch case-label dispatch, `~x` теперь XOR (не −1!), 8-й/16-ричные
+  литералы, `[3][4]` размерности.
+- ✅ **`onx-run`** (tools/onx-run.c) — эмулятор RV64IMAFD на хосте:
+  запуск .onx без QEMU, трассировка (ONYXRUN_TRACE/WATCH/FRAME).
+- ✅ **libonyxc v0.6** — `termios.h` (tcgetattr/tcsetattr/cfmakeraw),
+  `math.h` (sqrt/pow/exp/log/sin/cos/tan/atan2/floor/ceil/fmod soft-float),
+  `assert.h`, `__func__`/`__FILE__`, exit() сбрасывает stdio.
+- ✅ **Интеграционные тесты** (scripts/integration-runner.sh) — 10 тестов
+  компиляция+запуск+сравнение вывода: 10/10 PASS.
 
 ## Что НЕ работает (пока)
 

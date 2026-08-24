@@ -172,6 +172,9 @@ typedef struct {
     int scope;
     bool is_used;
     bool is_defined;
+    /* For static locals: index of the backing GLOBAL symbol, or -1 for
+     * ordinary stack locals. References redirect to the global. */
+    int alias_global;
     /* For builtins: index. */
     int builtin_id;
 } sym_t;
