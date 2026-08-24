@@ -55,10 +55,6 @@ void *realloc(void *p, size_t n) {
 }
 
 void exit(int code) {
-    /* Flush stdio buffers before terminating — without this every
-     * buffered printf() output was silently lost. */
-    fflush(stdout);
-    fflush(stderr);
     /* Run atexit handlers in reverse order. */
     extern int atexit_run_handlers(void);
     atexit_run_handlers();
@@ -411,11 +407,3 @@ void *bsearch(const void *key, const void *base, size_t n, size_t sz,
 }
 
 char **environ_get(void) { return environ; }
-
-/* ── assert backend ─────────────────────────────────────────────────── */
-void __assert_fail(const char *expr, const char *file, int line,
-                   const char *func) {
-    fprintf(stderr, "Assertion failed: %s (%s: %s: %d)\n",
-            expr, file, func ? func : "?", line);
-    exit(134);   /* 128+SIGABRT, matching Unix convention */
-}

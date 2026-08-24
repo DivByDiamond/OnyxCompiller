@@ -211,40 +211,6 @@
 
 #ifndef __ASSEMBLER__
 
-#ifdef __onyx__
-/*
- * OnyxCC path — no inline assembly support; use the __ecallN builtins
- * (code-generated directly as an `ecall` with args in a7/a0..a5).
- * The preprocessor predefines __onyx__=1 for every onyxcc invocation.
- */
-static inline long _onyx_syscall0(long n) {
-    return __ecall1(n);
-}
-static inline long _onyx_syscall1(long n, long a) {
-    return __ecall2(n, a);
-}
-static inline long _onyx_syscall2(long n, long a, long b) {
-    return __ecall3(n, a, b);
-}
-static inline long _onyx_syscall3(long n, long a, long b, long c) {
-    return __ecall4(n, a, b, c);
-}
-static inline long _onyx_syscall4(long n, long a, long b, long c, long d) {
-    return __ecall5(n, a, b, c, d);
-}
-static inline long _onyx_syscall5(long n, long a, long b, long c, long d, long e) {
-    return __ecall6(n, a, b, c, d, e);
-}
-static inline long _onyx_syscall6(long n, long a, long b, long c, long d, long e, long f) {
-    /* 6 args + nr = 7 values; a5 is reused by folding: not needed by any
-     * current syscall except mmap(fd, off are 0), so pass f via a5 through
-     * the __ecall6 builtin with the last argument merged — kept for ABI
-     * completeness via a custom expansion. */
-    return __ecall6(n, a, b, c, d, e); (void)f;
-}
-
-#else /* !__onyx__ — clang/gcc path with real inline asm */
-
 /* 4-arg variant used by mmap / sigaction / etc. */
 static inline long _onyx_syscall4(long n, long a, long b, long c, long d) {
     register long a0 __asm__("a0") = a;
@@ -311,8 +277,6 @@ static inline long _onyx_syscall3(long n, long a, long b, long c) {
     __asm__ volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
     return a0;
 }
-
-#endif /* __onyx__ */
 
 #endif /* __ASSEMBLER__ */
 #endif /* ONYX_SYSCALLS_H */
