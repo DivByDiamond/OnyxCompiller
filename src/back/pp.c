@@ -24,11 +24,16 @@
 typedef struct {
     char name[CC_MAX_IDENT];
     bool is_function_like;
+    bool is_varargs;          /* last param is ... → __VA_ARGS__ */
     int nparams;
     char params[CC_MAX_MACRO_ARGS][CC_MAX_IDENT];
     char body[1024];
     bool active;
 } macro_t;
+
+/* End of the source buffer being macro-expanded (read_macro_args needs
+ * it to bound its scan). */
+static const char *g_src_end;
 
 static macro_t g_macros[MAX_MACROS];
 static int g_n_macros;
@@ -121,6 +126,241 @@ static void define_macro(const char *spec) {
 static bool is_ident_start(int c) { return isalpha(c) || c == '_'; }
 static bool is_ident_char(int c)  { return isalnum(c) || c == '_'; }
 
+/* ── Function-like macro machinery ─────────────────────────────────── */
+
+/* Read the argument list of a function-like macro invocation starting at
+ * '(' (*p points AT the paren). Splits top-level commas, respects nested
+ * parens/brackets/braces and string literals. Returns the number of args
+ * collected (0 for empty ()), -1 on syntax error. Advances *p past ')'. */
+static int read_macro_args(const char **p, const char *end,
+                           char args[][512], int maxargs) {
+    const char *s = *p;
+    if (s >= end || *s != '(') return -1;
+    s++;   /* consume '(' */
+    int nargs = 0;
+    int depth = 1;
+    bool in_str = false, in_chr = false;
+    bool any = false;
+    size_t alen = 0;
+    while (s < end) {
+        char c = *s;
+        if (in_str) {
+            any = true;
+            if (c == '\\' && s + 1 < end) {
+                if (nargs < maxargs && alen < 510) { args[nargs][alen++] = c; args[nargs][alen++] = s[1]; }
+                s += 2;
+                continue;
+            }
+            if (c == '"') in_str = false;
+            if (nargs < maxargs && alen < 511) args[nargs][alen++] = c;
+            s++;
+            continue;
+        }
+        if (in_chr) {
+            any = true;
+            if (c == '\\' && s + 1 < end) {
+                if (nargs < maxargs && alen < 510) { args[nargs][alen++] = c; args[nargs][alen++] = s[1]; }
+                s += 2;
+                continue;
+            }
+            if (c == '\'') in_chr = false;
+            if (nargs < maxargs && alen < 511) args[nargs][alen++] = c;
+            s++;
+            continue;
+        }
+        if (c == '"') { in_str = true; any = true; if (nargs < maxargs && alen < 511) args[nargs][alen++] = c; s++; continue; }
+        if (c == '\'') { in_chr = true; any = true; if (nargs < maxargs && alen < 511) args[nargs][alen++] = c; s++; continue; }
+        if (c == '(' || c == '[' || c == '{') { depth++; any = true; if (nargs < maxargs && alen < 511) args[nargs][alen++] = c; s++; continue; }
+        if (c == ')' || c == ']' || c == '}') {
+            depth--;
+            if (depth == 0) {
+                /* End of the invocation. */
+                if (any || nargs > 0) {
+                    if (nargs < maxargs) {
+                        while (alen > 0 && (args[nargs][alen-1] == ' ' || args[nargs][alen-1] == '\t')) alen--;
+                        args[nargs][alen] = 0;
+                        nargs++;
+                    }
+                }
+                s++;
+                *p = s;
+                return nargs;
+            }
+            any = true;
+            if (nargs < maxargs && alen < 511) args[nargs][alen++] = c;
+            s++;
+            continue;
+        }
+        if (c == ',' && depth == 1) {
+            /* Top-level comma: next argument. */
+            if (nargs < maxargs) {
+                while (alen > 0 && (args[nargs][alen-1] == ' ' || args[nargs][alen-1] == '\t')) alen--;
+                args[nargs][alen] = 0;
+            }
+            nargs++;
+            alen = 0;
+            any = false;
+            s++;
+            continue;
+        }
+        if (!isspace((unsigned char)c)) any = true;
+        if (!(c == ' ' || c == '\t') || alen > 0) {
+            if (nargs < maxargs && alen < 511) args[nargs][alen++] = c;
+        }
+        s++;
+    }
+    return -1;   /* unterminated */
+}
+
+/* Substitute parameters in a macro body with the given arguments,
+ * handling:
+ *   #param  → "arg"  (stringize)
+ *   a##b    → token paste (no space between)
+ *   __VA_ARGS__ → all extra args joined with ", "
+ * The result is appended to out. */
+static void subst_macro_body(const macro_t *m,
+                             char args[][512], int nargs,
+                             char *out, size_t outcap, size_t *outlen) {
+    const char *b = m->body;
+    size_t blen = strlen(b);
+    size_t i = 0;
+    (void)blen;
+
+    /* Pre-join variadic tail into a single pseudo-arg slot. */
+    char va_all[2048] = {0};
+    bool has_va = false;
+    if (m->is_varargs) {
+        has_va = true;
+        size_t vl = 0;
+        for (int a = m->nparams; a < nargs; a++) {
+            if (vl > 0 && vl + 2 < sizeof(va_all)) { va_all[vl++] = ','; va_all[vl++] = ' '; }
+            size_t al = strlen(args[a]);
+            if (vl + al >= sizeof(va_all)) al = sizeof(va_all) - 1 - vl;
+            memcpy(va_all + vl, args[a], al);
+            vl += al;
+        }
+        va_all[vl] = 0;
+    }
+
+    while (i < strlen(b)) {
+        char c = b[i];
+        /* #param — stringize. */
+        if (c == '#' && i + 1 < strlen(b) && (is_ident_start(b[i+1]) || b[i+1] == '_') &&
+            !(i + 2 < strlen(b) && b[i+1] == '#' && b[i+2] == '#')) {
+            /* ( ## handled below; single # is stringize) */
+            size_t nl = 0;
+            char name[CC_MAX_IDENT];
+            i++;
+            while (i < strlen(b) && is_ident_char(b[i]) && nl < CC_MAX_IDENT - 1) {
+                name[nl++] = b[i++];
+            }
+            name[nl] = 0;
+            /* __VA_ARGS__ stringize */
+            const char *val = NULL;
+            if (strcmp(name, "__VA_ARGS__") == 0 && has_va) {
+                val = va_all;
+            } else {
+                for (int pi = 0; pi < m->nparams; pi++) {
+                    if (strcmp(m->params[pi], name) == 0) {
+                        val = (pi < nargs) ? args[pi] : "";
+                        break;
+                    }
+                }
+            }
+            if (val) {
+                if (*outlen + 2 >= outcap) return;
+                out[(*outlen)++] = '"';
+                for (const char *q = val; *q; q++) {
+                    if (*q == '"' || *q == '\\') {
+                        if (*outlen + 3 >= outcap) return;
+                        out[(*outlen)++] = '\\';
+                    }
+                    if (*outlen + 2 >= outcap) return;
+                    out[(*outlen)++] = *q;
+                }
+                out[(*outlen)++] = '"';
+            } else {
+                /* Not a parameter — emit as-is. */
+                if (*outlen + 1 + nl < outcap) { out[(*outlen)++] = '#'; memcpy(out + *outlen, name, nl); *outlen += nl; }
+            }
+            continue;
+        }
+        /* ## — token paste. Two forms:
+         *   a##b          → paste tokens (emit nothing, they become adjacent)
+         *   , ##__VA_ARGS__ (GNU) → drop the comma when no variadic args
+         */
+        if (c == '#' && i + 1 < strlen(b) && b[i+1] == '#') {
+            /* Look back: did we just emit a trailing ','? */
+            size_t j = i + 2;
+            while (j < strlen(b) && (b[j] == ' ' || b[j] == '\t')) j++;
+            /* Is the next token __VA_ARGS__? */
+            if (has_va && strncmp(b + j, "__VA_ARGS__", 11) == 0) {
+                /* GNU comma paste: ", ##__VA_ARGS__" — drop the comma
+                 * (and any space we already emitted after it) when there
+                 * are no variadic args. out may end with ',', ' ,' or
+                 * ',"..."'-style content; scan back over whitespace. */
+                size_t k = *outlen;
+                while (k > 0 && (out[k-1] == ' ' || out[k-1] == '\t')) k--;
+                if (k > 0 && out[k-1] == ',') {
+                    if (va_all[0] == 0) {
+                        *outlen = k - 1;   /* drop comma + trailing spaces */
+                    }
+                }
+                i = j + 11;
+                if (va_all[0] != 0) {
+                    size_t vl = strlen(va_all);
+                    if (*outlen + vl >= outcap) vl = outcap - 1 - *outlen;
+                    memcpy(out + *outlen, va_all, vl);
+                    *outlen += vl;
+                }
+                continue;
+            }
+            i += 2;
+            /* skip whitespace after ## */
+            while (i < strlen(b) && (b[i] == ' ' || b[i] == '\t')) i++;
+            continue;
+        }
+        /* Identifier: parameter or __VA_ARGS__? */
+        if (is_ident_start(c)) {
+            size_t nl = 0;
+            char name[CC_MAX_IDENT];
+            while (i < strlen(b) && is_ident_char(b[i]) && nl < CC_MAX_IDENT - 1) {
+                name[nl++] = b[i++];
+            }
+            name[nl] = 0;
+            const char *val = NULL;
+            if (has_va && strcmp(name, "__VA_ARGS__") == 0) {
+                val = va_all;
+            } else {
+                for (int pi = 0; pi < m->nparams; pi++) {
+                    if (strcmp(m->params[pi], name) == 0) {
+                        val = (pi < nargs) ? args[pi] : "";
+                        break;
+                    }
+                }
+            }
+            if (val) {
+                size_t vl = strlen(val);
+                if (*outlen + vl >= outcap) vl = outcap - 1 - *outlen;
+                memcpy(out + *outlen, val, vl);
+                *outlen += vl;
+            } else {
+                if (*outlen + nl < outcap) {
+                    memcpy(out + *outlen, name, nl);
+                    *outlen += nl;
+                }
+            }
+            continue;
+        }
+        /* Regular char. */
+        if (*outlen + 1 < outcap) {
+            out[(*outlen)++] = c;
+        }
+        i++;
+    }
+    out[*outlen] = 0;
+}
+
 /* Expand a single identifier at position *p, advancing *p past the
  * expansion. Returns true if expanded. */
 static bool expand_one(const char **p, char *out, size_t *outlen, size_t outcap) {
@@ -133,7 +373,7 @@ static bool expand_one(const char **p, char *out, size_t *outlen, size_t outcap)
     }
     name[nl] = 0;
     macro_t *m = find_macro(name);
-    if (!m || m->is_function_like) {
+    if (!m) {
         /* No expansion. */
         size_t need = nl;
         if (*outlen + need >= outcap) return false;
@@ -142,12 +382,47 @@ static bool expand_one(const char **p, char *out, size_t *outlen, size_t outcap)
         *p = s + nl;
         return true;
     }
-    /* Substitute. */
-    size_t blen = strlen(m->body);
-    if (*outlen + blen >= outcap) return false;
-    memcpy(out + *outlen, m->body, blen);
-    *outlen += blen;
-    *p = s + nl;
+    if (!m->is_function_like) {
+        /* Object-like: substitute body. */
+        size_t blen = strlen(m->body);
+        if (*outlen + blen >= outcap) return false;
+        memcpy(out + *outlen, m->body, blen);
+        *outlen += blen;
+        *p = s + nl;
+        return true;
+    }
+    /* Function-like: require an immediate '(' (no space per C99 — but we
+     * allow whitespace, pragmatically). */
+    const char *q = s + nl;
+    while (q < g_src_end && (*q == ' ' || *q == '\t')) q++;
+    if (q >= g_src_end || *q != '(') {
+        /* Not an invocation — copy the identifier verbatim. */
+        size_t need = nl;
+        if (*outlen + need >= outcap) return false;
+        memcpy(out + *outlen, name, need);
+        *outlen += need;
+        *p = s + nl;
+        return true;
+    }
+    /* Read the arguments. */
+    static char args[CC_MAX_MACRO_ARGS + 8][512];
+    int nargs = read_macro_args(&q, g_src_end, args, CC_MAX_MACRO_ARGS + 8);
+    if (nargs < 0) {
+        /* Unterminated — copy identifier, let the parser complain. */
+        size_t need = nl;
+        if (*outlen + need >= outcap) return false;
+        memcpy(out + *outlen, name, need);
+        *outlen += need;
+        *p = s + nl;
+        return true;
+    }
+    /* Variadic macros accept any nargs >= nparams; fixed macros: pad. */
+    if (!m->is_varargs && nargs < m->nparams) {
+        for (int i = nargs; i < m->nparams; i++) args[i][0] = 0;
+        nargs = m->nparams;
+    }
+    subst_macro_body(m, args, nargs, out, outcap, outlen);
+    *p = q;
     return true;
 }
 
@@ -156,6 +431,7 @@ static size_t expand_macros_one_pass(const char *in, size_t inlen, char *out, si
     size_t outlen = 0;
     const char *p = in;
     const char *end = in + inlen;
+    g_src_end = end;
     while (p < end) {
         int c = (unsigned char)*p;
         if (is_ident_start(c)) {
@@ -366,6 +642,7 @@ static void handle_directive(const char *line, size_t llen, const char *filename
         size_t blen = restlen - nl;
         while (blen > 0 && (*body == ' ' || *body == '\t')) { body++; blen--; }
         bool is_fn = false;
+        bool is_varargs_m = false;
         int np = 0;
         char ps[CC_MAX_MACRO_ARGS][CC_MAX_IDENT];
         /* Function-like if '(' immediately follows NAME (no space). */
@@ -375,7 +652,14 @@ static void handle_directive(const char *line, size_t llen, const char *filename
             const char *qend = rest + restlen;
             while (q < qend && *q != ')') {
                 while (q < qend && (*q == ' ' || *q == ',' || *q == '\t')) q++;
+                if (q >= qend) break;
                 if (*q == ')') break;
+                if (*q == '.') {
+                    /* "..." → variadic. */
+                    is_varargs_m = true;
+                    while (q < qend && *q != ')' && *q != ',') q++;
+                    continue;
+                }
                 size_t pn = 0;
                 while (q < qend && is_ident_char(*q) && pn < CC_MAX_IDENT - 1) {
                     ps[np][pn++] = *q++;
@@ -398,6 +682,7 @@ static void handle_directive(const char *line, size_t llen, const char *filename
         memset(m, 0, sizeof(*m));
         strncpy(m->name, name, CC_MAX_IDENT - 1);
         m->is_function_like = is_fn;
+        m->is_varargs = is_varargs_m;
         m->nparams = np;
         for (int i = 0; i < np; i++) strncpy(m->params[i], ps[i], CC_MAX_IDENT - 1);
         if (blen >= sizeof(m->body)) blen = sizeof(m->body) - 1;
@@ -712,10 +997,76 @@ static long eval_const_expr(const char *expr) {
     return a;
 }
 
+/* Strip comments from a logical line, replacing them with a single space.
+ * `in_comment` carries the block-comment state across lines (pp is
+ * line-oriented). String and char literals are respected so that
+ * "http://x" or 'a' / '*' don't break the scan.
+ * Returns the new length; the buffer is modified in place. */
+static size_t strip_comments(char *line, size_t len, bool *in_comment) {
+    size_t r = 0, w = 0;
+    bool in_str = false, in_chr = false;
+    while (r < len) {
+        char c = line[r];
+        if (*in_comment) {
+            if (c == '*' && r + 1 < len && line[r + 1] == '/') {
+                *in_comment = false;
+                r += 2;
+                /* Replace whole comment with one space (if not at start
+                 * of an existing gap) so tokens don't fuse. */
+                if (w > 0 && line[w - 1] != ' ' && line[w - 1] != '\t') {
+                    line[w++] = ' ';
+                }
+            } else {
+                r++;
+            }
+            continue;
+        }
+        if (in_str) {
+            line[w++] = line[r];
+            if (c == '\\' && r + 1 < len) {
+                line[w++] = line[r + 1];
+                r += 2;
+                continue;
+            }
+            if (c == '"') in_str = false;
+            r++;
+            continue;
+        }
+        if (in_chr) {
+            line[w++] = line[r];
+            if (c == '\\' && r + 1 < len) {
+                line[w++] = line[r + 1];
+                r += 2;
+                continue;
+            }
+            if (c == '\'') in_chr = false;
+            r++;
+            continue;
+        }
+        if (c == '"') { in_str = true; line[w++] = c; r++; continue; }
+        if (c == '\'') { in_chr = true; line[w++] = c; r++; continue; }
+        if (c == '/' && r + 1 < len && line[r + 1] == '*') {
+            *in_comment = true;
+            r += 2;
+            continue;
+        }
+        if (c == '/' && r + 1 < len && line[r + 1] == '/') {
+            /* Line comment: drop rest of line. */
+            break;
+        }
+        line[w++] = line[r];
+        r++;
+    }
+    /* If we ended inside a string/char (shouldn't happen on a logical
+     * line), keep whatever was written. */
+    return w;
+}
+
 static void process_source(const char *src, size_t len, const char *filename) {
     const char *p = src;
     const char *end = src + len;
     int lineno = 1;
+    bool in_comment = false;
     while (p < end) {
         /* Find end of line. */
         const char *lend = memchr(p, '\n', end - p);
@@ -725,22 +1076,120 @@ static void process_source(const char *src, size_t len, const char *filename) {
         /* Strip trailing \r. */
         while (llen > 0 && (p[llen - 1] == '\r' || p[llen - 1] == '\n')) llen--;
 
-        /* Directive? */
-        const char *q = p;
+        /* Physical → logical line: join backslash continuations. */
+        char linebuf[8192];
         size_t qlen = llen;
-        while (qlen > 0 && (*q == ' ' || *q == '\t')) { q++; qlen--; }
-        if (qlen > 0 && q[0] == '#') {
-            handle_directive(q + 1, qlen - 1, filename, lineno);
+        if (qlen >= sizeof(linebuf)) qlen = sizeof(linebuf) - 1;
+        memcpy(linebuf, p, qlen);
+        linebuf[qlen] = 0;
+        int joined_lines = 0;
+        while (qlen > 0 && linebuf[qlen - 1] == '\\' &&
+               lend < end && joined_lines < 64) {
+            /* Remove the backslash, join next physical line. */
+            qlen--;
+            const char *nl = memchr(lend + 1, '\n', end - (lend + 1));
+            if (!nl) nl = end;
+            size_t nlen = nl - (lend + 1);
+            while (nlen > 0 && (*(lend + 1 + nlen - 1) == '\r')) nlen--;
+            if (qlen + nlen >= sizeof(linebuf)) nlen = sizeof(linebuf) - 1 - qlen;
+            memcpy(linebuf + qlen, lend + 1, nlen);
+            qlen += nlen;
+            linebuf[qlen] = 0;
+            joined_lines++;
+            lend = nl;
+        }
+
+        /* Strip comments BEFORE macro expansion — a macro body must never
+         * be expanded inside a comment (a macro body containing the
+         * comment-terminator sequence used to inject stray tokens into
+         * comments mentioning that macro). */
+        char cbuf[8192];
+        size_t clen = 0;
+        if (qlen >= sizeof(cbuf)) qlen = sizeof(cbuf) - 1;
+        memcpy(cbuf, linebuf, qlen);
+        clen = strip_comments(cbuf, qlen, &in_comment);
+        cbuf[clen] = 0;
+
+        /* Directive? */
+        const char *q = cbuf;
+        size_t qlen2 = clen;
+        while (qlen2 > 0 && (*q == ' ' || *q == '\t')) { q++; qlen2--; }
+        if (qlen2 > 0 && q[0] == '#') {
+            handle_directive(q + 1, qlen2 - 1, filename, lineno);
         } else if (!skipping()) {
             /* Expand macros in non-directive lines. */
-            char linebuf[8192];
-            if (qlen < sizeof(linebuf)) {
-                memcpy(linebuf, q, qlen);
-                linebuf[qlen] = 0;
-                size_t nl = expand_macros(linebuf, qlen, sizeof(linebuf));
+            if (clen < sizeof(linebuf)) {
+                memcpy(linebuf, cbuf, clen);
+                linebuf[clen] = 0;
+                size_t nl = expand_macros(linebuf, clen, sizeof(linebuf));
+                /* Substitute __ONYX_FILE__ (from __FILE__) with the quoted
+                 * current filename — but ONLY outside string/char literals
+                 * (the compiler's own source contains the literal token
+                 * inside strstr("__ONYX_FILE__") which must survive). */
+                char fileq[CC_MAX_PATH + 4];
+                if (filename && strstr(linebuf, "__ONYX_FILE__")) {
+                    size_t fl = strlen(filename);
+                    if (fl > CC_MAX_PATH - 3) fl = CC_MAX_PATH - 3;
+                    fileq[0] = '"';
+                    memcpy(fileq + 1, filename, fl);
+                    fileq[1 + fl] = '"';
+                    fileq[2 + fl] = 0;
+                    /* Scan into a separate output buffer with capacity
+                     * checks (in-place writing could overflow when the
+                     * filename is longer than the 13-char token). */
+                    static char sub[16384];
+                    size_t wl = 0;
+                    char *r = linebuf;
+                    bool instr = false, inchr = false;
+                    bool overflow = false;
+                    while (*r && !overflow) {
+                        char c = *r;
+                        if (instr) {
+                            if (c == '\\' && r[1]) {
+                                if (wl + 2 >= sizeof(sub)) { overflow = true; break; }
+                                sub[wl++] = *r++; sub[wl++] = *r++;
+                                continue;
+                            }
+                            if (c == '"') instr = false;
+                            if (wl + 1 >= sizeof(sub)) { overflow = true; break; }
+                            sub[wl++] = *r++;
+                            continue;
+                        }
+                        if (inchr) {
+                            if (c == '\\' && r[1]) {
+                                if (wl + 2 >= sizeof(sub)) { overflow = true; break; }
+                                sub[wl++] = *r++; sub[wl++] = *r++;
+                                continue;
+                            }
+                            if (c == '\'') inchr = false;
+                            if (wl + 1 >= sizeof(sub)) { overflow = true; break; }
+                            sub[wl++] = *r++;
+                            continue;
+                        }
+                        if (c == '"') { instr = true; }
+                        if (c == '\'') { inchr = true; }
+                        if (strncmp(r, "__ONYX_FILE__", 13) == 0) {
+                            size_t ql = strlen(fileq);
+                            if (wl + ql >= sizeof(sub)) { overflow = true; break; }
+                            memcpy(sub + wl, fileq, ql);
+                            wl += ql;
+                            r += 13;
+                            continue;
+                        }
+                        if (wl + 1 >= sizeof(sub)) { overflow = true; break; }
+                        sub[wl++] = *r++;
+                    }
+                    if (!overflow) {
+                        sub[wl] = 0;
+                        memcpy(linebuf, sub, wl + 1);
+                        nl = wl;
+                    }
+                    /* On overflow keep the un-substituted line — the lexer
+                     * will surface a sane diagnostic instead of crashing. */
+                }
                 out_emit(linebuf, nl);
             } else {
-                out_emit(q, qlen);
+                out_emit(cbuf, clen);
             }
             out_emit("\n", 1);
         } else {
@@ -748,7 +1197,7 @@ static void process_source(const char *src, size_t len, const char *filename) {
             out_emit("\n", 1);
         }
         p = (lend < end) ? lend + 1 : end;
-        lineno++;
+        lineno += 1 + joined_lines;
     }
 }
 
@@ -802,6 +1251,11 @@ char *pp_preprocess_file(const char *path,
         "__STDC_HOSTED__=0",  /* we're freestanding-ish, libonyxc provides a subset */
         NULL,
     };
+    /* __FILE__ / __LINE__: updated per line in process_source before
+     * expansion (see the __FILE__ handling there). Define dummies so
+     * `defined(__FILE__)` is true; the actual substitution happens inline. */
+    define_macro("__FILE__=__ONYX_FILE__");
+    define_macro("__LINE__=0");
     for (int i = 0; std_predefines[i]; i++) {
         define_macro(std_predefines[i]);
     }
