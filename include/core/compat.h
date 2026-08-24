@@ -31,9 +31,8 @@ typedef unsigned long uintptr_t;
 #define NULL ((void*)0)
 #define UINT64_MAX 18446744073709551615ULL
 
-/* bool — typedef (not #define) so that <stdbool.h> can be included
- * afterwards without its `typedef _Bool bool;` being mangled. */
-typedef _Bool bool;
+/* bool */
+#define bool _Bool
 #define true 1
 #define false 0
 

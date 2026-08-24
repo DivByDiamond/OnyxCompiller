@@ -93,15 +93,13 @@ void rv_addi_imm(int rd, int rs1, int64_t imm) {
         rv_addi(rd, rs1, (int)imm);
         return;
     }
-    /* Materialize imm into t6, then add.
-     * lo MUST be sign-extended from 12 bits: the addi immediate field is
-     * SIGNED, so `lui 0xD; addi 0xEAD` computed 0xD000-339 = 0xCEAD instead
-     * of 0xDEAD. Split as lo in [-2048, 2047], hi = (imm - lo) & ~0xFFF. */
+    /* Materialize imm into t6, then add. */
     int tmp = RV_T6;
     int64_t v = imm;
-    int64_t lo = ((v & 0xFFF) ^ 0x800) - 0x800;   /* sign-extend bit 11 */
-    int64_t hi = (v - lo) & ~0xFFFULL;
-    rv_lui(tmp, (uint32_t)((hi >> 12) & 0xFFFFF) & 0xFFFFF);
+    int64_t lo = (int64_t)(int32_t)(v & 0xFFF);
+    int64_t hi = (v - lo) & 0xFFFFFFFFFFFFF000LL;
+    /* lui tmp, hi[31:12] */
+    rv_lui(tmp, (uint32_t)(hi >> 12) & 0xFFFFF);
     rv_addi(tmp, tmp, (int)lo);
     rv_add(rd, rs1, tmp);
 }
@@ -288,21 +286,7 @@ void rv_fence(void)  { emit32(0x0FF0000F); }
 void rv_ret(void)    { rv_jalr(RV_ZERO, RV_RA, 0); }
 void rv_mv(int rd, int rs)    { rv_addi(rd, rs, 0); }
 void rv_neg(int rd, int rs)   { rv_sub(rd, RV_ZERO, rs); }
-void rv_xori(int rd, int rs, int imm) {
-    uint32_t insn = (uint32_t)(imm & 0xFFF) << 20
-                  | (uint32_t)(rs & 0x1F) << 15
-                  | 0x4 << 12
-                  | (uint32_t)(rd & 0x1F) << 7
-                  | 0x13;
-    emit32(insn);
-}
-
-void rv_not(int rd, int rs)   {
-    /* ~x = x XOR -1 (0xFFFFFFFF...). The old `addi rs, -1` computed x-1,
-     * which only matches ~x for x ∈ {0, -1} — every mask-based clear
-     * (flags &= ~MASK) silently became garbage. */
-    rv_xori(rd, rs, -1);
-}
+void rv_not(int rd, int rs)   { rv_addi(rd, rs, -1); }
 void rv_seqz(int rd, int rs)  { rv_sltiu(rd, rs, 1); }
 void rv_snez(int rd, int rs)  { rv_sltu(rd, RV_ZERO, rs); }
 
@@ -364,29 +348,23 @@ void rv_fsd(int rs2, int rs1, int imm) {
     emit32(insn);
 }
 
-/* Arithmetic — single-precision. funct3=0 (RNE).
- * funct7 encodings per RISC-V F-extension spec:
- *   FADD.S=0x00  FSUB.S=0x04  FMUL.S=0x08  FDIV.S=0x0C */
+/* Arithmetic — single-precision. funct3=0 (RNE). */
 void rv_fadd_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x00, 0x0, rd, rs1, rs2); }
-void rv_fsub_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x04, 0x0, rd, rs1, rs2); }
-void rv_fmul_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x08, 0x0, rd, rs1, rs2); }
-void rv_fdiv_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x0C, 0x0, rd, rs1, rs2); }
+void rv_fsub_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x08, 0x0, rd, rs1, rs2); }
+void rv_fmul_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x10, 0x0, rd, rs1, rs2); }
+void rv_fdiv_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x18, 0x0, rd, rs1, rs2); }
 
-/* Arithmetic — double-precision. The precision (fmt) is encoded in
- * funct7 bits [26:25] (01=double), NOT in funct3 — funct3 is the rounding
- * mode. FADD.D=0x01 FSUB.D=0x05 FMUL.D=0x09 FDIV.D=0x0D */
-void rv_fadd_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x01, 0x0, rd, rs1, rs2); }
-void rv_fsub_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x05, 0x0, rd, rs1, rs2); }
-void rv_fmul_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x09, 0x0, rd, rs1, rs2); }
-void rv_fdiv_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x0D, 0x0, rd, rs1, rs2); }
+/* Arithmetic — double-precision. funct3=1 (RNE for double). */
+void rv_fadd_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x00, 0x1, rd, rs1, rs2); }
+void rv_fsub_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x08, 0x1, rd, rs1, rs2); }
+void rv_fmul_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x10, 0x1, rd, rs1, rs2); }
+void rv_fdiv_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x18, 0x1, rd, rs1, rs2); }
 
-/* Move between int and float register files.
- *   FMV.W.X funct7=0x78   FMV.X.W funct7=0x70
- *   FMV.D.X funct7=0x79   FMV.X.D funct7=0x71 */
-void rv_fmv_w_x(int rd, int rs1) { rv_emit_fpu_r(0x78, 0x0, rd, rs1, 0); }
-void rv_fmv_x_w(int rd, int rs1) { rv_emit_fpu_r(0x70, 0x0, rd, rs1, 0); }
-void rv_fmv_d_x(int rd, int rs1) { rv_emit_fpu_r(0x79, 0x0, rd, rs1, 0); }
-void rv_fmv_x_d(int rd, int rs1) { rv_emit_fpu_r(0x71, 0x0, rd, rs1, 0); }
+/* Move between int and float register files. */
+void rv_fmv_w_x(int rd, int rs1) { rv_emit_fpu_r(0xF8, 0x0, rd, rs1, 0); }
+void rv_fmv_x_w(int rd, int rs1) { rv_emit_fpu_r(0xE0, 0x0, rd, rs1, 0); }
+void rv_fmv_d_x(int rd, int rs1) { rv_emit_fpu_r(0xF2, 0x0, rd, rs1, 0); }
+void rv_fmv_x_d(int rd, int rs1) { rv_emit_fpu_r(0xE2, 0x1, rd, rs1, 0); }
 
 /* Conversions — verified against Spike riscv/encoding.h MATCH_* constants.
  *   fcvt.s.l: funct7=0x68, rs2=0x2, funct3=0 (RNE)

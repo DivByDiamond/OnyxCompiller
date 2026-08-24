@@ -12,10 +12,6 @@
 #define CC_H
 
 #include "onx.h"
-#ifndef CC_FREESTANDING
-#include <stdbool.h>   /* bool in cc_options_t */
-#include <stddef.h>    /* size_t in prototypes */
-#endif
 
 /* ---- Limits ------------------------------------------------------------ */
 #define CC_MAX_TOKEN_LEN   256
@@ -113,7 +109,7 @@ extern uint64_t g_entry;     /* set by gen when _start is emitted */
 /* ---- CLI options ------------------------------------------------------ */
 typedef struct {
     const char *input;          /* primary input file (first one) */
-    const char *input_files[30]; /* all input files (user files + auto-linked libc) */
+    const char *input_files[16]; /* all input files */
     int n_input_files;
     int current_file_idx;       /* index of file currently being compiled */
     const char *output;         /* default: a.onx */
@@ -122,8 +118,6 @@ typedef struct {
     bool verbose;
     bool dump_tokens;
     bool dump_ast;
-    bool preprocess_only;       /* -E: dump preprocessed source, no codegen */
-    bool nostdlib;              /* -nostdlib: skip libonyxc auto-link */
     const char *include_paths[16];
     int n_include_paths;
     const char *define_macros[64];

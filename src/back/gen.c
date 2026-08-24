@@ -28,7 +28,6 @@
 #include "back/gen.h"
 #include "arch/riscv64.h"
 #include "front/parser_priv.h"
-#include "front/decl.h"
 
 gen_func_t g_func;
 
@@ -48,9 +47,6 @@ typedef enum {
     VAL_IMM,    /* constant in .imm */
     VAL_SYM,    /* symbol: .sym_idx + .offset */
     VAL_LVAL,   /* address in .reg + .offset */
-    VAL_SPILL,  /* address stored at [fp + .offset] (assignment-lhs spill) */
-    VAL_SPILL_F, /* FLOAT VALUE stored at [fp + .offset] (binop lhs spill) */
-    VAL_SPILL_I, /* INT VALUE stored at [fp + .offset] (binop lhs spill) */
 } val_kind_t;
 
 typedef struct {
@@ -70,65 +66,10 @@ static void parse_stmt(lexer_t *lx);
 static void parse_stmt_body(lexer_t *lx);
 static val_t parse_primary(lexer_t *lx);
 static val_t parse_unary(lexer_t *lx);
-static long long gen_const_expr(lexer_t *lx);
+static long long parse_const_expr(lexer_t *lx);
 static void patch_jal(uint32_t off, int32_t delta);
 static void patch_sd_imm(uint32_t off, int32_t imm);
 static void parse_asm(lexer_t *lx);
-/* Current function name — for static-local mangling. */
-static char g_cur_func_name[CC_MAX_IDENT];
-static type_t *g_cur_func_ret = NULL;   /* return type of enclosing function */
-
-/* Epilogue patch list. Frame layout (fp points at the TOP of the frame,
- * i.e. at the caller's sp at entry):
- *
- *   [fp - frame, fp)      the frame, owned by the callee
- *     fp - 8 .. fp        (unused, keeps locals 16-aligned)
- *     fp - 16 ...         locals / param spill slots (negative offsets)
- *     fp - frame + 8      saved ra
- *     fp - frame + 0      saved fp
- *
- * Epilogue sequence (placeholders patched with the real frame size):
- *     addi sp, fp, -frame   ; sp = frame bottom
- *     ld   ra, 8(sp)
- *     ld   fp, 0(sp)
- *     addi sp, sp, frame    ; sp restored to the top
- *     ret
- *
- * The ORIGINAL code set fp = sp AFTER the stack decrement, so locals at
- * fp-N lived BELOW sp — outside the frame — and any callee prologue
- * overwrote them. Deep call chains also leaked stack because the
- * deallocation was hard-coded to 16.
- */
-#define EPILOGUE_PATCH_MAX 512
-static uint32_t g_epilogue_patch_off[EPILOGUE_PATCH_MAX];
-static uint8_t  g_epilogue_patch_neg[EPILOGUE_PATCH_MAX];  /* 1: imm=-frame, 0: imm=+frame */
-static int g_n_epilogue_patches;
-
-static void epilogue_record(uint32_t off, int neg) {
-    if (g_n_epilogue_patches < EPILOGUE_PATCH_MAX) {
-        g_epilogue_patch_off[g_n_epilogue_patches] = off;
-        g_epilogue_patch_neg[g_n_epilogue_patches] = (uint8_t)neg;
-        g_n_epilogue_patches++;
-    }
-}
-
-static void emit_function_epilogue(void) {
-    rv_addi(RV_A0, RV_ZERO, 0);
-    /* t1 = frame (patched lui+addi pair; single addi cannot hold +2048+). */
-    uint32_t lui_off = (uint32_t)g_text.size;
-    rv_lui(RV_T1, 0);
-    epilogue_record(lui_off, 2);
-    uint32_t addi_off = (uint32_t)g_text.size;
-    rv_addi(RV_T1, RV_T1, 0);
-    epilogue_record(addi_off, 3);
-    rv_sub(RV_SP, RV_FP, RV_T1);   /* sp = frame bottom */
-    rv_ld(RV_RA, RV_SP, 8);
-    rv_ld(RV_FP, RV_SP, 0);
-    rv_add(RV_SP, RV_SP, RV_T1);   /* sp = frame top (restored) */
-    rv_ret();
-}
-
-
 /* Forward declaration for brace initializer parsing. */
 static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type);
 static uint64_t gen_emit_global_init_elided(lexer_t *lx, type_t *type);
@@ -267,13 +208,6 @@ static void materialize(val_t *v, int reg) {
                 v->offset = 0;
             }
             break;
-        case VAL_SPILL:
-            /* Address lives in a stack slot — load it. */
-            rv_ld(reg, RV_FP, (int)v->offset);
-            v->kind = VAL_LVAL;
-            v->reg = reg;
-            v->offset = 0;
-            break;
         case VAL_REG:
             if (v->reg != reg) {
                 rv_mv(reg, v->reg);
@@ -284,37 +218,13 @@ static void materialize(val_t *v, int reg) {
 }
 
 static void load_value(val_t *v, int reg) {
-    if (v->kind == VAL_SPILL_I) {
-        /* Reload the spilled int value. */
-        if (v->type && (v->type->kind == TY_ARRAY || v->type->kind == TY_FUNC)) {
-            rv_ld(reg, RV_FP, (int)v->offset);
-        } else {
-            uint64_t sz = type_sizeof(v->type ? v->type : &ty_long);
-            bool uns = type_is_unsigned(v->type);
-            switch (sz) {
-                case 1: uns ? rv_lbu(reg, RV_FP, (int)v->offset) : rv_lb(reg, RV_FP, (int)v->offset); break;
-                case 2: uns ? rv_lhu(reg, RV_FP, (int)v->offset) : rv_lh(reg, RV_FP, (int)v->offset); break;
-                case 4: uns ? rv_lwu(reg, RV_FP, (int)v->offset) : rv_lw(reg, RV_FP, (int)v->offset); break;
-                default: rv_ld(reg, RV_FP, (int)v->offset); break;
-            }
-        }
-        v->kind = VAL_REG;
-        v->reg = reg;
-        v->offset = 0;
-        return;
-    }
     /* Materialize the actual value (dereference if LVAL). */
     materialize(v, reg);
     if (v->kind == VAL_LVAL) {
         /* Load from [reg + offset]. */
         uint64_t sz = type_sizeof(v->type);
         if (v->type->kind == TY_ARRAY || v->type->kind == TY_FUNC) {
-            /* Array/function decays to its ADDRESS as a plain VALUE.
-             * Returning VAL_LVAL here made consumers (call arguments,
-             * casts) deref it again — `(long)buf` passed buf's CONTENTS
-             * as the pointer. */
-            v->kind = VAL_REG;
-            v->offset = 0;
+            /* Array decays to pointer: keep address. */
             return;
         }
         switch (sz) {
@@ -394,29 +304,27 @@ static void load_float_value(val_t *v, int freg) {
         return;
     }
     if (v->kind == VAL_IMM && !is_float_type(v->type)) {
-        /* Integer constant → float: materialize int, then fcvt.
-         * Default to DOUBLE (C promotes int constants in float contexts to
-         * double per usual arithmetic conversions); float contexts
-         * down-convert at their use site. Using FCVT.S.W here produced a
-         * single-precision value whose upper 32 bits were garbage when
-         * stored as a double (`double r = 1` read back as 0). */
+        /* Integer constant → float: materialize int, then fcvt. */
         materialize(v, RV_T0);
-        bool want_double = (freg == RV_FT0) ? true : true;  /* see note */
-        (void)want_double;
-        rv_fcvt_d_l(freg, RV_T0);
+        bool is_double = v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE);
+        if (is_double) {
+            rv_fcvt_d_l(freg, RV_T0);
+        } else {
+            rv_fcvt_s_l(freg, RV_T0);
+        }
         v->kind = VAL_REG;
         v->reg = freg;
         v->offset = 0;
-        /* Keep the value's declared type as double so later stores use FSD. */
-        v->type = &ty_double;
         return;
     }
-    if (v->kind == VAL_SPILL_F) {
-        /* Reload the spilled float value. */
-        if (v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE)) {
-            rv_fld(freg, RV_FP, (int)v->offset);
+    /* For LVAL/SYM: materialize address, then flw/fld. */
+    materialize(v, RV_T0);
+    if (v->kind == VAL_LVAL) {
+        bool is_double = v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE);
+        if (is_double) {
+            rv_fld(freg, RV_T0, (int)v->offset);
         } else {
-            rv_flw(freg, RV_FP, (int)v->offset);
+            rv_flw(freg, RV_T0, (int)v->offset);
         }
         v->kind = VAL_REG;
         v->reg = freg;
@@ -424,11 +332,10 @@ static void load_float_value(val_t *v, int freg) {
         return;
     }
     if (v->kind == VAL_REG) {
-        /* Handle REG FIRST — materialize() would drag the value through
-         * an INT register (mv t0, fX), destroying the float bits. */
+        /* Already in a register. */
         if (v->reg == freg) return;
         if (is_float_type(v->type)) {
-            /* Move between float regs: fsgnj (fmv within float file). */
+            /* Move between float regs: use fsgnj (fmv within float file). */
             if (v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE)) {
                 rv_emit_fpu_r(0x11, 0x0, freg, v->reg, v->reg); /* fsgnj.d */
             } else {
@@ -443,40 +350,6 @@ static void load_float_value(val_t *v, int freg) {
             }
         }
         v->reg = freg;
-        return;
-    }
-
-    /* For LVAL/SYM: materialize address, then flw/fld — but an INT-typed
-     * lvalue must be loaded with lw/lwz first and CONVERTED (fld on a 4-byte
-     * int slot read 8 bytes of garbage: log()'s `n * 0.693` exploded). */
-    materialize(v, RV_T0);
-    if (v->kind == VAL_LVAL) {
-        bool is_double = v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE);
-        if (is_float_type(v->type)) {
-            if (is_double) {
-                rv_fld(freg, RV_T0, (int)v->offset);
-            } else {
-                rv_flw(freg, RV_T0, (int)v->offset);
-            }
-        } else {
-            /* Integer lvalue → float register. */
-            uint64_t sz = type_sizeof(v->type);
-            bool uns = type_is_unsigned(v->type);
-            switch (sz) {
-                case 1: uns ? rv_lbu(RV_T1, RV_T0, (int)v->offset) : rv_lb(RV_T1, RV_T0, (int)v->offset); break;
-                case 2: uns ? rv_lhu(RV_T1, RV_T0, (int)v->offset) : rv_lh(RV_T1, RV_T0, (int)v->offset); break;
-                case 4: uns ? rv_lwu(RV_T1, RV_T0, (int)v->offset) : rv_lw(RV_T1, RV_T0, (int)v->offset); break;
-                default: rv_ld(RV_T1, RV_T0, (int)v->offset); break;
-            }
-            rv_fcvt_d_l(freg, RV_T1);
-        }
-        v->kind = VAL_REG;
-        v->reg = freg;
-        v->offset = 0;
-        if (!is_float_type(v->type)) {
-            v->type = &ty_double;   /* converted value is double */
-        }
-        return;
     }
 }
 
@@ -485,9 +358,6 @@ static void patch_branch(uint32_t off, int32_t delta) {
     uint8_t *p = g_text.data + off;
     uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
                     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-    /* Clear the B-type immediate bits BEFORE patching — the old code
-     * only OR-ed, so a branch patched twice accumulated garbage bits. */
-    insn &= ~0xFE000F80u;
     insn |= ((uint32_t)(delta & 0x1000) << 19) |
             ((uint32_t)(delta & 0x7E0) << 20) |
             ((uint32_t)(delta & 0x1E) << 7)  |
@@ -621,10 +491,23 @@ type_t *parse_type_spec(lexer_t *lx) {
                             continue;
                         }
                         do {
+                            type_t *ftyp = fbase;
+                            while (accept(T_STAR)) ftyp = type_make_ptr(ftyp);
                             char fname[CC_MAX_IDENT] = {0};
-                            /* Full declarator: supports function-pointer
-                             * fields like `int (*read)(char *, int);`. */
-                            type_t *ftyp = parse_declarator(lx, fbase, fname, sizeof(fname));
+                            if (lx->cur.kind == T_IDENT) {
+                                strncpy(fname, lx->cur.text, CC_MAX_IDENT - 1);
+                                lex_next(lx);
+                            }
+                            while (lx->cur.kind == T_LBRACKET) {
+                                lex_next(lx);
+                                uint64_t len = 0;
+                                if (lx->cur.kind == T_INT) {
+                                    len = lx->cur.ival;
+                                    lex_next(lx);
+                                }
+                                parse_expect(T_RBRACKET, "expected ']'");
+                                ftyp = type_make_array(ftyp, len);
+                            }
                             /* Allocate field. */
                             uint64_t falign = type_alignof(ftyp);
                             if (falign > max_align) max_align = falign;
@@ -813,25 +696,15 @@ typedef struct {
 static data_rodata_fixup_t g_data_rodata_fixups[4096];
 static int g_n_data_rodata_fixups = 0;
 
-/* Fixups for global data pointing at another SYMBOL (address-of-global
- * initializers: FILE *stdin = &g_stdin_obj; int *p = arr; void (*f)() = fn). */
-typedef struct {
-    int      sym_idx;      /* referenced global symbol */
-    uint32_t data_off;     /* 8-byte slot in g_data to patch */
-} data_sym_fixup_t;
-
-static data_sym_fixup_t g_data_sym_fixups[4096];
-static int g_n_data_sym_fixups = 0;
-
-/* Emit a global address load into `reg`. Records a fixup for later.
- * ALWAYS emits the lui+addi pair — the fixup resolver splits the final
- * address into hi20/lo12 across both instructions; a lone lui would
- * silently drop the low 12 bits of the symbol address. */
+/* Emit a global address load into `reg`. Records a fixup for later. */
 static void emit_load_global_addr(int reg, int sym_idx, int64_t add_off) {
     uint32_t lui_off = (uint32_t)g_text.size;
     rv_lui(reg, 0);
-    uint32_t addi_off = (uint32_t)g_text.size;
-    rv_addi(reg, reg, (int)add_off);
+    uint32_t addi_off = 0;
+    if (add_off != 0) {
+        addi_off = (uint32_t)g_text.size;
+        rv_addi(reg, reg, (int)add_off);
+    }
     if (g_n_fixups >= 4096) cc_fatal("too many global refs");
     g_fixups[g_n_fixups].sym_idx = sym_idx;
     g_fixups[g_n_fixups].patch_lui = lui_off;
@@ -842,79 +715,24 @@ static void emit_load_global_addr(int reg, int sym_idx, int64_t add_off) {
 
 /* ---- Function call codegen ------------------------------------------ */
 static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *callee) {
-    /* Parse args. Each argument is evaluated and immediately SPILLED to a
-     * stack slot; the a0-a7 registers are loaded from those slots only
-     * after every argument has been parsed. Without this, an argument
-     * containing a function call (fwrite(s, 1, strlen(s), fp)) would
-     * clobber the argument registers already holding earlier arguments —
-     * callee-saved registers do not exist in this codegen. */
+    /* Parse args. We evaluate args left-to-right into a0-a7 (max 8).
+     * Extra args go on the stack. */
     parse_expect(T_LPAREN, "expected '('");
 
     int nargs = 0;
-    int64_t arg_slots[8];
-    type_t *arg_types[8];
-    bool arg_fp[8];
+    int arg_regs[8] = {RV_A0, RV_A1, RV_A2, RV_A3, RV_A4, RV_A5, RV_A6, RV_A7};
+    val_t args[8];
+    /* args[] preserves the evaluated argument values so a future stack-
+     * argument path (for calls with > 8 args) can spill them without
+     * re-evaluating side-effecting expressions. Currently unused. */
+    (void)args;
 
     if (lx->cur.kind != T_RPAREN) {
         for (;;) {
             val_t a = parse_assign(lx);
             if (nargs < 8) {
-                bool fp = is_float_type(a.type);
-                /* Allocate an 8-byte (16-aligned) spill slot. */
-                g_func.cur_offset += 8;
-                g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-                int64_t slot = -(int64_t)g_func.cur_offset;
-                if (g_func.cur_offset > g_func.frame_size) {
-                    g_func.frame_size = g_func.cur_offset;
-                }
-                bool is_struct = (a.type->kind == TY_STRUCT || a.type->kind == TY_UNION);
-                if (fp) {
-                    load_float_value(&a, RV_FT0);
-                    rv_fsd(RV_FT0, RV_FP, (int)slot);
-                } else if (is_struct) {
-                    /* Structs (va_list) pass BY VALUE: copy the object into
-                     * one contiguous frame block, then pass a POINTER to it
-                     * in the argument register (single-register struct ABI). */
-                    uint64_t ssz = type_sizeof(a.type);
-                    if (ssz > 32) ssz = 32;
-                    g_func.cur_offset += ssz;
-                    g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-                    int64_t sslot = -(int64_t)g_func.cur_offset;
-                    if (g_func.cur_offset > g_func.frame_size) {
-                        g_func.frame_size = g_func.cur_offset;
-                    }
-                    /* Struct PARAMS hold a POINTER (by-value ABI) — local
-                     * struct objects are the real thing; deref only params.
-                     * NOTE: must classify BEFORE materialize() (which turns
-                     * VAL_SYM into VAL_LVAL and hides the slot index). */
-                    bool a_is_local = false;
-                    if (a.kind == VAL_SYM && a.sym_idx >= g_n_globals) {
-                        int64_t aoff = g_locals[a.sym_idx - g_n_globals].offset;
-                        for (int vi = 0; vi < g_func.n_struct_locals; vi++) {
-                            if (g_func.struct_local_slots[vi] == aoff) {
-                                a_is_local = true;
-                                break;
-                            }
-                        }
-                    }
-                    materialize(&a, RV_T0);       /* &source (or &param slot) */
-                    if (!a_is_local) {
-                        rv_ld(RV_T0, RV_T0, 0);   /* param slot → object ptr */
-                    }
-                    for (uint64_t k = 0; k < ssz; k += 8) {
-                        rv_ld(RV_T1, RV_T0, (int)k);
-                        rv_sd(RV_T1, RV_FP, (int)sslot + (int)k);
-                    }
-                    /* Load the block's ADDRESS as the argument value. */
-                    rv_addi(RV_T0, RV_FP, (int)sslot);
-                    rv_sd(RV_T0, RV_FP, (int)slot);
-                } else {
-                    load_value(&a, RV_T0);
-                    rv_sd(RV_T0, RV_FP, (int)slot);
-                }
-                arg_slots[nargs] = slot;
-                arg_types[nargs] = a.type;
-                arg_fp[nargs] = fp;
+                load_value(&a, arg_regs[nargs]);
+                args[nargs] = a;
                 nargs++;
             }
             if (!accept(T_COMMA)) break;
@@ -925,35 +743,15 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
     /* Track max args for stack reservation. */
     if (nargs > g_func.max_call_args) g_func.max_call_args = nargs;
 
-    /* Load arguments into a0-a7 / fa0-fa7 from their spill slots.
-     * Per the RISC-V calling convention the two register files are indexed
-     * INDEPENDENTLY: the Nth integer arg goes to aN, the Mth FP arg goes to
-     * faM — not to fa<total-arg-index>. (fmt, 2.25) used to put 2.25 in fa1.) */
-    int gp_idx = 0, fp_idx = 0;
-    for (int i = 0; i < nargs; i++) {
-        if (i >= 8 && gp_idx >= 8 && fp_idx >= 8) break;
-        if (arg_fp[i]) {
-            if (fp_idx < 8) {
-                rv_fld(RV_FA0 + fp_idx, RV_FP, (int)arg_slots[i]);
-                fp_idx++;
-            }
-        } else {
-            if (gp_idx < 8) {
-                rv_ld(RV_A0 + gp_idx, RV_FP, (int)arg_slots[i]);
-                gp_idx++;
-            }
-        }
-    }
-
     /* Indirect call vs direct call. */
-    if (callee && (callee->kind == VAL_REG || callee->kind == VAL_LVAL ||
-                   callee->kind == VAL_SYM || callee->kind == VAL_SPILL)) {
+    if (callee && (callee->kind == VAL_REG || callee->kind == VAL_LVAL || callee->kind == VAL_SYM)) {
         /* Indirect call through function pointer. */
         val_t cv = *callee;
         load_value(&cv, RV_T5);
         rv_jalr(RV_RA, RV_T5, 0);
     } else if (fn_sym_idx >= 0) {
-        /* Direct call: la t0, sym; jalr ra, t0, 0. */
+        /* Direct call: auipc + jalr with offset 0.
+         * Use t0 as scratch: la t0, sym; jalr ra, t0, 0. */
         emit_load_global_addr(RV_T0, fn_sym_idx, 0);
         rv_jalr(RV_RA, RV_T0, 0);
     } else {
@@ -968,236 +766,6 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
     result.type = fn_type ? fn_type->ret : &ty_int;
     return result;
 }
-
-/* ---- Postfix operators ---------------------------------------------- */
-/* Spill an INT value sitting in a scratch register (T0/T1/T2) to a stack
- * slot — the mirror of spill_freg for the integer side. Without it, an int
- * lhs already materialized in T0 was destroyed by RHS sub-evaluation
- * (2*i*(2*i+1) degenerated to x*x). */
-static void spill_ireg(val_t *v) {
-    if (v->kind != VAL_REG) return;
-    if (v->reg != RV_T0 && v->reg != RV_T1 && v->reg != RV_T2) return;
-    if (is_float_type(v->type)) return;
-    g_func.cur_offset += 8;
-    g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-    int64_t slot = -(int64_t)g_func.cur_offset;
-    if (g_func.cur_offset > g_func.frame_size) {
-        g_func.frame_size = g_func.cur_offset;
-    }
-    if (v->type && (v->type->kind == TY_ARRAY || v->type->kind == TY_FUNC)) {
-        /* Address-like values: store the register as-is. */
-        rv_sd(v->reg, RV_FP, (int)slot);
-    } else {
-        uint64_t sz = type_sizeof(v->type ? v->type : &ty_long);
-        switch (sz) {
-            case 1: rv_sb(v->reg, RV_FP, (int)slot); break;
-            case 2: rv_sh(v->reg, RV_FP, (int)slot); break;
-            case 4: rv_sw(v->reg, RV_FP, (int)slot); break;
-            default: rv_sd(v->reg, RV_FP, (int)slot); break;
-        }
-    }
-    v->kind = VAL_SPILL_I;
-    v->reg = RV_FP;
-    v->offset = slot;
-}
-
-/* Spill a float value sitting in a scratch FP register (FT0/FT1) to a
- * stack slot, protecting it across RHS evaluation — the codegen uses FT0
- * as universal scratch, so an FP lhs in FT0 gets destroyed the moment the
- * RHS is parsed. Returns a VAL_SPILL-ish value loaded back on use. */
-static void spill_freg(val_t *v) {
-    if (v->kind != VAL_REG) return;
-    if (v->reg != RV_FT0 && v->reg != RV_FT1) return;
-    if (!is_float_type(v->type)) return;
-    g_func.cur_offset += 8;
-    g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-    int64_t slot = -(int64_t)g_func.cur_offset;
-    if (g_func.cur_offset > g_func.frame_size) {
-        g_func.frame_size = g_func.cur_offset;
-    }
-    if (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE) {
-        rv_fsd(v->reg, RV_FP, (int)slot);
-    } else {
-        rv_fsw(v->reg, RV_FP, (int)slot);
-    }
-    v->kind = VAL_SPILL_F;
-    v->reg = RV_FP;
-    v->offset = slot;
-}
-
-/* Spill an LVAL's address register to a stack slot, converting it to
- * VAL_SPILL. Protects the value across subsequent expression evaluation
- * (no register allocator). No-op for non-scratch LVALs. */
-static void spill_lval(val_t *v) {
-    if (v->kind != VAL_LVAL || v->reg == RV_FP) return;
-    g_func.cur_offset += 8;
-    g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-    int64_t slot = -(int64_t)g_func.cur_offset;
-    if (g_func.cur_offset > g_func.frame_size) {
-        g_func.frame_size = g_func.cur_offset;
-    }
-    if (v->offset == 0) {
-        rv_sd(v->reg, RV_FP, (int)slot);
-    } else {
-        rv_addi(RV_T3, v->reg, (int)v->offset);
-        rv_sd(RV_T3, RV_FP, (int)slot);
-    }
-    v->kind = VAL_SPILL;
-    v->reg = RV_FP;
-    v->offset = slot;
-}
-
-/* Postfix operators: index [], member . ->, call (), ++/--.
- * Shared by primary identifiers and parenthesized expressions. */
-static val_t parse_postfix(lexer_t *lx, val_t v) {
-            for (;;) {
-                if (lx->cur.kind == T_LBRACKET) {
-                    /* Protect the base LVAL from being clobbered by the
-                     * index expression (fp->buf[fp->buf_end + i] used to
-                     * deref through the INDEX value). */
-                    spill_lval(&v);
-                    lex_next(lx);
-                    val_t idx = parse_expr(lx);
-                    parse_expect(T_RBRACKET, "expected ']'");
-                    /* Materialize the INDEX into T1 first — loading the base
-                     * into T0 afterwards used to clobber an index value
-                     * sitting in T0 (`set[v % base]` indexed with the base). */
-                    load_value(&idx, RV_T1);
-                    /* Compute the indexing BASE:
-                     * - array lvalue  → address of the array itself
-                     * - pointer value → the pointer's VALUE (single deref of
-                     *   its slot; load_value would deref the POINT EE too,
-                     *   breaking `in[put + i]`). */
-                    materialize(&v, RV_T0);
-                    if (v.kind == VAL_LVAL && v.type->kind != TY_ARRAY &&
-                        v.type->kind != TY_FUNC) {
-                        rv_ld(RV_T0, RV_T0, (int)v.offset);
-                        v.kind = VAL_REG;
-                        v.reg = RV_T0;
-                        v.offset = 0;
-                    }
-                    type_t *elem_type = NULL;
-                    if (v.type->kind == TY_ARRAY) {
-                        elem_type = v.type->base;
-                        uint64_t sz = type_sizeof(elem_type);
-                        if (sz != 1) {
-                            rv_addi_imm(RV_T2, RV_ZERO, sz);
-                            rv_mul(RV_T1, RV_T1, RV_T2);
-                        }
-                    } else if (v.type->kind == TY_PTR) {
-                        elem_type = v.type->base;
-                        uint64_t sz = type_sizeof(elem_type);
-                        if (sz != 1) {
-                            rv_addi_imm(RV_T2, RV_ZERO, sz);
-                            rv_mul(RV_T1, RV_T1, RV_T2);
-                        }
-                    }
-                    rv_add(RV_T0, RV_T0, RV_T1);
-                    v.kind = VAL_LVAL;
-                    v.type = elem_type;
-                    v.reg = RV_T0;
-                    v.offset = 0;
-                    continue;
-                }
-                if (lx->cur.kind == T_DOT || lx->cur.kind == T_ARROW) {
-                    int is_arrow = (lx->cur.kind == T_ARROW);
-                    lex_next(lx);
-                    if (lx->cur.kind != T_IDENT) {
-                        parse_error("expected member name");
-                        break;
-                    }
-                    char mname[CC_MAX_IDENT];
-                    strncpy(mname, lx->cur.text, CC_MAX_IDENT - 1);
-                    lex_next(lx);
-                    /* Get struct type. */
-                    type_t *st = is_arrow ? v.type->base : v.type;
-                    if (!st || (st->kind != TY_STRUCT && st->kind != TY_UNION)) {
-                        cc_error("member access on non-struct");
-                        break;
-                    }
-                    int fi = -1;
-                    for (int i = 0; i < st->nfields; i++) {
-                        if (strcmp(st->fields[i].name, mname) == 0) { fi = i; break; }
-                    }
-                    if (fi < 0) {
-                        cc_error("no member '%s' in struct", mname);
-                        break;
-                    }
-                    if (is_arrow) {
-                        /* v is pointer; load address into T0. */
-                        load_value(&v, RV_T0);
-                        v.kind = VAL_LVAL;
-                        v.reg = RV_T0;
-                        v.offset = (int64_t)st->fields[fi].offset;
-                    } else {
-                        /* v is the struct value (must be LVAL/SYM). */
-                        if (v.kind == VAL_SYM) {
-                            materialize(&v, RV_T0);
-                        }
-                        v.kind = VAL_LVAL;
-                        v.offset += (int64_t)st->fields[fi].offset;
-                    }
-                    v.type = st->fields[fi].type;
-                    continue;
-                }
-                if (lx->cur.kind == T_LPAREN) {
-                    /* Postfix call on a value: e.g. func_ptr(args), arr[i](args). */
-                    type_t *ft = NULL;
-                    if (v.type->kind == TY_PTR && v.type->base && v.type->base->kind == TY_FUNC) {
-                        ft = v.type->base;
-                    } else if (v.type->kind == TY_FUNC) {
-                        ft = v.type;
-                    }
-                    if (!ft) {
-                        cc_error("called object is not a function or function pointer");
-                        break;
-                    }
-                    /* The callee address must survive argument evaluation. */
-                    spill_lval(&v);
-                    return gen_call(lx, -1, ft, &v);
-                }
-                if (lx->cur.kind == T_INC || lx->cur.kind == T_DEC) {
-                    int op = lx->cur.kind;
-                    lex_next(lx);
-                    if (v.kind != VAL_SYM && v.kind != VAL_LVAL && v.kind != VAL_SPILL) {
-                        cc_error("++/-- requires lvalue");
-                        break;
-                    }
-                    /* Spill the object ADDRESS first — loading the current
-                     * value into T0 would clobber the address register when
-                     * the object itself is an LVAL in a scratch register. */
-                    spill_lval(&v);
-                    /* Load current value into T0. */
-                    val_t cur = v;
-                    load_value(&cur, RV_T0);
-                    /* Compute new value: +/- 1, scaled by sizeof if pointer. */
-                    uint64_t sz = type_is_pointer(v.type) ? type_sizeof(v.type->base) : 1;
-                    rv_addi_imm(RV_T1, RV_T0, op == T_INC ? (int64_t)sz : -(int64_t)sz);
-                    /* Store back: address is FP-relative (SPILL) or direct. */
-                    int addr_reg = RV_T2;
-                    if (v.kind == VAL_SYM || v.kind == VAL_SPILL) {
-                        materialize(&v, addr_reg);
-                    } else {
-                        rv_addi(addr_reg, v.reg, (int)v.offset);
-                    }
-                    uint64_t st = type_sizeof(v.type);
-                    switch (st) {
-                        case 1: rv_sb(RV_T1, addr_reg, 0); break;
-                        case 2: rv_sh(RV_T1, addr_reg, 0); break;
-                        case 4: rv_sw(RV_T1, addr_reg, 0); break;
-                        case 8: rv_sd(RV_T1, addr_reg, 0); break;
-                    }
-                    /* Post-inc/dec returns the OLD value (already in T0). */
-                    v.kind = VAL_REG;
-                    v.reg = RV_T0;
-                    v.offset = 0;
-                    continue;
-                }
-                break;
-            }
-    return v;
-}
-
 
 /* ---- Primary parser ------------------------------------------------- */
 static val_t parse_primary(lexer_t *lx) {
@@ -1256,10 +824,10 @@ static val_t parse_primary(lexer_t *lx) {
             /* Could be cast: ( type ) expr. */
             if (is_type_start(lx)) {
                 type_t *t = parse_type_spec(lx);
-                /* Full abstract declarator: (int *), (char (*)[4]),
-                 * (void (*)(int)) — function-pointer casts. */
-                char dummy_name[CC_MAX_IDENT];
-                t = parse_declarator(lx, t, dummy_name, sizeof(dummy_name));
+                while (accept(T_STAR)) {
+                    t = type_make_ptr(t);
+                    while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
+                }
                 parse_expect(T_RPAREN, "expected ')' after cast");
                 /* Compound literal: (type){ init_list } */
                 if (lx->cur.kind == T_LBRACE) {
@@ -1432,9 +1000,7 @@ static val_t parse_primary(lexer_t *lx) {
             }
             val_t e = parse_expr(lx);
             parse_expect(T_RPAREN, "expected ')'");
-            /* Postfix operators apply to parenthesized expressions too:
-             * (*p)[i], (f())[0], (a.b).c, ... */
-            return parse_postfix(lx, e);
+            return e;
         }
         case T_IDENT: {
             char name[CC_MAX_IDENT];
@@ -1445,25 +1011,30 @@ static val_t parse_primary(lexer_t *lx) {
 
             /* Function call? */
             if (lx->cur.kind == T_LPAREN) {
-                /* Built-in syscall stubs: __ecall0..6(n[, a[, ...]]) → ecall */
-                if (strncmp(name, "__ecall", 7) == 0 && name[7] >= '0' && name[7] <= '6' && name[8] == 0) {
+                /* Built-in syscall stubs: __ecall0..3(n[, a[, b[, c]]]) → ecall */
+                if (strcmp(name, "__ecall0") == 0 || strcmp(name, "__ecall1") == 0 ||
+                    strcmp(name, "__ecall2") == 0 || strcmp(name, "__ecall3") == 0) {
                     int nargs = name[7] - '0';
                     parse_expect(T_LPAREN, "expected '('");
+                    long args[4] = {0,0,0,0};
                     int got = 0;
                     if (lx->cur.kind != T_RPAREN) {
                         for (;;) {
                             val_t a = parse_assign(lx);
-                            if (got < 7) {
-                                int regs[7] = {RV_A7, RV_A0, RV_A1, RV_A2, RV_A3, RV_A4, RV_A5};
+                            if (got < 4) {
+                                int regs[4] = {RV_A7, RV_A0, RV_A1, RV_A2};
                                 load_value(&a, regs[got]);
+                                args[got] = 1;
                             }
                             got++;
                             if (!accept(T_COMMA)) break;
                         }
                     }
                     parse_expect(T_RPAREN, "expected ')'");
-                    if (got != nargs) {
-                        cc_warn("__ecall%d called with %d args", nargs, got);
+                    (void)args;
+                    /* Move first arg (n) into a7, others stay in a0-a2. */
+                    if (nargs >= 1) {
+                        /* n is currently in A7 (regs[0]); that's where we want it. */
                     }
                     rv_ecall();
                     val_t r;
@@ -1477,9 +1048,8 @@ static val_t parse_primary(lexer_t *lx) {
                     /* va_start(ap, last) — `last` is ignored */
                     parse_expect(T_LPAREN, "expected '('");
                     val_t ap = parse_assign(lx);
-                    /* Both spellings take the ignored `last` argument. */
-                    if (lx->cur.kind == T_COMMA) {
-                        lex_next(lx);
+                    if (strcmp(name, "va_start") == 0) {
+                        parse_expect(T_COMMA, "expected ','");
                         parse_assign(lx);
                     }
                     parse_expect(T_RPAREN, "expected ')'");
@@ -1487,63 +1057,32 @@ static val_t parse_primary(lexer_t *lx) {
                     if (!g_func.is_variadic) {
                         cc_error("va_start used in non-variadic function");
                     }
-                    /* Allocate the 16-byte cursor pair in the frame and
-                     * store its ADDRESS into ap. */
-                    g_func.cur_offset += 16;
-                    g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-                    int64_t pair = -(int64_t)g_func.cur_offset;
-                    if (g_func.cur_offset > g_func.frame_size) {
-                        g_func.frame_size = g_func.cur_offset;
-                    }
                     int gp_off = g_func.nparams * 8;
                     if (gp_off > 64) gp_off = 64;
-                    /* pair[0] = &gp_area[nparams] */
-                    rv_addi(RV_T1, RV_FP, g_func.va_save_off + gp_off);
-                    rv_sd(RV_T1, RV_FP, (int)pair);
-                    /* pair[8] = &fp_area[0] (no named FP tracking). */
-                    if (g_func.va_fsave_off != 0) {
-                        rv_addi(RV_T1, RV_FP, g_func.va_fsave_off);
-                        rv_sd(RV_T1, RV_FP, (int)pair + 8);
-                    }
-                    /* ap = &pair. */
-                    rv_addi(RV_T1, RV_FP, (int)pair);
+                    int off = g_func.va_save_off + gp_off;
+                    rv_addi(RV_T1, RV_FP, off);
                     rv_sd(RV_T1, RV_T0, 0);
                     val_t vr;
                     memset(&vr, 0, sizeof(vr));
                     return vr;
                 }
-                if (strcmp(name, "va_arg") == 0 || strcmp(name, "__builtin_va_arg") == 0) {
+                if (strcmp(name, "va_arg") == 0) {
                     /* va_arg(ap, type) — type is a C type, not an expression */
                     parse_expect(T_LPAREN, "expected '('");
                     val_t ap = parse_assign(lx);
                     parse_expect(T_COMMA, "expected ','");
                     type_t *arg_type = parse_type_spec(lx);
-                    /* Full declarator: va_arg(ap, int (*)(void)) etc. */
-                    char dummy_name[CC_MAX_IDENT];
-                    arg_type = parse_declarator(lx, arg_type, dummy_name, sizeof(dummy_name));
+                    while (accept(T_STAR)) arg_type = type_make_ptr(arg_type);
+                    while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
                     parse_expect(T_RPAREN, "expected ')'");
-                    /* ap is char* → load the pointer value first. */
-                    load_value(&ap, RV_T0);
-                    if (is_float_type(arg_type)) {
-                        /* FP vararg: cursor lives at pair+8. */
-                        rv_ld(RV_T1, RV_T0, 8);
-                        rv_fld(RV_FT0, RV_T1, 0);
-                        rv_addi(RV_T1, RV_T1, 8);
-                        rv_sd(RV_T1, RV_T0, 8);
-                        val_t vr;
-                        memset(&vr, 0, sizeof(vr));
-                        vr.kind = VAL_REG;
-                        vr.reg = RV_FT0;
-                        vr.type = arg_type;
-                        return vr;
-                    }
+                    materialize(&ap, RV_T0);
                     rv_ld(RV_T1, RV_T0, 0);
                     uint64_t sz = type_sizeof(arg_type);
-                    bool uns = type_is_unsigned(arg_type);
                     switch (sz) {
-                        case 1: uns ? rv_lbu(RV_T2, RV_T1, 0) : rv_lb(RV_T2, RV_T1, 0); break;
-                        case 2: uns ? rv_lhu(RV_T2, RV_T1, 0) : rv_lh(RV_T2, RV_T1, 0); break;
-                        case 4: uns ? rv_lwu(RV_T2, RV_T1, 0) : rv_lw(RV_T2, RV_T1, 0); break;
+                        case 1: rv_lbu(RV_T2, RV_T1, 0); break;
+                        case 2: rv_lhu(RV_T2, RV_T1, 0); break;
+                        case 4: rv_lwu(RV_T2, RV_T1, 0); break;
+                        case 8: rv_ld(RV_T2, RV_T1, 0); break;
                         default: rv_ld(RV_T2, RV_T1, 0); break;
                     }
                     rv_addi(RV_T1, RV_T1, 8);
@@ -1565,21 +1104,6 @@ static val_t parse_primary(lexer_t *lx) {
                 }
                 /* Check local symbols first (e.g. local function pointer). */
                 int lidx = symtab_lookup_local(name);
-                if (lidx >= 0 && g_locals[lidx].alias_global >= 0) {
-                    /* Static local — indirect call through the backing
-                     * global (function-pointer static locals). */
-                    int gidx = g_locals[lidx].alias_global;
-                    type_t *gt = g_globals[gidx].type;
-                    if (gt->kind == TY_PTR && gt->base && gt->base->kind == TY_FUNC) {
-                        val_t callee;
-                        memset(&callee, 0, sizeof(callee));
-                        callee.kind = VAL_SYM;
-                        callee.sym_idx = gidx;
-                        callee.type = gt;
-                        return gen_call(lx, -1, gt->base, &callee);
-                    }
-                    lidx = -1;
-                }
                 if (lidx >= 0 && g_locals[lidx].type->kind == TY_PTR &&
                     g_locals[lidx].type->base && g_locals[lidx].type->base->kind == TY_FUNC) {
                     /* Indirect call through local function pointer. */
@@ -1627,35 +1151,9 @@ static val_t parse_primary(lexer_t *lx) {
                 return gen_call(lx, idx, ft, NULL);
             }
 
-            /* __func__ — the enclosing function's name as a string. */
-            if (strcmp(name, "__func__") == 0) {
-                const char *fn = g_cur_func_name[0] ? g_cur_func_name : "?";
-                size_t fl = strlen(fn);
-                uint32_t off = cc_strpool_add(fn, fl);
-                uint32_t lui_off = (uint32_t)g_text.size;
-                rv_lui(RV_T0, 0);
-                uint32_t addi_off = (uint32_t)g_text.size;
-                rv_addi(RV_T0, RV_T0, (int)off);
-                if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
-                g_rodata_fixups[g_n_rodata_fixups].rodata_off = off;
-                g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
-                g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
-                g_n_rodata_fixups++;
-                v.kind = VAL_REG;
-                v.reg = RV_T0;
-                v.type = type_make_ptr(&ty_char);
-                return v;
-            }
-
             /* Variable / enum const. */
             int lidx = symtab_lookup_local(name);
-            if (lidx >= 0 && g_locals[lidx].alias_global >= 0) {
-                /* Static local — reference the backing global symbol. */
-                v.kind = VAL_SYM;
-                v.sym_idx = g_locals[lidx].alias_global;
-                v.offset = 0;
-                v.type = g_locals[lidx].type;
-            } else if (lidx >= 0) {
+            if (lidx >= 0) {
                 v.kind = VAL_SYM;
                 v.sym_idx = g_n_globals + lidx;  /* local encoding */
                 v.offset = 0;
@@ -1686,9 +1184,128 @@ static val_t parse_primary(lexer_t *lx) {
                 }
             }
 
-            /* Postfix: index [], member . ->, call (), ++/--. */
-            v = parse_postfix(lx, v);
-            return v;
+            /* Postfix: array index [], member . ->, call (). */
+            for (;;) {
+                if (lx->cur.kind == T_LBRACKET) {
+                    lex_next(lx);
+                    val_t idx = parse_expr(lx);
+                    parse_expect(T_RBRACKET, "expected ']'");
+                    /* Compute address: base + idx * sizeof(*base). */
+                    load_value(&v, RV_T0);
+                    load_value(&idx, RV_T1);
+                    type_t *elem_type = NULL;
+                    if (v.type->kind == TY_ARRAY) {
+                        elem_type = v.type->base;
+                        uint64_t sz = type_sizeof(elem_type);
+                        if (sz != 1) {
+                            rv_addi_imm(RV_T2, RV_ZERO, sz);
+                            rv_mul(RV_T1, RV_T1, RV_T2);
+                        }
+                    } else if (v.type->kind == TY_PTR) {
+                        elem_type = v.type->base;
+                        uint64_t sz = type_sizeof(elem_type);
+                        if (sz != 1) {
+                            rv_addi_imm(RV_T2, RV_ZERO, sz);
+                            rv_mul(RV_T1, RV_T1, RV_T2);
+                        }
+                    }
+                    rv_add(RV_T0, RV_T0, RV_T1);
+                    v.kind = VAL_LVAL;
+                    v.type = elem_type;
+                    v.reg = RV_T0;
+                    v.offset = 0;
+                    continue;
+                }
+                if (lx->cur.kind == T_DOT || lx->cur.kind == T_ARROW) {
+                    int is_arrow = (lx->cur.kind == T_ARROW);
+                    lex_next(lx);
+                    if (lx->cur.kind != T_IDENT) {
+                        parse_error("expected member name");
+                        break;
+                    }
+                    char mname[CC_MAX_IDENT];
+                    strncpy(mname, lx->cur.text, CC_MAX_IDENT - 1);
+                    lex_next(lx);
+                    /* Get struct type. */
+                    type_t *st = is_arrow ? v.type->base : v.type;
+                    if (!st || (st->kind != TY_STRUCT && st->kind != TY_UNION)) {
+                        cc_error("member access on non-struct");
+                        break;
+                    }
+                    int fi = -1;
+                    for (int i = 0; i < st->nfields; i++) {
+                        if (strcmp(st->fields[i].name, mname) == 0) { fi = i; break; }
+                    }
+                    if (fi < 0) {
+                        cc_error("no member '%s' in struct", mname);
+                        break;
+                    }
+                    if (is_arrow) {
+                        /* v is pointer; load address into T0. */
+                        load_value(&v, RV_T0);
+                        v.kind = VAL_LVAL;
+                        v.reg = RV_T0;
+                        v.offset = (int64_t)st->fields[fi].offset;
+                    } else {
+                        /* v is the struct value (must be LVAL/SYM). */
+                        if (v.kind == VAL_SYM) {
+                            materialize(&v, RV_T0);
+                        }
+                        v.kind = VAL_LVAL;
+                        v.offset += (int64_t)st->fields[fi].offset;
+                    }
+                    v.type = st->fields[fi].type;
+                    continue;
+                }
+                if (lx->cur.kind == T_LPAREN) {
+                    /* Postfix call on a value: e.g. func_ptr(args), arr[i](args). */
+                    type_t *ft = NULL;
+                    if (v.type->kind == TY_PTR && v.type->base && v.type->base->kind == TY_FUNC) {
+                        ft = v.type->base;
+                    } else if (v.type->kind == TY_FUNC) {
+                        ft = v.type;
+                    }
+                    if (!ft) {
+                        cc_error("called object is not a function or function pointer");
+                        break;
+                    }
+                    return gen_call(lx, -1, ft, &v);
+                }
+                if (lx->cur.kind == T_INC || lx->cur.kind == T_DEC) {
+                    int op = lx->cur.kind;
+                    lex_next(lx);
+                    if (v.kind != VAL_SYM && v.kind != VAL_LVAL) {
+                        cc_error("++/-- requires lvalue");
+                        break;
+                    }
+                    /* Load current value into T0. */
+                    val_t cur = v;
+                    load_value(&cur, RV_T0);
+                    /* Compute new value: +/- 1, scaled by sizeof if pointer. */
+                    uint64_t sz = type_is_pointer(v.type) ? type_sizeof(v.type->base) : 1;
+                    rv_addi_imm(RV_T1, RV_T0, op == T_INC ? (int64_t)sz : -(int64_t)sz);
+                    /* Store back. */
+                    int addr_reg = RV_T2;
+                    if (v.kind == VAL_SYM) {
+                        materialize(&v, addr_reg);
+                    } else {
+                        rv_addi(addr_reg, v.reg, (int)v.offset);
+                    }
+                    uint64_t st = type_sizeof(v.type);
+                    switch (st) {
+                        case 1: rv_sb(RV_T1, addr_reg, 0); break;
+                        case 2: rv_sh(RV_T1, addr_reg, 0); break;
+                        case 4: rv_sw(RV_T1, addr_reg, 0); break;
+                        case 8: rv_sd(RV_T1, addr_reg, 0); break;
+                    }
+                    /* Post-inc/dec returns the OLD value (already in T0). */
+                    v.kind = VAL_REG;
+                    v.reg = RV_T0;
+                    v.offset = 0;
+                    continue;
+                }
+                break;
+            }
             return v;
         }
         case T_KW_SIZEOF: {
@@ -1696,8 +1313,7 @@ static val_t parse_primary(lexer_t *lx) {
             parse_expect(T_LPAREN, "expected '(' after sizeof");
             if (is_type_start(lx)) {
                 type_t *t = parse_type_spec(lx);
-                char dummy_name[CC_MAX_IDENT];
-                t = parse_declarator(lx, t, dummy_name, sizeof(dummy_name));
+                while (accept(T_STAR)) t = type_make_ptr(t);
                 parse_expect(T_RPAREN, "expected ')'");
                 v.kind = VAL_IMM;
                 v.imm = (int64_t)type_sizeof(t);
@@ -1776,27 +1392,13 @@ static val_t parse_unary(lexer_t *lx) {
             lex_next(lx);
             val_t e = parse_unary(lx);
             if (e.kind == VAL_SYM) {
-                /* &sym — materialize address; the ADDRESS is the value, so
-                 * return it as VAL_REG (not LVAL — otherwise gen_store's
-                 * load_value would dereference it). */
+                /* &sym — materialize address. */
                 materialize(&e, RV_T0);
-                e.kind = VAL_REG;
-                e.reg = RV_T0;
-                e.offset = 0;
                 e.type = type_make_ptr(e.type);
                 return e;
             }
-            if (e.kind == VAL_LVAL || e.kind == VAL_SPILL) {
-                /* &*p — same as p; &(a[i]) — address already computed. */
-                materialize(&e, RV_T0);
-                e.kind = VAL_REG;
-                e.reg = RV_T0;
-                e.offset = 0;
-                e.type = type_make_ptr(e.type);
-                return e;
-            }
-            if (e.kind == VAL_REG && e.type->kind == TY_FUNC) {
-                /* Bare function name — decay to function pointer. */
+            if (e.kind == VAL_LVAL) {
+                /* &*p — same as p. */
                 e.type = type_make_ptr(e.type);
                 return e;
             }
@@ -1807,12 +1409,10 @@ static val_t parse_unary(lexer_t *lx) {
             int op = lx->cur.kind;
             lex_next(lx);
             val_t e = parse_unary(lx);
-            if (e.kind != VAL_SYM && e.kind != VAL_LVAL && e.kind != VAL_SPILL) {
+            if (e.kind != VAL_SYM && e.kind != VAL_LVAL) {
                 cc_error("++/-- requires lvalue");
                 return e;
             }
-            /* Spill the object ADDRESS before value evaluation. */
-            spill_lval(&e);
             /* Load current value. */
             val_t cur = e;
             load_value(&cur, RV_T0);
@@ -1821,7 +1421,7 @@ static val_t parse_unary(lexer_t *lx) {
             rv_addi_imm(RV_T1, RV_T0, op == T_INC ? (int64_t)sz : -(int64_t)sz);
             /* Store back. */
             int addr_reg = RV_T2;
-            if (e.kind == VAL_SYM || e.kind == VAL_SPILL) {
+            if (e.kind == VAL_SYM) {
                 materialize(&e, addr_reg);
             } else {
                 rv_addi(addr_reg, e.reg, (int)e.offset);
@@ -1848,7 +1448,7 @@ static val_t parse_unary(lexer_t *lx) {
 
 /* Helper: assign a new value to an lvalue. */
 static void gen_store(val_t *lhs, val_t *rhs, int op) {
-    if (lhs->kind != VAL_SYM && lhs->kind != VAL_LVAL && lhs->kind != VAL_SPILL) {
+    if (lhs->kind != VAL_SYM && lhs->kind != VAL_LVAL) {
         cc_error("assignment requires lvalue");
         return;
     }
@@ -1856,14 +1456,11 @@ static void gen_store(val_t *lhs, val_t *rhs, int op) {
     bool fp_lhs = is_float_type(lhs->type);
 
     if (fp_lhs) {
-        /* Float/double store path.
-         * Load the CURRENT lhs value FIRST: the rhs evaluation leaves its
-         * result in FT0, so loading rhs-then-cur clobbers rhs with the cur
-         * value (r *= b computed 0 because rhs was overwritten before use). */
+        /* Float/double store path. */
+        load_float_value(rhs, RV_FT0);
         if (op != T_ASSIGN) {
             val_t cur = *lhs;
             load_float_value(&cur, RV_FT1);
-            load_float_value(rhs, RV_FT0);
             bool is_d = (lhs->type->kind == TY_DOUBLE || lhs->type->kind == TY_LDOUBLE);
             switch (op) {
                 case T_PLUS_ASSIGN:  is_d ? rv_fadd_d(RV_FT0, RV_FT1, RV_FT0) : rv_fadd_s(RV_FT0, RV_FT1, RV_FT0); break;
@@ -1872,12 +1469,10 @@ static void gen_store(val_t *lhs, val_t *rhs, int op) {
                 case T_SLASH_ASSIGN: is_d ? rv_fdiv_d(RV_FT0, RV_FT1, RV_FT0) : rv_fdiv_s(RV_FT0, RV_FT1, RV_FT0); break;
                 default: cc_error("invalid compound assignment for float"); break;
             }
-        } else {
-            load_float_value(rhs, RV_FT0);
         }
         /* Compute address of LHS into T0. */
         int addr_reg = RV_T0;
-        if (lhs->kind == VAL_SYM || lhs->kind == VAL_SPILL) {
+        if (lhs->kind == VAL_SYM) {
             materialize(lhs, addr_reg);
         } else {
             rv_addi(addr_reg, lhs->reg, (int)lhs->offset);
@@ -1919,7 +1514,7 @@ static void gen_store(val_t *lhs, val_t *rhs, int op) {
 
     /* Compute address of LHS into T2. */
     int addr_reg = RV_T2;
-    if (lhs->kind == VAL_SYM || lhs->kind == VAL_SPILL) {
+    if (lhs->kind == VAL_SYM) {
         materialize(lhs, addr_reg);
     } else {
         rv_addi(addr_reg, lhs->reg, (int)lhs->offset);
@@ -2093,59 +1688,10 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
             continue;
         }
 
-        /* Protect an LVAL lhs from RHS evaluation clobbering its address
-         * register (no register allocator: `c->pos < c->cap` used to load
-         * cap through the pos VALUE). Spill the address to the stack. */
-        if (lhs.kind == VAL_LVAL && lhs.reg != RV_FP) {
-            g_func.cur_offset += 8;
-            g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-            int64_t slot = -(int64_t)g_func.cur_offset;
-            if (g_func.cur_offset > g_func.frame_size) {
-                g_func.frame_size = g_func.cur_offset;
-            }
-            if (lhs.offset == 0) {
-                rv_sd(lhs.reg, RV_FP, (int)slot);
-            } else {
-                rv_addi(RV_T3, lhs.reg, (int)lhs.offset);
-                rv_sd(RV_T3, RV_FP, (int)slot);
-            }
-            lhs.kind = VAL_SPILL;
-            lhs.reg = RV_FP;
-            lhs.offset = slot;
-        }
-
-        /* FP lhs sitting in a scratch FP register must be spilled BEFORE
-         * the RHS is parsed — RHS evaluation uses FT0/FT1 as scratch and
-         * would destroy it (`term * -1.0 / x` yielded the old term). */
-        spill_freg(&lhs);
-        /* INT lhs in a scratch reg: same rule (2*i*(2*i+1) collapsed to
-         * garbage when the RHS sub-expression reused T0). */
-        spill_ireg(&lhs);
-
         val_t rhs = parse_unary(lx);
         int next_prec = op_prec(lx->cur.kind);
         if (next_prec > prec) {
             rhs = parse_binop_rhs(lx, prec + 1, rhs);
-        }
-
-        /* Spill an LVAL rhs as well: loading the LHS first would clobber
-         * the register holding the RHS address (`c->pos < c->cap`). */
-        if (rhs.kind == VAL_LVAL && rhs.reg != RV_FP) {
-            g_func.cur_offset += 8;
-            g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-            int64_t slot = -(int64_t)g_func.cur_offset;
-            if (g_func.cur_offset > g_func.frame_size) {
-                g_func.frame_size = g_func.cur_offset;
-            }
-            if (rhs.offset == 0) {
-                rv_sd(rhs.reg, RV_FP, (int)slot);
-            } else {
-                rv_addi(RV_T3, rhs.reg, (int)rhs.offset);
-                rv_sd(RV_T3, RV_FP, (int)slot);
-            }
-            rhs.kind = VAL_SPILL;
-            rhs.reg = RV_FP;
-            rhs.offset = slot;
         }
 
         /* Type promotion for arithmetic. */
@@ -2153,11 +1699,10 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
         bool fp_arith = is_float_type(common);
 
         if (fp_arith) {
-            /* Float/double arithmetic — use FPU registers.
-             * RHS first (results live in FT0 — same clobber rule as ints). */
+            /* Float/double arithmetic — use FPU registers. */
             bool is_d = (common->kind == TY_DOUBLE || common->kind == TY_LDOUBLE);
-            load_float_value(&rhs, RV_FT1);
             load_float_value(&lhs, RV_FT0);
+            load_float_value(&rhs, RV_FT1);
             switch (op) {
                 case T_PLUS:
                     is_d ? rv_fadd_d(RV_FT0, RV_FT0, RV_FT1) : rv_fadd_s(RV_FT0, RV_FT0, RV_FT1);
@@ -2207,11 +1752,8 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
             continue;
         }
 
-        /* Load RHS first: every expression leaves its result in T0, so
-         * loading the LHS into T0 first would clobber an RHS sitting there
-         * (`i < n / 2` degenerated into `i < i` and loops never ran). */
-        load_value(&rhs, RV_T1);
         load_value(&lhs, RV_T0);
+        load_value(&rhs, RV_T1);
 
         if (type_is_pointer(lhs.type) && type_is_integer(rhs.type)) {
             /* pointer + int → pointer arithmetic, scale by sizeof(*lhs). */
@@ -2283,11 +1825,7 @@ static val_t parse_ternary(lexer_t *lx) {
         rv_beq(RV_T0, RV_ZERO, 0);
         uint32_t br1_off = (uint32_t)g_text.size - 4;
         val_t then_v = parse_expr(lx);
-        if (is_float_type(then_v.type)) {
-            load_float_value(&then_v, RV_FT0);
-        } else {
-            load_value(&then_v, RV_T0);
-        }
+        load_value(&then_v, RV_T0);
         /* jal end */
         rv_jal(RV_ZERO, 0);
         uint32_t jmp_off = (uint32_t)g_text.size - 4;
@@ -2295,11 +1833,7 @@ static val_t parse_ternary(lexer_t *lx) {
         else_label = (uint32_t)g_text.size;
         parse_expect(T_COLON, "expected ':' in ternary");
         val_t else_v = parse_ternary(lx);
-        if (is_float_type(else_v.type)) {
-            load_float_value(&else_v, RV_FT0);
-        } else {
-            load_value(&else_v, RV_T0);
-        }
+        load_value(&else_v, RV_T0);
         end_label = (uint32_t)g_text.size;
 
         /* Patch branches. */
@@ -2319,7 +1853,7 @@ static val_t parse_ternary(lexer_t *lx) {
         p2[0] = i2 & 0xff; p2[1] = (i2 >> 8) & 0xff; p2[2] = (i2 >> 16) & 0xff; p2[3] = (i2 >> 24) & 0xff;
 
         then_v.kind = VAL_REG;
-        then_v.reg = is_float_type(then_v.type) ? RV_FT0 : RV_T0;
+        then_v.reg = RV_T0;
         return then_v;
     }
     return cond;
@@ -2332,31 +1866,6 @@ static val_t parse_assign(lexer_t *lx) {
         k == T_SLASH_ASSIGN || k == T_PERCENT_ASSIGN || k == T_AND_ASSIGN || k == T_OR_ASSIGN ||
         k == T_XOR_ASSIGN || k == T_SHL_ASSIGN || k == T_SHR_ASSIGN) {
         lex_next(lx);
-
-        /* Spill the LHS address to a stack slot BEFORE evaluating the RHS.
-         * The codegen has no register allocator: every expression uses the
-         * T0-T2 scratch set, so an LVAL held in a scratch register across
-         * RHS evaluation silently turns into garbage (`*p = 5` used to
-         * store through the VALUE 5). The spilled slot is marked VAL_SPILL:
-         * it CONTAINS the target address (double indirection on use). */
-        if (lhs.kind == VAL_LVAL && lhs.reg != RV_FP) {
-            g_func.cur_offset += 8;
-            g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-            int64_t slot = -(int64_t)g_func.cur_offset;
-            if (g_func.cur_offset > g_func.frame_size) {
-                g_func.frame_size = g_func.cur_offset;
-            }
-            if (lhs.offset == 0) {
-                rv_sd(lhs.reg, RV_FP, (int)slot);
-            } else {
-                rv_addi(RV_T3, lhs.reg, (int)lhs.offset);
-                rv_sd(RV_T3, RV_FP, (int)slot);
-            }
-            lhs.kind = VAL_SPILL;
-            lhs.reg = RV_FP;
-            lhs.offset = slot;
-        }
-
         val_t rhs = parse_assign(lx);
         gen_store(&lhs, &rhs, k);
         /* Assignment returns the assigned value. */
@@ -2584,67 +2093,25 @@ static void parse_stmt_body(lexer_t *lx) {
             return;
         }
         for (;;) {
+            type_t *t = base;
+            while (accept(T_STAR)) {
+                t = type_make_ptr(t);
+                while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
+            }
             char name[CC_MAX_IDENT] = {0};
-            /* Full declarator — supports function pointers, e.g.
-             * `int (*cmp)(const void *, const void *) = my_cmp;`. */
-            type_t *t = parse_declarator(lx, base, name, sizeof(name));
-
-            if (is_typedef) {
-                /* typedef inside a function body — install globally. */
-                t->is_typedef = true;
-                symtab_install_global(name, SYM_TYPEDEF, t);
-                if (accept(T_COMMA)) continue;
-                break;
+            if (lx->cur.kind == T_IDENT) {
+                strncpy(name, lx->cur.text, CC_MAX_IDENT - 1);
+                lex_next(lx);
             }
-            if (is_extern) {
-                /* extern declaration inside a function — reference to a
-                 * global defined elsewhere. */
-                t->is_extern = true;
-                int gidx = symtab_lookup_global(name);
-                if (gidx < 0) {
-                    gidx = symtab_install_global(name, SYM_GLOBAL_VAR, t);
-                    g_globals[gidx].is_defined = false;
+            while (lx->cur.kind == T_LBRACKET) {
+                lex_next(lx);
+                uint64_t len = 0;
+                if (lx->cur.kind != T_RBRACKET) {
+                    len = (uint64_t)parse_const_expr(lx);
                 }
-                if (accept(T_COMMA)) continue;
-                break;
+                parse_expect(T_RBRACKET, "expected ']'");
+                t = type_make_array(t, len);
             }
-            if (is_static) {
-                /* Static local: allocate in .data/.bss with a mangled name
-                 * (function-scoped, collision-free across functions).
-                 * Initialization happens at LOAD time like a global, so we
-                 * route through gen_decl() instead of emitting runtime
-                 * stores. Do NOT set is_static on the type — the name is
-                 * already unique (gen_decl's per-file mangling would break
-                 * symbol lookups). */
-                char gname[CC_MAX_IDENT * 2];
-                snprintf(gname, sizeof(gname), "__sl_%s_%s",
-                         g_cur_func_name[0] ? g_cur_func_name : "_", name);
-                int gidx = symtab_lookup_global(gname);
-                if (gidx < 0) {
-                    gidx = symtab_install_global(gname, SYM_GLOBAL_VAR, t);
-                }
-                if (!g_globals[gidx].is_defined) {
-                    decl_t *sd = ast_new_decl(D_VAR, lx->cur.pos);
-                    sd->type = t;
-                    strncpy(sd->name, gname, CC_MAX_IDENT * 2 - 1);
-                    if (accept(T_ASSIGN)) {
-                        sd->init = gen_parse_global_init(lx, t);
-                    }
-                    gen_decl(sd);
-                } else if (accept(T_ASSIGN)) {
-                    /* Redundant re-declaration — consume and ignore init. */
-                    gen_parse_global_init(lx, t);
-                }
-                /* Local alias so plain `name` resolves to the global. */
-                int lidx = symtab_lookup_local(name);
-                if (lidx < 0) {
-                    lidx = symtab_install_local(name, SYM_LOCAL_VAR, t, g_cur_scope);
-                }
-                g_locals[lidx].alias_global = gidx;
-                if (accept(T_COMMA)) continue;
-                break;
-            }
-
             /* For incomplete array types, defer stack allocation so that
              * brace initializer can complete the type first. */
             bool deferred = false;
@@ -2662,12 +2129,6 @@ static void parse_stmt_body(lexer_t *lx) {
                 g_func.cur_offset += sz;
                 g_func.cur_offset = (g_func.cur_offset + al - 1) & ~(al - 1);
                 off = -(int64_t)g_func.cur_offset;
-                /* Track local struct/union objects: call arguments must
-                 * copy them directly (params arrive as pointers). */
-                if ((t->kind == TY_STRUCT || t->kind == TY_UNION) &&
-                    g_func.n_struct_locals < 64) {
-                    g_func.struct_local_slots[g_func.n_struct_locals++] = off;
-                }
                 idx = symtab_install_local(name, SYM_LOCAL_VAR, t, g_cur_scope);
                 g_locals[idx].offset = off;
                 if (g_func.cur_offset > g_func.frame_size) {
@@ -2677,37 +2138,7 @@ static void parse_stmt_body(lexer_t *lx) {
 
             /* Optional initializer. */
             if (accept(T_ASSIGN)) {
-                if (t->kind == TY_ARRAY && !deferred && lx->cur.kind == T_STRING &&
-                    (t->base->kind == TY_CHAR || t->base->kind == TY_SCHAR ||
-                     t->base->kind == TY_UCHAR)) {
-                    /* char a[N] = "literal" — copy bytes (with NUL) from
-                     * rodata into the local array, zero-pad the rest.
-                     * (Previously the string's ADDRESS was stored into
-                     * a[0], corrupting the array.) */
-                    size_t slen;
-                    char *sbuf = parse_concat_string(lx, &slen);
-                    uint64_t total = slen + 1;
-                    uint64_t arrsz = type_sizeof(t);
-                    uint32_t ro_off = cc_strpool_add(sbuf, slen);
-                    free(sbuf);
-                    uint32_t lui_off = (uint32_t)g_text.size;
-                    rv_lui(RV_T1, 0);
-                    uint32_t addi_off = (uint32_t)g_text.size;
-                    rv_addi(RV_T1, RV_T1, (int)ro_off);
-                    if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
-                    g_rodata_fixups[g_n_rodata_fixups].rodata_off = ro_off;
-                    g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
-                    g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
-                    g_n_rodata_fixups++;
-                    uint64_t ncopy = total < arrsz ? total : arrsz;
-                    for (uint64_t i = 0; i < ncopy; i++) {
-                        rv_lbu(RV_T2, RV_T1, (int)i);
-                        rv_sb(RV_T2, RV_FP, (int)off + (int)i);
-                    }
-                    for (uint64_t i = ncopy; i < arrsz; i++) {
-                        rv_sb(RV_ZERO, RV_FP, (int)off + (int)i);
-                    }
-                } else if (lx->cur.kind == T_LBRACE) {
+                if (lx->cur.kind == T_LBRACE) {
                     if (deferred) {
                         /* For incomplete arrays: parse brace init first to
                          * determine the actual element count, then allocate. */
@@ -2734,43 +2165,6 @@ static void parse_stmt_body(lexer_t *lx) {
                         gen_emit_local_braced_init(lx, t, off, idx);
                     } else {
                         gen_emit_local_braced_init(lx, t, off, idx);
-                    }
-                } else if (deferred && lx->cur.kind == T_STRING &&
-                           (t->base->kind == TY_CHAR || t->base->kind == TY_SCHAR ||
-                            t->base->kind == TY_UCHAR)) {
-                    /* char name[] = "literal"; — complete the array from the
-                     * string length, allocate, then copy bytes from rodata. */
-                    size_t slen;
-                    char *sbuf = parse_concat_string(lx, &slen);
-                    uint64_t total = slen + 1;   /* include NUL */
-                    t->length = total;
-                    t->is_incomplete = false;
-                    t->size = total;
-                    t->is_complete = true;
-                    uint64_t al = type_alignof(t);
-                    g_func.cur_offset += total;
-                    g_func.cur_offset = (g_func.cur_offset + al - 1) & ~(al - 1);
-                    off = -(int64_t)g_func.cur_offset;
-                    idx = symtab_install_local(name, SYM_LOCAL_VAR, t, g_cur_scope);
-                    g_locals[idx].offset = off;
-                    if (g_func.cur_offset > g_func.frame_size) {
-                        g_func.frame_size = g_func.cur_offset;
-                    }
-                    /* Bytes live in rodata; emit unrolled copy: lbu/sb pairs. */
-                    uint32_t ro_off = cc_strpool_add(sbuf, slen);
-                    free(sbuf);
-                    uint32_t lui_off = (uint32_t)g_text.size;
-                    rv_lui(RV_T1, 0);
-                    uint32_t addi_off = (uint32_t)g_text.size;
-                    rv_addi(RV_T1, RV_T1, (int)ro_off);
-                    if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
-                    g_rodata_fixups[g_n_rodata_fixups].rodata_off = ro_off;
-                    g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
-                    g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
-                    g_n_rodata_fixups++;
-                    for (uint64_t i = 0; i < total; i++) {
-                        rv_lbu(RV_T2, RV_T1, (int)i);
-                        rv_sb(RV_T2, RV_FP, (int)off + (int)i);
                     }
                 } else {
                     val_t init = parse_assign(lx);
@@ -2801,13 +2195,7 @@ static void parse_stmt_body(lexer_t *lx) {
             val_t cond = parse_expr(lx);
             parse_expect(T_RPAREN, "expected ')'");
             load_value(&cond, RV_T0);
-            /* Inverted-branch pattern (B-type ±4 KiB is too short for big
-             * then/else bodies):
-             *   bne t0, zero, +8    ; cond true  -> then
-             *   jal zero, else/end  ; cond false -> skip (JAL ±1 MiB)
-             */
-            rv_bne(RV_T0, RV_ZERO, 8);
-            rv_jal(RV_ZERO, 0);
+            rv_beq(RV_T0, RV_ZERO, 0);  /* skip then if false */
             uint32_t br_off = (uint32_t)g_text.size - 4;
             parse_stmt(lx);
             uint32_t end_label;
@@ -2818,14 +2206,28 @@ static void parse_stmt_body(lexer_t *lx) {
                 uint32_t else_label = (uint32_t)g_text.size;
                 parse_stmt(lx);
                 end_label = (uint32_t)g_text.size;
-                /* Patch the false-jump to else_label (JAL). */
-                patch_jal(br_off, (int32_t)else_label - (int32_t)br_off);
-                /* Patch then-skip jump to end_label. */
-                patch_jal(jmp_off, (int32_t)end_label - (int32_t)jmp_off);
+                /* Patch br1 to else_label. */
+                int32_t d1 = (int32_t)else_label - (int32_t)br_off;
+                uint8_t *p1 = g_text.data + br_off;
+                uint32_t i1 = (uint32_t)p1[0] | ((uint32_t)p1[1] << 8) | ((uint32_t)p1[2] << 16) | ((uint32_t)p1[3] << 24);
+                i1 |= ((uint32_t)(d1 & 0x1000) << 19) | ((uint32_t)(d1 & 0x7E0) << 20) |
+                      ((uint32_t)(d1 & 0x1E) << 7) | ((uint32_t)(d1 & 0x800) >> 4);
+                p1[0] = i1 & 0xff; p1[1] = (i1 >> 8) & 0xff; p1[2] = (i1 >> 16) & 0xff; p1[3] = (i1 >> 24) & 0xff;
+                int32_t d2 = (int32_t)end_label - (int32_t)jmp_off;
+                uint8_t *p2 = g_text.data + jmp_off;
+                uint32_t i2 = (uint32_t)p2[0] | ((uint32_t)p2[1] << 8) | ((uint32_t)p2[2] << 16) | ((uint32_t)p2[3] << 24);
+                i2 &= ~0xFFFFF000;
+                i2 |= ((uint32_t)(d2 & 0x100000) << 11) | ((uint32_t)(d2 & 0x7FE) << 20) |
+                      ((uint32_t)(d2 & 0x800) << 9) | ((uint32_t)(d2 & 0xFF000));
+                p2[0] = i2 & 0xff; p2[1] = (i2 >> 8) & 0xff; p2[2] = (i2 >> 16) & 0xff; p2[3] = (i2 >> 24) & 0xff;
             } else {
                 end_label = (uint32_t)g_text.size;
-                /* Patch the false-jump to end_label (JAL). */
-                patch_jal(br_off, (int32_t)end_label - (int32_t)br_off);
+                int32_t d1 = (int32_t)end_label - (int32_t)br_off;
+                uint8_t *p1 = g_text.data + br_off;
+                uint32_t i1 = (uint32_t)p1[0] | ((uint32_t)p1[1] << 8) | ((uint32_t)p1[2] << 16) | ((uint32_t)p1[3] << 24);
+                i1 |= ((uint32_t)(d1 & 0x1000) << 19) | ((uint32_t)(d1 & 0x7E0) << 20) |
+                      ((uint32_t)(d1 & 0x1E) << 7) | ((uint32_t)(d1 & 0x800) >> 4);
+                p1[0] = i1 & 0xff; p1[1] = (i1 >> 8) & 0xff; p1[2] = (i1 >> 16) & 0xff; p1[3] = (i1 >> 24) & 0xff;
             }
             return;
         }
@@ -2849,14 +2251,11 @@ static void parse_stmt_body(lexer_t *lx) {
             parse_expect(T_RPAREN, "expected ')'");
             parse_expect(T_SEMI, "expected ';'");
             load_value(&d_cond, RV_T0);
-            /* Loop back with JAL (±1 MiB): a big body overflows the B-type
-             * backward branch the same way as while-loops. */
-            rv_beq(RV_T0, RV_ZERO, 8);   /* cond false -> skip loop-back */
-            rv_jal(RV_ZERO, 0);          /* back to body_label */
-            uint32_t back_off = (uint32_t)g_text.size - 4;
+            rv_bne(RV_T0, RV_ZERO, 0);
+            uint32_t br_off = (uint32_t)g_text.size - 4;
             uint32_t end_label = (uint32_t)g_text.size;
 
-            patch_jal(back_off, (int32_t)body_label - (int32_t)back_off);
+            patch_branch(br_off, (int32_t)body_label - (int32_t)br_off);
             for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
                 patch_jal(g_func.break_fixups[i], (int32_t)end_label - (int32_t)g_func.break_fixups[i]);
             for (int i = saved_n_cont; i < g_func.n_continue_fixups; i++)
@@ -2874,14 +2273,7 @@ static void parse_stmt_body(lexer_t *lx) {
             val_t cond = parse_expr(lx);
             parse_expect(T_RPAREN, "expected ')'");
             load_value(&cond, RV_T0);
-            /* Inverted-branch pattern: B-type immediates only reach ±4 KiB;
-             * loop bodies can be far larger (vformat_run's switch is >8 KiB),
-             * which used to overflow the immediate into a BACKWARD jump.
-             *   bne t0, zero, +8     ; cond true -> fall into body
-             *   jal zero, exit       ; cond false -> exit (JAL: ±1 MiB)
-             */
-            rv_bne(RV_T0, RV_ZERO, 8);
-            rv_jal(RV_ZERO, 0);
+            rv_beq(RV_T0, RV_ZERO, 0);
             uint32_t br_off = (uint32_t)g_text.size - 4;
             int saved_n_break = g_func.n_break_fixups;
             int saved_n_cont = g_func.n_continue_fixups;
@@ -2895,8 +2287,8 @@ static void parse_stmt_body(lexer_t *lx) {
             rv_jal(RV_ZERO, 0);  /* back to cond_label */
             uint32_t jmp_off = (uint32_t)g_text.size - 4;
             uint32_t end_label = (uint32_t)g_text.size;
-            /* Patch conditional exit jump. */
-            patch_jal(br_off, (int32_t)end_label - (int32_t)br_off);
+            /* Patch conditional branch. */
+            patch_branch(br_off, (int32_t)end_label - (int32_t)br_off);
             /* Patch loop-back jump. */
             patch_jal(jmp_off, (int32_t)cond_label - (int32_t)jmp_off);
             /* Patch break fixups. */
@@ -2919,31 +2311,17 @@ static void parse_stmt_body(lexer_t *lx) {
                 if (is_float_type(v.type)) {
                     /* Return float/double in FA0 (float ABI convention). */
                     load_float_value(&v, RV_FA0);
-                } else if (g_cur_func_ret && is_float_type(g_cur_func_ret)) {
-                    /* Int value returned from a double function: convert
-                     * (`return 1` in pow() used to leave fa0 untouched). */
-                    load_value(&v, RV_T0);
-                    rv_fcvt_d_l(RV_FA0, RV_T0);
                 } else {
                     load_value(&v, RV_A0);
                 }
             }
             parse_expect(T_SEMI, "expected ';'");
-            /* Epilogue: restore fp, ra; dealloc stack; ret.
-             * Return value already in a0/fa0 — keep it. */
-            {
-                uint32_t lui_off = (uint32_t)g_text.size;
-                rv_lui(RV_T1, 0);
-                epilogue_record(lui_off, 2);
-                uint32_t addi_off = (uint32_t)g_text.size;
-                rv_addi(RV_T1, RV_T1, 0);
-                epilogue_record(addi_off, 3);
-                rv_sub(RV_SP, RV_FP, RV_T1);
-                rv_ld(RV_RA, RV_SP, 8);
-                rv_ld(RV_FP, RV_SP, 0);
-                rv_add(RV_SP, RV_SP, RV_T1);
-                rv_ret();
-            }
+            /* Epilogue: restore fp, ra; dealloc stack; ret. */
+            rv_addi(RV_SP, RV_FP, 0);
+            rv_ld(RV_RA, RV_SP, 8);
+            rv_ld(RV_FP, RV_SP, 0);
+            rv_addi(RV_SP, RV_SP, 16);
+            rv_ret();
             return;
         }
         case T_KW_BREAK: {
@@ -3016,10 +2394,7 @@ static void parse_stmt_body(lexer_t *lx) {
             parse_expect(T_SEMI, "expected ';'");
             if (has_cond) {
                 load_value(&cond, RV_T0);
-                /* Inverted-branch exit (B-type ±4 KiB overflows on big
-                 * bodies — same fix as while). */
-                rv_bne(RV_T0, RV_ZERO, 8);
-                rv_jal(RV_ZERO, 0);
+                rv_beq(RV_T0, RV_ZERO, 0);
             }
             uint32_t br_off = has_cond ? (uint32_t)g_text.size - 4 : 0;
 
@@ -3074,7 +2449,7 @@ static void parse_stmt_body(lexer_t *lx) {
             g_func.loop_depth--;
 
             if (has_cond)
-                patch_jal(br_off, (int32_t)end_label - (int32_t)br_off);
+                patch_branch(br_off, (int32_t)end_label - (int32_t)br_off);
             patch_jal(jmp_off, (int32_t)cond_label - (int32_t)jmp_off);
             /* Patch break fixups → end_label. */
             for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
@@ -3102,14 +2477,6 @@ static void parse_stmt_body(lexer_t *lx) {
             g_func.break_label = 0;
             g_func.switch_depth++;
             uint32_t prev_branch = 0;
-            /* Label-to-handler jumps: every `case V:` compare that MATCHES
-             * must jump past the remaining labels of its group into the
-             * handler. The old code relied on fall-through, so for
-             * `case 'd': case 'i': handler` a 'd' match fell into the 'i'
-             * compare, mismatched, and escaped to the NEXT case — args were
-             * consumed by the wrong handlers (printf %d/%u/%x shifted). */
-            uint32_t label_jumps[128];
-            int n_label_jumps = 0;
             while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF) {
                 if (lx->cur.kind == T_KW_CASE) {
                     if (prev_branch)
@@ -3120,33 +2487,16 @@ static void parse_stmt_body(lexer_t *lx) {
                     parse_expect(T_COLON, "expected ':' after case value");
                     rv_bne(RV_T1, RV_T0, 0);
                     prev_branch = (uint32_t)g_text.size - 4;
-                    /* match → jump to handler (patched below). */
-                    rv_jal(RV_ZERO, 0);
-                    if (n_label_jumps < 128)
-                        label_jumps[n_label_jumps++] = (uint32_t)g_text.size - 4;
                 } else if (lx->cur.kind == T_KW_DEFAULT) {
                     if (prev_branch)
                         patch_branch(prev_branch, (int32_t)g_text.size - (int32_t)prev_branch);
                     prev_branch = 0;
                     lex_next(lx);
                     parse_expect(T_COLON, "expected ':' after default");
-                    /* default: the handler starts right here. */
-                    for (int i = 0; i < n_label_jumps; i++)
-                        patch_jal(label_jumps[i], (int32_t)g_text.size - (int32_t)label_jumps[i]);
-                    n_label_jumps = 0;
                 } else {
-                    /* First statement of this label group = handler start. */
-                    if (n_label_jumps > 0) {
-                        for (int i = 0; i < n_label_jumps; i++)
-                            patch_jal(label_jumps[i], (int32_t)g_text.size - (int32_t)label_jumps[i]);
-                        n_label_jumps = 0;
-                    }
                     parse_stmt(lx);
                 }
             }
-            /* Empty trailing group: handler = switch end. */
-            for (int i = 0; i < n_label_jumps; i++)
-                patch_jal(label_jumps[i], (int32_t)g_text.size - (int32_t)label_jumps[i]);
             if (prev_branch)
                 patch_branch(prev_branch, (int32_t)g_text.size - (int32_t)prev_branch);
             uint32_t end = (uint32_t)g_text.size;
@@ -3267,7 +2617,7 @@ static long long const_expr_binop(lexer_t *lx, int min_prec) {
     return lhs;
 }
 
-static long long gen_const_expr(lexer_t *lx) {
+long long parse_const_expr(lexer_t *lx) {
     return const_expr_binop(lx, 0);
 }
 
@@ -3308,65 +2658,6 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
         e->ival = start_off;
         e->type = type;
         return e;
-    }
-
-    /* Address-of-global initializers: &symbol, or a bare array/function
-     * name that decays to its address. Resolved at finalize time. */
-    {
-        bool handled = false;
-        if (lx->cur.kind == T_AMP) {
-            lexer_t save = *lx;
-            lex_next(lx);
-            if (lx->cur.kind == T_IDENT) {
-                int idx = symtab_lookup_global(lx->cur.text);
-                if (idx < 0 && g_opts.n_input_files > 1) {
-                    char mangled[CC_MAX_IDENT + 16];
-                    mangle_static_name(lx->cur.text, mangled, sizeof(mangled));
-                    idx = symtab_lookup_global(mangled);
-                }
-                if (idx >= 0 && (g_globals[idx].kind == SYM_GLOBAL_VAR ||
-                                 g_globals[idx].kind == SYM_FUNCTION)) {
-                    lex_next(lx);
-                    expr_t *e = ast_new_expr(EX_ADDR, lx->cur.pos);
-                    e->ival = idx;
-                    e->type = type_make_ptr(g_globals[idx].type);
-                    return e;
-                }
-            }
-            *lx = save;   /* not a resolvable symbol — fall through */
-            handled = true;
-        }
-        if (!handled && lx->cur.kind == T_IDENT) {
-            lexer_t save = *lx;
-            char nm[CC_MAX_IDENT];
-            strncpy(nm, lx->cur.text, CC_MAX_IDENT - 1);
-            nm[CC_MAX_IDENT - 1] = 0;
-            lex_next(lx);
-            if (lx->cur.kind == T_COMMA || lx->cur.kind == T_SEMI) {
-                int idx = symtab_lookup_global(nm);
-                if (idx < 0 && g_opts.n_input_files > 1) {
-                    char mangled[CC_MAX_IDENT + 16];
-                    mangle_static_name(nm, mangled, sizeof(mangled));
-                    idx = symtab_lookup_global(mangled);
-                }
-                if (idx >= 0 && g_globals[idx].kind == SYM_GLOBAL_VAR &&
-                    (g_globals[idx].type->kind == TY_ARRAY)) {
-                    /* Array name decays to its address. */
-                    expr_t *e = ast_new_expr(EX_ADDR, lx->cur.pos);
-                    e->ival = idx;
-                    e->type = type_make_ptr(g_globals[idx].type->base);
-                    return e;
-                }
-                if (idx >= 0 && g_globals[idx].kind == SYM_FUNCTION) {
-                    /* Function name decays to pointer-to-function. */
-                    expr_t *e = ast_new_expr(EX_ADDR, lx->cur.pos);
-                    e->ival = idx;
-                    e->type = type_make_ptr(g_globals[idx].type);
-                    return e;
-                }
-            }
-            *lx = save;
-        }
     }
 
     /* For non-string: support only integer/pointer constants. */
@@ -3557,8 +2848,6 @@ static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type) {
         gen_emit_global_init_scalar(lx, type);
     }
 
-    /* Allow a trailing comma before the closing brace: {1, 2, 3,}. */
-    accept(T_COMMA);
     parse_expect(T_RBRACE, "expected '}'");
     return (uint64_t)(g_data.size - start_off);
 }
@@ -3787,19 +3076,12 @@ static void gen_emit_global_init_scalar(lexer_t *lx, type_t *type) {
 }
 
 /* ---- Function body codegen ----------------------------------------- */
-static char g_cur_func_name[CC_MAX_IDENT] = "";
-
 static void gen_func_body(lexer_t *lx, decl_t *d) {
     type_t *ftype = d->type;
     symtab_enter_function(ftype);
-    strncpy(g_cur_func_name, d->name, CC_MAX_IDENT - 1);
-    g_cur_func_name[CC_MAX_IDENT - 1] = 0;
-    g_cur_func_ret = ftype->ret;
 
-    /* Frame bookkeeping. cur_offset starts at 16: the first local lands
-     * at fp-16; saved ra/fp live at the very BOTTOM of the frame
-     * (fp-frame+8, fp-frame+0), patched in once the size is known. */
-    g_func.frame_size = 16;
+    /* Reserve space for ra and fp. */
+    g_func.frame_size = 16;  /* ra at 8, fp at 0 */
     g_func.cur_offset = 16;
     g_func.max_call_args = 0;
     g_func.loop_depth = 0;
@@ -3808,10 +3090,7 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
     g_func.in_function = true;
     g_func.nparams = ftype->nparams;
     g_func.is_variadic = ftype->is_varargs;
-    g_func.n_va_locals = 0;
-    g_func.n_struct_locals = 0;
     label_clear();
-    g_n_epilogue_patches = 0;
 
     /* Pre-allocate slots for parameters. */
     int arg_regs[8] = {RV_A0, RV_A1, RV_A2, RV_A3, RV_A4, RV_A5, RV_A6, RV_A7};
@@ -3845,148 +3124,55 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
      * Approach: parse body into g_text with a placeholder prologue,
      * then patch frame_size. */
     uint32_t prologue_start = (uint32_t)g_text.size;
-    /* t1 = frame (patched lui+addi pair; a single addi immediate cannot
-     * represent +2048 or larger, which silently became NEGATIVE and put
-     * fp BELOW sp for functions with big locals like vformat_run). */
-    uint32_t prologue_lui_off = (uint32_t)g_text.size;
-    rv_lui(RV_T1, 0);
-    uint32_t prologue_addi_off = (uint32_t)g_text.size;
-    rv_addi(RV_T1, RV_T1, 0);
-    rv_sub(RV_SP, RV_SP, RV_T1);    /* sp -= frame */
-    /* sd ra, 8(sp) — ra at frame bottom + 8 */
+    /* Emit 16-byte placeholder prologue: */
+    /* addi sp, sp, -FRAME  (patched) */
+    rv_addi(RV_SP, RV_SP, 0);
+    /* sd ra, 8(sp) */
     rv_sd(RV_RA, RV_SP, 8);
-    /* sd fp, 0(sp) — old fp at frame bottom */
+    /* sd fp, 0(sp) */
     rv_sd(RV_FP, RV_SP, 0);
-    /* fp = sp + frame = TOP of frame (caller's sp).
-     * Locals live at fp-N, INSIDE the frame. */
-    rv_add(RV_FP, RV_SP, RV_T1);
+    /* addi fp, sp, 0 */
+    rv_addi(RV_FP, RV_SP, 0);
 
-    /* Store parameters from a0-a7 / fa0-fa7 to their slots.
-     * Integer params arrive in the a-regs; float/double params arrive in
-     * the fa-regs (independent register files — matching gen_call).
-     * The old code stored EVERY param from the a-regs, so any function
-     * taking a double read garbage (sqrt(4.0) computed from junk). */
-    {
-        int gp_i = 0, fp_i = 0;
-        for (int i = 0; i < ftype->nparams; i++) {
-            int off = param_slots[i];
-            type_t *ptyp = ftype->params[i].type;
-            bool is_fp = is_float_type(ptyp);
-            bool is_struct = (ptyp->kind == TY_STRUCT || ptyp->kind == TY_UNION);
-            if (is_fp) {
-                if (fp_i < 8) {
-                    rv_fsd(RV_FA0 + fp_i, RV_FP, off);
-                    fp_i++;
-                }
-            } else if (is_struct) {
-                /* Struct passed BY VALUE: the register holds a POINTER to
-                 * the caller's copy — dereference into the local slot so
-                 * p.field accesses read the struct's bytes directly. */
-                if (gp_i < 8) {
-                    uint64_t sz = type_sizeof(ptyp);
-                    if (sz > 32) sz = 32;
-                    rv_addi(RV_T0, RV_FP, off);       /* &local slot */
-                    for (uint64_t k = 0; k < sz; k += 8) {
-                        rv_ld(RV_T1, arg_regs[gp_i], (int)k);
-                        rv_sd(RV_T1, RV_T0, (int)k);
-                    }
-                    gp_i++;
-                }
-            } else {
-                if (gp_i < 8) {
-                    uint64_t sz = type_sizeof(ptyp);
-                    switch (sz) {
-                        case 1: rv_sb(arg_regs[gp_i], RV_FP, off); break;
-                        case 2: rv_sh(arg_regs[gp_i], RV_FP, off); break;
-                        case 4: rv_sw(arg_regs[gp_i], RV_FP, off); break;
-                        default: rv_sd(arg_regs[gp_i], RV_FP, off); break;
-                    }
-                    gp_i++;
-                }
-            }
+    /* Store parameters from a0-a7 to their slots. */
+    for (int i = 0; i < ftype->nparams && i < 8; i++) {
+        int off = param_slots[i];
+        type_t *ptyp = ftype->params[i].type;
+        uint64_t sz = type_sizeof(ptyp);
+        switch (sz) {
+            case 1: rv_sb(arg_regs[i], RV_FP, off); break;
+            case 2: rv_sh(arg_regs[i], RV_FP, off); break;
+            case 4: rv_sw(arg_regs[i], RV_FP, off); break;
+            case 8: rv_sd(arg_regs[i], RV_FP, off); break;
         }
     }
 
-    /* For variadic functions: save all a0-a7 to the register save area.
-     * The 64-byte area MUST be allocated inside the frame (below every
-     * local). The old code neither reserved the space nor aligned it, so
-     * with fp at the frame top the a5-a7 stores landed ABOVE fp — inside
-     * the CALLER's frame, silently corrupting its locals (vfprintf's ap
-     * became garbage). */
+    /* For variadic functions: save all a0-a7 to the register save area. */
     if (ftype->is_varargs) {
-        /* GP save area (a0-a7). */
-        g_func.cur_offset += 64;
-        g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
         g_func.va_save_off = -(int)g_func.cur_offset;
-        if (g_func.cur_offset > g_func.frame_size) {
-            g_func.frame_size = g_func.cur_offset;
-        }
         for (int i = 0; i < 8; i++) {
             rv_sd(arg_regs[i], RV_FP, g_func.va_save_off + i * 8);
-        }
-        /* FP save area (fa0-fa7): doubles in varargs are passed in the
-         * FP registers — without saving them, va_arg(ap, double) read
-         * garbage from the GP area. */
-        g_func.cur_offset += 64;
-        g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
-        g_func.va_fsave_off = -(int)g_func.cur_offset;
-        if (g_func.cur_offset > g_func.frame_size) {
-            g_func.frame_size = g_func.cur_offset;
-        }
-        for (int i = 0; i < 8; i++) {
-            rv_fsd(RV_FA0 + i, RV_FP, g_func.va_fsave_off + i * 8);
         }
     }
 
     parse_compound(lx);
 
     /* Default return. */
-    emit_function_epilogue();
+    rv_addi(RV_A0, RV_ZERO, 0);
+    rv_addi(RV_SP, RV_FP, 0);
+    rv_ld(RV_RA, RV_SP, 8);
+    rv_ld(RV_FP, RV_SP, 0);
+    rv_addi(RV_SP, RV_SP, 16);
+    rv_ret();
 
-    /* Patch prologue and epilogues with the real frame size, using the
-     * standard lui/addi decomposition: lui gets (frame+0x800)>>12, addi
-     * gets frame - (lui<<12) (always fits in [-2048, 2047]). */
+    /* Patch prologue: replace `addi sp, sp, 0` with `addi sp, sp, -frame`. */
     int frame = (g_func.frame_size + 15) & ~15;
-    /* The frame must ALSO hold saved ra/fp BELOW the deepest local. */
-    frame = (frame + 16) & ~15;
-    {
-        uint32_t lui_imm = (uint32_t)(((uint64_t)frame + 0x800) >> 12);
-        int32_t addi_imm = (int32_t)frame - (int32_t)(lui_imm << 12);
-
-        /* Prologue lui+addi (t1 = frame). */
-        for (int k = 0; k < 2; k++) {
-            uint32_t off = k == 0 ? prologue_lui_off : prologue_addi_off;
-            uint8_t *p = g_text.data + off;
-            uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-            if (k == 0) {
-                insn &= ~0xFFFFF000u;
-                insn |= (lui_imm & 0xFFFFF) << 12;
-            } else {
-                insn &= ~0xFFF00000u;
-                insn |= ((uint32_t)addi_imm & 0xFFF) << 20;
-            }
-            p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
-            p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
-        }
-
-        /* Epilogue lui+addi pairs. */
-        for (int i = 0; i < g_n_epilogue_patches; i++) {
-            int kind = g_epilogue_patch_neg[i];
-            uint8_t *q = g_text.data + g_epilogue_patch_off[i];
-            uint32_t e = (uint32_t)q[0] | ((uint32_t)q[1] << 8) |
-                         ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
-            if (kind == 2) {
-                e &= ~0xFFFFF000u;
-                e |= (lui_imm & 0xFFFFF) << 12;
-            } else if (kind == 3) {
-                e &= ~0xFFF00000u;
-                e |= ((uint32_t)addi_imm & 0xFFF) << 20;
-            }
-            q[0] = e & 0xff; q[1] = (e >> 8) & 0xff;
-            q[2] = (e >> 16) & 0xff; q[3] = (e >> 24) & 0xff;
-        }
-    }
-    g_n_epilogue_patches = 0;
+    int32_t f = -frame;
+    uint8_t *p = g_text.data + prologue_start;
+    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    insn &= ~0xFFF00000;
+    insn |= ((uint32_t)(f & 0xFFF)) << 20;
+    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff; p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
 
     rv_resolve_fixups();
     label_check_unresolved();
@@ -4003,17 +3189,6 @@ void gen_init(void) {
     cc_buf_init(&g_data);
     g_bss_size = 0;
     g_entry = 0;
-
-    /* Built-in typedefs recognized by the compiler:
-     * __builtin_va_list — va_list is a plain char* on our ABI (the
-     * va_start/va_arg builtins treat it as a pointer). Without this,
-     * `va_list` params resolved to implicit int (4 bytes), corrupting
-     * variadic frames. */
-    /* va_list = char* — points to a 16-byte cursor pair:
-     *   [ap+0] = GP cursor (integer varargs, walks the a0-a7 save area)
-     *   [ap+8] = FP cursor (double varargs, walks the fa0-fa7 save area)
-     * va_start allocates the pair in the frame and stores both cursors. */
-    symtab_install_global("__builtin_va_list", SYM_TYPEDEF, type_make_ptr(&ty_char));
 }
 
 void gen_reset_for_file(void) {
@@ -4053,19 +3228,9 @@ void gen_decl(decl_t *d) {
         }
         case D_FUNC_DEF: {
             int idx = symtab_install_global(name, SYM_FUNCTION, d->type);
-            const char *entry_name = g_opts.entry_sym ? g_opts.entry_sym : "_start";
-            bool is_entry = (strcmp(name, entry_name) == 0);
-            /* First definition of the entry symbol wins. Without this,
-             * auto-linked libonyxc's _start (start_cc.c) silently replaced
-             * a user program's own _start and hijacked the entry point. */
-            if (is_entry && g_entry != 0) {
-                cc_warn("'%s' defined twice (auto-linked libc?); keeping the first definition as entry", name);
-                gen_func_body(g_lx, d);   /* still compile the body */
-                return;
-            }
             g_globals[idx].is_defined = true;
             g_globals[idx].text_off = (uint32_t)g_text.size;
-            if (is_entry) {
+            if (strcmp(name, g_opts.entry_sym ? g_opts.entry_sym : "_start") == 0) {
                 g_entry = CC_TEXT_VADDR + g_text.size;
             }
             gen_func_body(g_lx, d);
@@ -4084,19 +3249,6 @@ void gen_decl(decl_t *d) {
                      * gen_handle_braced_init_global().  Just record the offset. */
                     g_globals[idx].is_defined = true;
                     g_globals[idx].text_off = (uint32_t)d->init->ival;
-                } else if (d->init->kind == EX_ADDR) {
-                    /* Address-of-global initializer: &g_stdin_obj, array or
-                     * function decay. Placeholder here; patched in
-                     * gen_finalize once addresses are known. */
-                    g_globals[idx].is_defined = true;
-                    g_globals[idx].text_off = (uint32_t)g_data.size;
-                    uint32_t data_off = (uint32_t)g_data.size;
-                    cc_buf_push64(&g_data, 0);
-                    if (g_n_data_sym_fixups >= 4096)
-                        cc_fatal("too many data-symbol fixups");
-                    g_data_sym_fixups[g_n_data_sym_fixups].sym_idx = (int)d->init->ival;
-                    g_data_sym_fixups[g_n_data_sym_fixups].data_off = data_off;
-                    g_n_data_sym_fixups++;
                 } else if (d->init->kind == EX_NUM) {
                     /* Integer/pointer constant initializer. */
                     uint64_t v = d->init->ival;
@@ -4229,16 +3381,6 @@ void gen_finalize(const char *entry_sym) {
         data_rodata_fixup_t *f = &g_data_rodata_fixups[i];
         uint64_t addr = rodata_vaddr + f->rodata_off;
         /* Write 8-byte little-endian address into g_data at data_off. */
-        for (int j = 0; j < 8; j++) {
-            g_data.data[f->data_off + j] = (uint8_t)(addr >> (8 * j));
-        }
-    }
-
-    /* Patch data-symbol fixups (address-of-global initializers). */
-    for (int i = 0; i < g_n_data_sym_fixups; i++) {
-        data_sym_fixup_t *f = &g_data_sym_fixups[i];
-        if (f->sym_idx < 0 || f->sym_idx >= g_n_globals) continue;
-        uint64_t addr = g_globals[f->sym_idx].vaddr;
         for (int j = 0; j < 8; j++) {
             g_data.data[f->data_off + j] = (uint8_t)(addr >> (8 * j));
         }

@@ -76,6 +76,7 @@ static const kw_entry_t kws[] = {
     {"volatile",   T_KW_VOLATILE},
     {"while",      T_KW_WHILE},
     {"_Bool",      T_KW_BOOL},
+    {"__builtin_va_list", T_KW_TYPEDEF},
     {"__attribute__", T_IDENT},   /* tokenized as ident; parser skips args */
     {"__attribute",   T_IDENT},
     {"__extension__", T_IDENT},
@@ -291,18 +292,12 @@ static void lex_number(lexer_t *lx, token_t *t) {
     size_t start_off = lx->pos;
     bool is_float = false;
     bool is_hex = false;
-    bool is_octal = false;
 
     int c = cur_ch(lx);
     if (c == '0' && (peek_ch(lx, 1) == 'x' || peek_ch(lx, 1) == 'X')) {
         is_hex = true;
         advance(lx); advance(lx);
         while (isxdigit(cur_ch(lx)) || cur_ch(lx) == '_') advance(lx);
-    } else if (c == '0' && peek_ch(lx, 1) >= '0' && peek_ch(lx, 1) <= '7') {
-        /* Octal literal (e.g. 0000010 = 8). */
-        is_octal = true;
-        advance(lx);
-        while ((cur_ch(lx) >= '0' && cur_ch(lx) <= '7') || cur_ch(lx) == '_') advance(lx);
     } else {
         while (isdigit(cur_ch(lx)) || cur_ch(lx) == '_') advance(lx);
         if (cur_ch(lx) == '.') {
@@ -357,14 +352,6 @@ static void lex_number(lexer_t *lx, token_t *t) {
                 int d = hexval(*p);
                 if (d < 0) break;
                 v = (v << 4) | d;
-                p++;
-            }
-        } else if (is_octal) {
-            const char *p = start + 1;   /* skip leading 0 */
-            while (p < start + n) {
-                if (*p == '_') { p++; continue; }
-                if (*p < '0' || *p > '7') break;
-                v = v * 8 + (*p - '0');
                 p++;
             }
         } else {
