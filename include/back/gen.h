@@ -16,7 +16,12 @@ typedef struct {
     int max_call_args;     /* max args passed to any call (for stack save) */
     int nparams;           /* number of named parameters */
     bool is_variadic;      /* current function has variadic args */
-    int va_save_off;       /* fp offset to register save area (variadic only) */
+    int va_save_off;       /* fp offset to GP (a0-a7) register save area (variadic only) */
+    int va_fsave_off;      /* fp offset to FP (fa0-fa7) register save area (variadic only) */
+    int64_t va_local_slots[8];  /* fp offsets of local va_list objects (16-byte) */
+    int n_va_locals;
+    int64_t struct_local_slots[64]; /* fp offsets of local struct/union objects */
+    int n_struct_locals;
     uint32_t break_label;
     uint32_t continue_label;
     int loop_depth;

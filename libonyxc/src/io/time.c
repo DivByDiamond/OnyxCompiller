@@ -144,9 +144,28 @@ char *ctime(const time_t *t) {
     return asctime(gmtime(t));
 }
 
+/* strftime helper context (file scope — no nested functions, OnyxCC
+ * does not support the GNU nested-function extension). */
+typedef struct {
+    char *s;
+    size_t n;
+    size_t max;
+} sfmt_ctx_t;
+
+static int sfmt_emit(sfmt_ctx_t *c, const char *str, size_t len) {
+    if (c->n + len >= c->max) return -1;
+    for (size_t i = 0; i < len; i++) c->s[c->n++] = str[i];
+    return 0;
+}
+
 size_t strftime(char *s, size_t max, const char *fmt, const struct tm *tm) {
     if (!s || !fmt || !tm || max == 0) return 0;
-    size_t n = 0;
+    sfmt_ctx_t ctx;
+    ctx.s = s;
+    ctx.n = 0;
+    ctx.max = max;
+    size_t *np = &ctx.n;   /* alias kept minimal */
+    (void)np;
     static const char *wday[] = {"Sunday","Monday","Tuesday","Wednesday",
                                 "Thursday","Friday","Saturday"};
     static const char *wday_short[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
@@ -154,96 +173,92 @@ size_t strftime(char *s, size_t max, const char *fmt, const struct tm *tm) {
                                   "July","August","September","October","November","December"};
     static const char *moname_short[] = {"Jan","Feb","Mar","Apr","May","Jun",
                                         "Jul","Aug","Sep","Oct","Nov","Dec"};
+    size_t n = 0;
 
-    int emit(const char *str, size_t len) {
-        if (n + len >= max) return -1;
-        for (size_t i = 0; i < len; i++) s[n++] = str[i];
-        return 0;
-    }
-
-    while (*fmt && n + 1 < max) {
-        if (*fmt != '%') { s[n++] = *fmt++; continue; }
+    while (*fmt && ctx.n + 1 < max) {
+        if (*fmt != '%') { s[ctx.n++] = *fmt++; continue; }
         fmt++;
         char buf[16];
         switch (*fmt) {
             case 'Y':
                 snprintf(buf, sizeof(buf), "%04d", tm->tm_year + 1900);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'y':
                 snprintf(buf, sizeof(buf), "%02d", (tm->tm_year + 1900) % 100);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'm':
                 snprintf(buf, sizeof(buf), "%02d", tm->tm_mon + 1);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'd':
                 snprintf(buf, sizeof(buf), "%02d", tm->tm_mday);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'H':
                 snprintf(buf, sizeof(buf), "%02d", tm->tm_hour);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'I': {
                 int h = tm->tm_hour % 12; if (h == 0) h = 12;
                 snprintf(buf, sizeof(buf), "%02d", h);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             }
             case 'M':
                 snprintf(buf, sizeof(buf), "%02d", tm->tm_min);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'S':
                 snprintf(buf, sizeof(buf), "%02d", tm->tm_sec);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'j':
                 snprintf(buf, sizeof(buf), "%03d", tm->tm_yday + 1);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'p':
-                if (emit(tm->tm_hour < 12 ? "AM" : "PM", 2) < 0) return n;
+                if (sfmt_emit(&ctx, tm->tm_hour < 12 ? "AM" : "PM", 2) < 0) return ctx.n;
                 break;
             case 'A':
-                if (emit(wday[tm->tm_wday & 7], strlen(wday[tm->tm_wday & 7])) < 0) return n;
+                if (sfmt_emit(&ctx, wday[tm->tm_wday & 7], strlen(wday[tm->tm_wday & 7])) < 0) return ctx.n;
                 break;
             case 'a':
-                if (emit(wday_short[tm->tm_wday & 7], 3) < 0) return n;
+                if (sfmt_emit(&ctx, wday_short[tm->tm_wday & 7], 3) < 0) return ctx.n;
                 break;
             case 'B':
-                if (emit(moname[tm->tm_mon % 12], strlen(moname[tm->tm_mon % 12])) < 0) return n;
+                if (sfmt_emit(&ctx, moname[tm->tm_mon % 12], strlen(moname[tm->tm_mon % 12])) < 0) return ctx.n;
                 break;
             case 'b': case 'h':
-                if (emit(moname_short[tm->tm_mon % 12], 3) < 0) return n;
+                if (sfmt_emit(&ctx, moname_short[tm->tm_mon % 12], 3) < 0) return ctx.n;
                 break;
             case 'w':
                 snprintf(buf, sizeof(buf), "%d", tm->tm_wday);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             case 'U': {
                 int w = (tm->tm_yday - tm->tm_wday + 7) / 7;
                 if (w < 0) w = 0;
                 snprintf(buf, sizeof(buf), "%02d", w);
-                if (emit(buf, strlen(buf)) < 0) return n;
+                if (sfmt_emit(&ctx, buf, strlen(buf)) < 0) return ctx.n;
                 break;
             }
             case '%':
-                if (n + 1 >= max) return n;
-                s[n++] = '%';
+                if (ctx.n + 1 >= max) return ctx.n;
+                s[ctx.n++] = '%';
                 break;
             default:
-                if (n + 2 >= max) return n;
-                s[n++] = '%';
-                s[n++] = *fmt;
+                if (ctx.n + 2 >= max) return ctx.n;
+                s[ctx.n++] = '%';
+                s[ctx.n++] = *fmt;
                 break;
         }
         if (*fmt == 0) break;
         fmt++;
     }
-    s[n] = 0;
+    s[ctx.n] = 0;
+    n = ctx.n;
     return n;
 }
 

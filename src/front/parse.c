@@ -14,6 +14,7 @@
 #include "front/parse.h"
 #include "back/gen.h"
 #include "front/parser_priv.h"
+#include "front/decl.h"
 
 lexer_t *g_lx = NULL;
 
@@ -165,125 +166,43 @@ static void parse_top_level(void) {
     }
 
     for (;;) {
-        type_t *t = base;
-        while (accept(T_STAR)) {
-            t = type_make_ptr(t);
-            while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
-        }
-        if (g_lx->cur.kind != T_IDENT) {
+        /* Full declarator: handles pointers, arrays, function types and
+         * function pointers via the splice algorithm in decl.c. */
+        char name[CC_MAX_IDENT] = {0};
+        cc_pos_t pos = g_lx->cur.pos;
+        type_t *t = parse_declarator(g_lx, base, name, sizeof(name));
+
+        if (name[0] == 0) {
             parse_error("expected identifier");
+            if (g_lx->cur.kind != T_SEMI && g_lx->cur.kind != T_EOF) {
+                lex_next(g_lx);
+            }
             return;
         }
-        char name[CC_MAX_IDENT];
-        strncpy(name, g_lx->cur.text, CC_MAX_IDENT - 1);
-        name[CC_MAX_IDENT - 1] = 0;
-        cc_pos_t pos = g_lx->cur.pos;
-        lex_next(g_lx);
 
-        if (g_lx->cur.kind == T_LPAREN) {
-            lex_next(g_lx);
-            type_t *ftype = type_dup(t);
-            ftype->kind = TY_FUNC;
-            ftype->ret = t;
-            ftype->nparams = 0;
-            ftype->is_varargs = false;
-            ftype->size = 8;
-            ftype->align = 8;
-            ftype->is_complete = true;
-
-            if (g_lx->cur.kind != T_RPAREN) {
-                for (;;) {
-                    if (g_lx->cur.kind == T_ELLIPSIS) {
-                        ftype->is_varargs = true;
-                        lex_next(g_lx);
-                        break;
-                    }
-                    type_t *pbase = NULL;
-                    bool ps, pe, pt, pi;
-                    char ptag[CC_MAX_IDENT] = {0};
-                    if (!parse_decl_spec(g_lx, &pbase, &ps, &pe, &pt, &pi, ptag)) {
-                        parse_error("expected parameter type");
-                        break;
-                    }
-                    type_t *ptyp = pbase;
-                    while (accept(T_STAR)) {
-                        ptyp = type_make_ptr(ptyp);
-                        /* Qualifiers between/after pointer stars: const char *const *p */
-                        while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
-                    }
-                    char pname[CC_MAX_IDENT] = {0};
-                    /* Parameter name is optional in prototypes. */
-                    if (g_lx->cur.kind == T_IDENT) {
-                        strncpy(pname, g_lx->cur.text, CC_MAX_IDENT - 1);
-                        /* But make sure it's not the start of the next param type. */
-                        /* (For MVP we accept any ident as the name.) */
-                        lex_next(g_lx);
-                    }
-                    /* Array declarator after name: argv[] */
-                    while (g_lx->cur.kind == T_LBRACKET) {
-                        lex_next(g_lx);
-                        uint64_t len = 0;
-                        if (g_lx->cur.kind != T_RBRACKET) {
-                            len = (uint64_t)parse_const_expr();
-                        }
-                        parse_expect(T_RBRACKET, "expected ']'");
-                        ptyp = type_make_array(ptyp, len);
-                    }
-                    /* Qualifiers may also appear after array declarator. */
-                    while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
-                    /* Array param decays to pointer. */
-                    if (ptyp->kind == TY_ARRAY) ptyp = type_decay(ptyp);
-                    if (ptyp->kind == TY_FUNC)  ptyp = type_make_ptr(ptyp);
-                    if (ptyp == &ty_void && pname[0] == 0) {
-                        /* (void) — will be detected after the loop. */
-                    }
-                    if (ftype->nparams < CC_MAX_FUNC_PARAMS) {
-                        func_param_t *pp = &ftype->params[ftype->nparams++];
-                        strncpy(pp->name, pname, CC_MAX_IDENT - 1);
-                        pp->type = ptyp;
-                    }
-                    if (!accept(T_COMMA)) break;
-                }
-            }
-            parse_expect(T_RPAREN, "expected ')' after parameter list");
-
-            /* (void) means no parameters. */
-            if (ftype->nparams == 1 && ftype->params[0].type == &ty_void &&
-                ftype->params[0].name[0] == 0) {
-                ftype->nparams = 0;
-            }
-
+        if (t->kind == TY_FUNC) {
+            /* Function definition or prototype. */
             skip_attributes();
 
             if (g_lx->cur.kind == T_LBRACE) {
                 decl_t *d = ast_new_decl(D_FUNC_DEF, pos);
-                d->type = ftype;
+                d->type = t;
                 strncpy(d->name, name, CC_MAX_IDENT - 1);
-                if (is_static) ftype->is_static = true;
-                if (is_inline) ftype->is_inline = true;
+                if (is_static) t->is_static = true;
+                if (is_inline) t->is_inline = true;
                 gen_decl(d);
                 return;
             } else {
                 decl_t *d = ast_new_decl(D_FUNC_DECL, pos);
-                d->type = ftype;
+                d->type = t;
                 strncpy(d->name, name, CC_MAX_IDENT - 1);
-                if (is_static) ftype->is_static = true;
+                if (is_static) t->is_static = true;
+                if (is_inline) t->is_inline = true;
                 gen_decl(d);
             }
         } else {
-            while (g_lx->cur.kind == T_LBRACKET) {
-                lex_next(g_lx);
-                uint64_t len = 0;
-                if (g_lx->cur.kind != T_RBRACKET) {
-                    len = (uint64_t)parse_const_expr();
-                }
-                parse_expect(T_RBRACKET, "expected ']'");
-                t = type_make_array(t, len);
-            }
             expr_t *init = NULL;
-            bool has_init = false;
             if (accept(T_ASSIGN)) {
-                has_init = true;
                 init = gen_parse_global_init(g_lx, t);
             }
             decl_t *d = ast_new_decl(D_VAR, pos);
@@ -295,10 +214,6 @@ static void parse_top_level(void) {
             if (is_typedef) {
                 d->kind = D_TYPEDEF;
                 t->is_typedef = true;
-            }
-            /* For globals with init, mark is_defined so finalize puts them in .data. */
-            if (has_init) {
-                /* will be set in gen_decl via init presence */
             }
             gen_decl(d);
         }
@@ -314,6 +229,14 @@ static void parse_top_level(void) {
 void parse_translation_unit(lexer_t *lx) {
     parser_set_lexer(lx);
     while (lx->cur.kind != T_EOF) {
+        size_t before = lx->pos;      /* byte offset before parsing this decl */
         parse_top_level();
+        /* Error recovery: if a malformed declaration consumed nothing, skip
+         * one token to guarantee forward progress (prevents infinite error
+         * loops that used to hang the compiler on bad input). */
+        if (lx->pos == before && lx->cur.kind != T_EOF) {
+            parse_error("skipping token to recover");
+            lex_next(lx);
+        }
     }
 }
