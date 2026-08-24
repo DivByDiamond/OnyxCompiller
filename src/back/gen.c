@@ -938,7 +938,7 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
      * INDEPENDENTLY: the Nth integer arg goes to aN, the Mth FP arg goes to
      * faM — not to fa<total-arg-index>. (fmt, 2.25) used to put 2.25 in fa1.) */
     int gp_idx = 0, fp_idx = 0;
-    for (int i = 0; i < nargs; i++) {
+    for (int i = 0; i < nargs && i < 8; i++) {
         if (i >= 8 && gp_idx >= 8 && fp_idx >= 8) break;
         if (arg_fp[i]) {
             if (fp_idx < 8) {
@@ -2634,7 +2634,8 @@ static void parse_stmt_body(lexer_t *lx) {
                 if (!g_globals[gidx].is_defined) {
                     decl_t *sd = ast_new_decl(D_VAR, lx->cur.pos);
                     sd->type = t;
-                    strncpy(sd->name, gname, CC_MAX_IDENT * 2 - 1);
+                    strncpy(sd->name, gname, CC_MAX_IDENT - 1);
+                    sd->name[CC_MAX_IDENT - 1] = '\0';
                     if (accept(T_ASSIGN)) {
                         sd->init = gen_parse_global_init(lx, t);
                     }
