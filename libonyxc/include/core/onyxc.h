@@ -23,6 +23,10 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
+/* ── Program arguments — set by _start (start_cc.c). Use these when
+ *    main's (argc, argv) parameters are unavailable or unreliable. */
+extern char **__onyx_argv;
+
 /* ── Standard file descriptors (also defined in unistd.h, but kept here
  *    for backwards compatibility with code that doesn't include unistd.h). */
 #define STDIN_FILENO  0
@@ -263,5 +267,7 @@ void  *bsearch(const void *key, const void *base, size_t n, size_t sz, int (*cmp
 #include <unistd.h>
 #include <signal.h>
 #include <limits.h>
+#include <termios.h>
+#include <math.h>
 
 #endif /* LIBONYXC_H */

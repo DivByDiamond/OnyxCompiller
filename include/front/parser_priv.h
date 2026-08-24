@@ -18,6 +18,9 @@ void parse_error(const char *msg);
 void parse_expect(token_kind_t k, const char *what);
 bool accept(token_kind_t k);
 
+/* Constant expression evaluator (parse.c) — uses g_lx. */
+long long parse_const_expr(void);
+
 /* Skip __attribute__((...)) or asm(...) if present. */
 void skip_attributes(void);
 
