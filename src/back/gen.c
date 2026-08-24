@@ -260,10 +260,18 @@ static void materialize(val_t *v, int reg) {
             break;
         }
         case VAL_LVAL:
-            /* Address already in v->reg + offset. Move to target reg. */
+            /* Address already in v->reg + offset. Move to target reg.
+             * When the value already sits in the TARGET register, the
+             * offset still has to be folded in with an explicit addi —
+             * previously it was silently dropped, so &struct.field
+             * returned &struct and every same-register address use
+             * pointed at the wrong member. */
             if (v->reg != reg) {
                 rv_addi(reg, v->reg, (int)v->offset);
                 v->reg = reg;
+                v->offset = 0;
+            } else if (v->offset != 0) {
+                rv_addi(reg, reg, (int)v->offset);
                 v->offset = 0;
             }
             break;
