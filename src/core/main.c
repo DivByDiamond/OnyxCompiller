@@ -248,8 +248,8 @@ int main(int argc, char **argv) {
     }
 
     /* Init arenas, types, symbol table (shared across all files). */
-    cc_arena_init(&g_ast_arena, 128 * 1024 * 1024);  /* 128 MiB for AST (auto-linked libc) */
-    cc_arena_init(&g_type_arena, 128 * 1024 * 1024); /* 128 MiB for types */
+    cc_arena_init(&g_ast_arena, 256 * 1024 * 1024);  /* 256 MiB for AST (auto-linked libc, multi-file apps) */
+    cc_arena_init(&g_type_arena, 256 * 1024 * 1024); /* 256 MiB for types */
     types_init(&g_type_arena);
     tags_init();
     symtab_init();
