@@ -255,3 +255,10 @@ long _onyx_snapshot_list(void *buf, size_t len) {
 long _onyx_write_fd(int fd, const void *buf, size_t n) {
     return _onyx_syscall3(SYS_write_fd, fd, (long)buf, (long)n);
 }
+
+/* poll(2) — non-blocking fd readiness multiplexer (OnyxKernel SYS_poll).
+ * fds points to an array of `struct pollfd` (16 bytes per entry on Onyx:
+ * 64-bit fd token + 32-bit events + 32-bit revents, see include/io/poll.h). */
+long _onyx_poll(void *fds, unsigned long nfds, int timeout) {
+    return _onyx_syscall3(SYS_poll, (long)fds, (long)nfds, (long)timeout);
+}
