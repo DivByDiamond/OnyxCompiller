@@ -63,3 +63,44 @@ int cfsetsane(struct termios *t) {
     t->c_cc[VTIME] = 0;
     return 0;
 }
+
+/* Allocate a PTY pair: open /dev/ptmx, resolve the pts number via
+ * TIOCGPTN and open the matching /dev/pts/N slave. On success *mfd and
+ * *sfd hold the master/slave descriptors and 0 is returned; on failure
+ * -1 is returned with errno set (and the master fd is closed). */
+int pty_open(int *mfd, int *sfd) {
+    int m = (int)_onyx_open("/dev/ptmx", O_RDWR, 0);
+    if (m < 0) {
+        errno = (int)(-m);
+        return -1;
+    }
+    int n = 0;
+    long r = _onyx_ioctl(m, TIOCGPTN, (long)&n);
+    if (r < 0) {
+        errno = (int)(-r);
+        _onyx_close(m);
+        return -1;
+    }
+    char path[16];
+    {
+        const char *pfx = "/dev/pts/";
+        int i = 0;
+        while (pfx[i] != '\0') { path[i] = pfx[i]; i++; }
+        if (n >= 10) { /* PTY_MAX caps the pts number at a single digit */
+            errno = ENODEV;
+            _onyx_close(m);
+            return -1;
+        }
+        path[i++] = (char)('0' + n);
+        path[i] = '\0';
+    }
+    int s = (int)_onyx_open(path, O_RDWR, 0);
+    if (s < 0) {
+        errno = (int)(-s);
+        _onyx_close(m);
+        return -1;
+    }
+    *mfd = m;
+    *sfd = s;
+    return 0;
+}
