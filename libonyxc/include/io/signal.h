@@ -34,6 +34,7 @@ extern "C" {
 #define SIGCONT     18
 #define SIGSTOP     19
 #define SIGTSTP     20
+#define SIGWINCH    28
 #define NSIG        32
 
 /* sigprocmask `how` */
@@ -56,9 +57,13 @@ struct sigaction {
     void (*sa_restorer)(void);
 };
 
-#define SA_NOCLDSTOP 0x1
-#define SA_NODEFER   0x2
-#define SA_RESTART   0x4
+/* Linux-compatible sa_flags. SA_NOCLDWAIT is the only flag the kernel
+ * acts on today (auto-reap children, no zombie, no SIGCHLD); the others
+ * are accepted-but-unimplemented in OnyxKernel. */
+#define SA_NOCLDSTOP 0x00000001
+#define SA_NOCLDWAIT 0x00000002
+#define SA_NODEFER   0x40000000
+#define SA_RESTART   0x10000000
 
 /* Raw kernel syscall — declared in onyxc.h. */
 long _onyx_kill(int pid, int sig);
