@@ -118,6 +118,16 @@ struct termios {
 #define TCGETS     0x5401
 #define TCSETS     0x5402
 #define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
+#define TIOCGPTN   0x80045430
+
+/* ── Window size (TIOCGWINSZ/TIOCSWINSZ) ───────────────────────────── */
+struct winsize {
+    unsigned short ws_row;    /* rows, in characters */
+    unsigned short ws_col;    /* columns, in characters */
+    unsigned short ws_xpixel; /* horizontal size, pixels (unused) */
+    unsigned short ws_ypixel; /* vertical size, pixels (unused) */
+};
 
 /* ── Functions ──────────────────────────────────────────────────────── */
 int tcgetattr(int fd, struct termios *termios_p);
@@ -129,6 +139,9 @@ int cfsetispeed(struct termios *termios_p, int speed);
 int cfsetospeed(struct termios *termios_p, int speed);
 int cfmakeraw(struct termios *termios_p);
 int cfsetsane(struct termios *termios_p);
+
+/* Allocate a PTY pair (open /dev/ptmx + /dev/pts/N). 0 on success. */
+int pty_open(int *mfd, int *sfd);
 
 void cfmakeraw_apply(struct termios *t);   /* alias, no syscall */
 
