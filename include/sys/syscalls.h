@@ -107,6 +107,10 @@
 #define SYS_chmod            75   /* chmod(path, mode) */
 #define SYS_fchmod           76   /* fchmod(fd, mode) */
 #define SYS_getdents         77   /* compat alias for getdents64 */
+#define SYS_chown            84   /* chown(path, uid, gid) */
+#define SYS_fchown           85   /* fchown(fd, uid, gid) */
+#define SYS_mouse_read       86   /* mouse_read(*event) */
+#define SYS_poll             87   /* poll(*fds, nfds, timeout) */
 
 /* ── Constants used by syscalls ───────────────────────────────────────── */
 
