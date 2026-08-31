@@ -259,6 +259,11 @@ static void materialize(val_t *v, int reg) {
             v->offset = 0;
             break;
         }
+        case VAL_SPILL_F:
+        case VAL_SPILL_I:
+            /* Spilled values are reloaded by load_value()/load_float_value()
+             * before they can reach materialize(). */
+            break;
         case VAL_LVAL:
             /* Address already in v->reg + offset. Move to target reg.
              * When the value already sits in the TARGET register, the
@@ -860,7 +865,6 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
 
     int nargs = 0;
     int64_t arg_slots[8];
-    type_t *arg_types[8];
     bool arg_fp[8];
 
     if (lx->cur.kind != T_RPAREN) {
@@ -921,7 +925,6 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
                     rv_sd(RV_T0, RV_FP, (int)slot);
                 }
                 arg_slots[nargs] = slot;
-                arg_types[nargs] = a.type;
                 arg_fp[nargs] = fp;
                 nargs++;
             }
@@ -4034,7 +4037,12 @@ void gen_reset_for_file(void) {
 
 /* Helper: mangle a static symbol name with per-file prefix. */
 static void mangle_static_name(const char *name, char *out, size_t out_sz) {
-    snprintf(out, out_sz, "__f%d_%s", g_opts.current_file_idx, name);
+    int n = snprintf(out, out_sz, "__f%d_", g_opts.current_file_idx);
+    size_t pos = (n < 0 || (size_t)n >= out_sz) ? 0 : (size_t)n;
+    size_t name_len = strlen(name);
+    if (pos + name_len + 1 > out_sz)
+        cc_fatal("static name too long to mangle");
+    memcpy(out + pos, name, name_len + 1);
 }
 
 void gen_decl(decl_t *d) {
