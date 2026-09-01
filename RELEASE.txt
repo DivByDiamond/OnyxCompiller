@@ -170,6 +170,6 @@ GPLv3, в соответствии с лицензией всего проект
 ССЫЛКИ
 ------
 
-- OnyxOS:     https://github.com/loki5512344/OnyxOS
-- OnyxBoot:   https://github.com/loki5512344/OnyxBoot
-- OnyxKernel: https://github.com/loki5512344/OnyxKernel
+- OnyxOS:     https://github.com/DivByDiamond/OnyxOS
+- OnyxBoot:   https://github.com/DivByDiamond/OnyxBoot
+- OnyxKernel: https://github.com/DivByDiamond/OnyxKernel

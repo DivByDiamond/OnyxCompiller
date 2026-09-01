@@ -287,6 +287,6 @@ GPLv3 (в соответствии с лицензией всего проект
 
 ## Связанные репозитории
 
-- [OnyxOS](https://github.com/loki5512344/OnyxOS) — основная ОС, документация
-- [OnyxBoot](https://github.com/loki5512344/OnyxBoot) — загрузчик на C++
-- [OnyxKernel](https://github.com/loki5512344/OnyxKernel) — ядро на Rust, формат `.onx`
+- [OnyxOS](https://github.com/DivByDiamond/OnyxOS) — основная ОС, документация
+- [OnyxBoot](https://github.com/DivByDiamond/OnyxBoot) — загрузчик на C++
+- [OnyxKernel](https://github.com/DivByDiamond/OnyxKernel) — ядро на Rust, формат `.onx`
