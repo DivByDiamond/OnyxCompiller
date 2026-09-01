@@ -262,3 +262,18 @@ long _onyx_write_fd(int fd, const void *buf, size_t n) {
 long _onyx_poll(void *fds, unsigned long nfds, int timeout) {
     return _onyx_syscall3(SYS_poll, (long)fds, (long)nfds, (long)timeout);
 }
+
+/* TCP (OnyxKernel/kernel/src/syscall/net_sys.rs). ip is 4 raw bytes,
+ * network byte order; conn_id is an opaque handle (0..7). */
+long _onyx_net_connect(const unsigned char ip[4], int port) {
+    return _onyx_syscall2(SYS_net_connect, (long)ip, port);
+}
+long _onyx_net_send(long conn_id, const void *buf, size_t n) {
+    return _onyx_syscall3(SYS_net_send, conn_id, (long)buf, (long)n);
+}
+long _onyx_net_recv(long conn_id, void *buf, size_t n) {
+    return _onyx_syscall3(SYS_net_recv, conn_id, (long)buf, (long)n);
+}
+long _onyx_net_close(long conn_id) {
+    return _onyx_syscall1(SYS_net_close, conn_id);
+}
