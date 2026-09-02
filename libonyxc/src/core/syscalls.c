@@ -277,3 +277,6 @@ long _onyx_net_recv(long conn_id, void *buf, size_t n) {
 long _onyx_net_close(long conn_id) {
     return _onyx_syscall1(SYS_net_close, conn_id);
 }
+long _onyx_net_resolve(const char *name, unsigned char ip_out[4]) {
+    return _onyx_syscall2(SYS_net_resolve, (long)name, (long)ip_out);
+}

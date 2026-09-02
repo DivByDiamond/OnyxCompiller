@@ -111,6 +111,7 @@ long _onyx_net_connect(const unsigned char ip[4], int port);
 long _onyx_net_send(long conn_id, const void *buf, size_t n);
 long _onyx_net_recv(long conn_id, void *buf, size_t n);
 long _onyx_net_close(long conn_id);
+long _onyx_net_resolve(const char *name, unsigned char ip_out[4]);
 long _onyx_isatty(int fd);
 long _onyx_fsync(int fd);
 long _onyx_getuid(void);

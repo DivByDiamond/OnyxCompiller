@@ -2,10 +2,11 @@
  * net.h — minimal TCP client sockets (libonyxc v0.5).
  *
  * Thin errno-translating wrapper over the raw _onyx_net_* syscalls
- * (OnyxKernel/kernel/src/syscall/net_sys.rs, #80-83). Outbound TCP only:
- * no listen/accept, no UDP, no DNS (callers pass a resolved IPv4 the same
- * way tools like `curl --resolve` do). At most 8 connections system-wide
- * (kernel table is fixed-size); net_connect() returns -1/ENOMEM past that.
+ * (OnyxKernel/kernel/src/syscall/net_sys.rs, #80-83, #89). Outbound TCP
+ * only: no listen/accept, no UDP. net_resolve() does a blocking DNS A-record
+ * lookup; net_connect() still takes a raw IPv4, so callers resolve first.
+ * At most 8 connections system-wide (kernel table is fixed-size);
+ * net_connect() returns -1/ENOMEM past that.
  */
 #ifndef _ONYX_NET_H
 #define _ONYX_NET_H
@@ -48,6 +49,18 @@ static inline long net_recv(int conn_id, void *buf, size_t len) {
 /* Closes the connection. Always succeeds. */
 static inline void net_close(int conn_id) {
     _onyx_net_close(conn_id);
+}
+
+long _onyx_net_resolve(const char *name, unsigned char ip_out[4]);
+
+/* Resolves a hostname to an IPv4 address via the kernel's built-in DNS
+ * resolver (blocking, single A-record query against the DHCP-learned
+ * server). Writes 4 raw bytes to ip_out on success, or returns -1/errno
+ * (e.g. ETIMEDOUT / EIO if no reply arrives). */
+static inline int net_resolve(const char *name, unsigned char ip_out[4]) {
+    long r = _onyx_net_resolve(name, ip_out);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return 0;
 }
 
 #ifdef __cplusplus
