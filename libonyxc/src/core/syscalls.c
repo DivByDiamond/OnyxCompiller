@@ -277,6 +277,12 @@ long _onyx_net_recv(long conn_id, void *buf, size_t n) {
 long _onyx_net_close(long conn_id) {
     return _onyx_syscall1(SYS_net_close, conn_id);
 }
-long _onyx_net_resolve(const char *name, unsigned char ip_out[4]) {
-    return _onyx_syscall2(SYS_net_resolve, (long)name, (long)ip_out);
+
+/* DNS A-record lookup (OnyxKernel/kernel/src/syscall/net_sys.rs, #89).
+ * Sends a blocking DNS query to the DHCP-learned server for `name` (no
+ * trailing dot), writes the 4-byte IPv4 into ip_out. Returns 0 on success
+ * or -errno on failure. Caller owns both buffers; name_len is the byte
+ * length of name (NOT strlen — caller may have it in a fixed buffer). */
+long _onyx_net_resolve(const char *name, size_t name_len, unsigned char ip_out[4]) {
+    return _onyx_syscall3(SYS_net_resolve, (long)name, (long)name_len, (long)ip_out);
 }

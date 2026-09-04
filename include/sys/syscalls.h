@@ -111,7 +111,7 @@
 #define SYS_net_send         81   /* net_send(conn_id, buf, len) -> bytes */
 #define SYS_net_recv         82   /* net_recv(conn_id, buf, len) -> bytes */
 #define SYS_net_close        83   /* net_close(conn_id) -> 0 */
-#define SYS_net_resolve      89   /* net_resolve(name_ptr, ip_out_ptr) -> 0 or -errno */
+#define SYS_net_resolve      89   /* net_resolve(name_ptr, name_len, ip_out) -> 0/-errno */
 #define SYS_chown            84   /* chown(path, uid, gid) */
 #define SYS_fchown           85   /* fchown(fd, uid, gid) */
 #define SYS_mouse_read       86   /* mouse_read(*event) */
