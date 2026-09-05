@@ -249,7 +249,7 @@ static void materialize(val_t *v, int reg) {
             if (is_local) {
                 int lidx = v->sym_idx - g_n_globals;
                 sym_t *s = &g_locals[lidx];
-                rv_addi(reg, RV_FP, (int)s->offset + (int)v->offset);
+                rv_addi_imm(reg, RV_FP, (int)s->offset + (int)v->offset);
             } else {
                 /* Global: emit lui+addi with fixup. */
                 emit_load_global_addr(reg, v->sym_idx, v->offset);
@@ -918,7 +918,7 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
                         rv_sd(RV_T1, RV_FP, (int)sslot + (int)k);
                     }
                     /* Load the block's ADDRESS as the argument value. */
-                    rv_addi(RV_T0, RV_FP, (int)sslot);
+                    rv_addi_imm(RV_T0, RV_FP, (int)sslot);
                     rv_sd(RV_T0, RV_FP, (int)slot);
                 } else {
                     load_value(&a, RV_T0);
@@ -1283,7 +1283,7 @@ static val_t parse_primary(lexer_t *lx) {
                     if (g_func.cur_offset > g_func.frame_size)
                         g_func.frame_size = g_func.cur_offset;
                     /* Compute address of stack slot. */
-                    rv_addi(RV_T0, RV_FP, (int)off);
+                    rv_addi_imm(RV_T0, RV_FP, (int)off);
                     /* Parse initializer list and emit stores. */
                     lex_next(lx); /* consume '{' */
                     int field_idx = 0;
@@ -1509,15 +1509,15 @@ static val_t parse_primary(lexer_t *lx) {
                     int gp_off = g_func.nparams * 8;
                     if (gp_off > 64) gp_off = 64;
                     /* pair[0] = &gp_area[nparams] */
-                    rv_addi(RV_T1, RV_FP, g_func.va_save_off + gp_off);
+                    rv_addi_imm(RV_T1, RV_FP, g_func.va_save_off + gp_off);
                     rv_sd(RV_T1, RV_FP, (int)pair);
                     /* pair[8] = &fp_area[0] (no named FP tracking). */
                     if (g_func.va_fsave_off != 0) {
-                        rv_addi(RV_T1, RV_FP, g_func.va_fsave_off);
+                        rv_addi_imm(RV_T1, RV_FP, g_func.va_fsave_off);
                         rv_sd(RV_T1, RV_FP, (int)pair + 8);
                     }
                     /* ap = &pair. */
-                    rv_addi(RV_T1, RV_FP, (int)pair);
+                    rv_addi_imm(RV_T1, RV_FP, (int)pair);
                     rv_sd(RV_T1, RV_T0, 0);
                     val_t vr;
                     memset(&vr, 0, sizeof(vr));
@@ -3667,7 +3667,7 @@ static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
     uint64_t sz = type_sizeof(type);
     /* Compute address: fp + fp_off + field_off. */
     int total_off = (int)(fp_off + field_off);
-    rv_addi(addr_reg, RV_FP, total_off);
+    rv_addi_imm(addr_reg, RV_FP, total_off);
     switch (sz) {
         case 1: rv_sb(RV_T0, addr_reg, 0); break;
         case 2: rv_sh(RV_T0, addr_reg, 0); break;
@@ -3897,7 +3897,7 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
                 if (gp_i < 8) {
                     uint64_t sz = type_sizeof(ptyp);
                     if (sz > 32) sz = 32;
-                    rv_addi(RV_T0, RV_FP, off);       /* &local slot */
+                    rv_addi_imm(RV_T0, RV_FP, off);       /* &local slot */
                     for (uint64_t k = 0; k < sz; k += 8) {
                         rv_ld(RV_T1, arg_regs[gp_i], (int)k);
                         rv_sd(RV_T1, RV_T0, (int)k);

@@ -200,8 +200,45 @@ void rv_srai(int rd, int rs1, int shamt) {
     emit32(insn);
 }
 
+/* Bug fix (2026-09-05): rv_ld/rv_sd/rv_lw/rv_sw/... (S-type and I-type
+ * load/store immediates) took a raw 12-bit signed offset and masked it in
+ * with no range check, unlike rv_addi_imm's lui+addi widening for large
+ * ADDI constants. Every fp-relative local-variable access goes through
+ * these — so a function whose stack frame put some local's offset below
+ * -2048 (any function with, say, an ~2KB local: `struct snake game;` in
+ * osnake, big process-list buffers in otop) got that offset silently
+ * two's-complement-wrapped into a small POSITIVE offset instead: an
+ * intended -2064 (0xF7F0 in 12 bits) can't be represented in the signed
+ * 12-bit field and wrapped to +2032 — landing the access on the wrong
+ * side of `fp`, outside the current frame entirely. Confirmed live: a
+ * minimal repro with a ~2KB local crashed OnyxOS with the exact same
+ * `sd t0, 2032(s0)` mis-encoding (should have been a negative offset)
+ * and the exact same wild fault address in two unrelated programs.
+ * Fixed at the lowest level (here) rather than patching each of the ~35
+ * call sites in gen.c: when `imm` doesn't fit in [-2048, 2047], the
+ * effective address is materialized into a scratch register the same
+ * way rv_addi_imm already does for oversized ADDI immediates, and the
+ * load/store then uses offset 0 from that register. */
+static int materialize_addr(int rs1, int64_t imm) {
+    /* Same decomposition as rv_addi_imm: lo must be sign-extended from
+     * the low 12 bits before subtracting it out of hi, or a negative imm
+     * near a 4096 boundary computes the wrong hi (see that function's
+     * comment for the worked example). */
+    int tmp = RV_T6;
+    int64_t lo = ((imm & 0xFFF) ^ 0x800) - 0x800;
+    int64_t hi = (imm - lo) & ~0xFFFULL;
+    rv_lui(tmp, (uint32_t)((hi >> 12) & 0xFFFFF) & 0xFFFFF);
+    rv_addi(tmp, tmp, (int)lo);
+    rv_add(tmp, rs1, tmp);
+    return tmp;
+}
+
 /* Loads: opcode 0x03 */
 static void emit_i_load(int funct3, int rd, int rs1, int imm) {
+    if (imm < -2048 || imm > 2047) {
+        rs1 = materialize_addr(rs1, imm);
+        imm = 0;
+    }
     uint32_t insn = (uint32_t)(imm & 0xFFF) << 20
                   | (uint32_t)(rs1 & 0x1F) << 15
                   | (uint32_t)(funct3 & 0x7) << 12
@@ -217,8 +254,15 @@ void rv_lbu(int rd, int rs1, int imm) { emit_i_load(0x4, rd, rs1, imm); }
 void rv_lhu(int rd, int rs1, int imm) { emit_i_load(0x5, rd, rs1, imm); }
 void rv_lwu(int rd, int rs1, int imm) { emit_i_load(0x6, rd, rs1, imm); }
 
-/* Stores: opcode 0x23 */
+/* Stores: opcode 0x23. Note rs2 (the value being stored) is never t6/t5:
+ * this codegen already reserves t6 as its "assembler temporary" (see
+ * rv_addi_imm), so no live value is ever carried in it across an emit
+ * call — safe to clobber it here to materialize the address first. */
 static void emit_s_store(int funct3, int rs2, int rs1, int imm) {
+    if (imm < -2048 || imm > 2047) {
+        rs1 = materialize_addr(rs1, imm);
+        imm = 0;
+    }
     uint32_t imm_lo = (uint32_t)(imm & 0x1F);
     uint32_t imm_hi = (uint32_t)((imm >> 5) & 0x7F);
     uint32_t insn = imm_hi << 25
