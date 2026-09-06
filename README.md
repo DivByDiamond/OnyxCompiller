@@ -2,7 +2,6 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-RISC--V%2064--bit-green" alt="RISC-V 64">
-  <img src="https://img.shields.io/badge/language-C99-orange" alt="C99">
   <img src="https://img.shields.io/badge/MMU-Sv39-yellow" alt="Sv39 MMU">
   <img src="https://img.shields.io/badge/license-GPL--3.0-red" alt="GPL-3.0">
 </p>
@@ -35,200 +34,259 @@
 </pre>
 </p>
 
-<p align="center"><em>A self-hosting C compiler for RISC-V 64-bit, targeting OnyxOS</em></p>
+# OnyxCC — C/C++ → RISC-V64 → .onx compiler for OnyxOS
 
-----
+**Status:** v0.6 — полноценная разработка userspace-софта: автолинковка libonyxc,
+function-like макросы, termios/math/assert в libc, FP-арифметика с varargs,
+интеграционные тесты запуска (onx-run эмулятор), 64/64 компиляция + 10/10 runtime.
+Компилятор собирается как:
+  - native Linux-бинарник (для разработки вне ОС)
+  - `.onx` для запуска внутри OnyxOS (self-hosting)
 
-OnyxCC (`onyxcc`) is a single-pass C99 compiler for RISC-V 64-bit, written in
-freestanding-compatible C. It compiles to the OnyxExec (`.onx`) format used
-by [OnyxKernel](https://github.com/DivByDiamond/OnyxKernel), and is
-self-hosting: `onyxcc` can compile its own source into a `.onx` binary that
-runs on OnyxOS and rebuilds the compiler again from there.
+OnyxCC — это single-pass компилятор C (с заделом под C++) для RISC-V64,
+написанный на чистом C. Цель — self-hosting: компилятор работает на
+OnyxOS и умеет собирать сам себя, а также всю userspace-часть ОС.
+Stage-1 уже достигнут: `make selfhost` собирает `onyxcc_self.onx`
+(11 source files → один self-contained .onx бинарь, готовый к запуску
+внутри OnyxOS).
 
-Architecturally it takes after tcc (tiny C compiler): minimal memory use,
-linear-time compilation, no intermediate representation, no heavyweight
-optimization passes. It is designed to run comfortably on boards with as
-little as 512 MB of RAM.
+Проект написан с нуля, вдохновлён архитектурой tcc (tiny C compiler):
+минимум памяти, линейное время компиляции, без IR и тяжёлых
+оптимизаций. Запускается на платах с 512 МБ ОЗУ.
 
-Part of the [OnyxOS](https://github.com/DivByDiamond/OnyxOS) ecosystem.
+## Возможности (v0.5)
 
-----
+- ✅ Лексер C99 + расширения (`__attribute__`, `__asm__`)
+- ✅ Препроцессор: `#include`, `#define` (object-like), `#if/#ifdef/#ifndef/#elif/#else/#endif`, `#pragma once`, `defined()`
+- ✅ Парсер C: функции, параметры, локальные переменные, массивы, указатели, struct/union/enum
+- ✅ Выражения: арифметика, сравнения, логика, битовые операции, `?:`, `,`, вызовы функций, `sizeof`, casts, `&`, `*`, `++`, `--`
+- ✅ Control flow: `if`/`else`, `while`, `for`, `return`, `break`/`continue` (частично)
+- ✅ Codegen RISC-V64 (RV64IMA): полный набор инструкций I + M extensions, B/J-типы с label fixups
+- ✅ Вызов функций по стандартному RISC-V calling convention (a0–a7, ra, sp, fp)
+- ✅ Запись `.onx` v1 (344-байт заголовок + сегменты) — формат совместим с OnyxKernel `onx::load()`
+- ✅ Встроенные `__ecall0..3(n, [a, [b, [c]]])` для syscalls без inline asm
+- ✅ **Multi-file compilation** — `onyxcc -o prog.onx main.c util.c lib.c` (до 16 .c файлов, shared symbol table с per-file static mangling)
+- ✅ **Self-hosting (stage-1)** — `make selfhost` → `onyxcc_self.onx` (компилятор компилирует свои 11 source files в один бинарь)
+- ✅ `switch`/`case`/`default` (linear compare chain с поддержкой `break`)
+- ✅ `goto` и labels (как backward, так и forward jumps)
+- ✅ Float/double в codegen (RV64 F/D расширения: fadd/fsub/fmul/fdiv, fld/fsd, fmv.w.x/fmv.x.w, fcvt.*)
+- ✅ Полные variadic args (`...`) — `va_start`/`va_arg`/`va_end` builtins
+- ✅ `&&`/`||` с short-circuit семантикой
+- ✅ Глобальные инициализаторы массивов/строк (включая brace-elided)
+- ✅ libonyxc v0.5: `_start`, `printf`/`fprintf`/`sprintf`/`snprintf`/`sscanf`, `FILE*` buffered I/O (`fopen`/`fread`/`fwrite`/`fgets`/`fputs`/`fseek`/`ftell`/`feof`/`getline`), `errno`/`strerror`/`perror`, `time`/`gmtime`/`strftime`/`clock_gettime`/`nanosleep`, signal sets (`sigaction`/`sigprocmask`), `qsort`/`bsearch`, более 30 string functions, full ctype
+- ✅ **`onyx-ld` linker** (src/tools/onyx-ld.c) — отдельный тул для линковки `.o` объектников (формат `ONYO`) и `.a` архивов (стандартный Unix `ar`) в финальный `.onx`. Поддерживает RISC-V релокации: `R_ONYO_64`/`R_ONYO_32`/`R_ONYO_HI20`/`R_ONYO_LO12_I`/`R_ONYO_LO12_S`/`R_ONYO_PCREL_HI20`/`R_ONYO_PCREL_LO12_I`/`R_ONYO_PCREL_LO12_S`/`R_ONYO_JAL`/`R_ONYO_BRANCH`.
 
-## Key Features
+## Что нового в v0.6
 
-- Single-pass codegen - expressions are compiled directly to RISC-V machine code as they are parsed; no IR
-- C99 lexer and parser - functions, parameters, locals, arrays, pointers, `struct`/`union`/`enum`, `switch`/`case`, `goto`/labels
-- Preprocessor - `#include`, object- and function-like `#define` (`#`/`##`, `__VA_ARGS__`), `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif`, `#pragma once`, `defined()`
-- RV64IMAFD codegen - full I/M integer extensions plus F/D floating point (soft- and hard-float paths), standard calling convention (a0-a7, ra, sp, fp)
-- Multi-file compilation - `onyxcc -o prog.onx main.c util.c lib.c` with a shared symbol table and per-file static-symbol mangling
-- Self-hosting - `make selfhost` compiles the compiler's own sources into `onyxcc_self.onx`
-- `onyx-ld` linker - links `.o` object files (`ONYO` format) and `.a` archives into a final `.onx`, with a full set of RISC-V relocations (`R_ONYO_64/32/HI20/LO12_I/LO12_S/PCREL_HI20/PCREL_LO12_I/PCREL_LO12_S/JAL/BRANCH`)
-- `onx-run` emulator - runs `.onx` binaries on the host without QEMU, with instruction/frame tracing for debugging codegen
-- Automatic libc linking - `onyxcc -o prog.onx prog.c` links `libonyxc` (start/syscalls/stdio/stdlib/string/ctype/time/termios/math) automatically; `-nostdlib`/`-N` disables it
-- `libonyxc` - a C99 libc for OnyxOS: buffered `stdio` (`printf` family, `FILE*` I/O), `stdlib`, 40+ `string` functions, full `ctype`, `time`/`strftime`/`clock_gettime`/`nanosleep`, `errno`/`strerror`, signal sets, `termios` (raw mode), soft-float `math.h`, `assert.h`
-- Integration tests - a compile + run + compare-output harness (`scripts/integration-runner.sh`) over the test suite
+- ✅ **Автолинковка libonyxc** — `onyxcc -o prog.onx prog.c` просто работает:
+  libc подхватывается автоматически (start/syscalls/stdio/stdlib/string/
+  ctype/time/termios/math), include-пути регистрируются сами.
+  `-nostdlib` / `-N` отключает.
+- ✅ **Function-like макросы** — `#x` (stringize), `a##b` (paste),
+  `__VA_ARGS__`, GNU-расширение `, ##__VA_ARGS__`.
+- ✅ **Указатели на функции** — параметы, локальные/глобальные переменные,
+  struct-поля, typedef'ы, касты, `va_arg(ap, int (*)(void))`.
+- ✅ **Float/double полностью** — F/D-кодировки по спеке, FP-параметры в
+  fa0-fa7, FP varargs (отдельная save-area), тернарники/составные
+  присваивания, `double`-возврат, int↔double конверсии.
+- ✅ **Критические фиксы кодгена** — фрейм (fp=верх фрейма, эпилоги
+  патчатся), spill-система для lhs/rhs, порядок загрузки операндов,
+  switch case-label dispatch, `~x` теперь XOR (не −1!), 8-й/16-ричные
+  литералы, `[3][4]` размерности.
+- ✅ **`onx-run`** (tools/onx-run.c) — эмулятор RV64IMAFD на хосте:
+  запуск .onx без QEMU, трассировка (ONYXRUN_TRACE/WATCH/FRAME).
+- ✅ **libonyxc v0.6** — `termios.h` (tcgetattr/tcsetattr/cfmakeraw),
+  `math.h` (sqrt/pow/exp/log/sin/cos/tan/atan2/floor/ceil/fmod soft-float),
+  `assert.h`, `__func__`/`__FILE__`, exit() сбрасывает stdio.
+- ✅ **Интеграционные тесты** (scripts/integration-runner.sh) — 10 тестов
+  компиляция+запуск+сравнение вывода: 10/10 PASS.
 
-## Not yet implemented
+## Что НЕ работает (пока)
 
-- C++ front end (header layout is in place; no parser yet)
-- `onyxcc -c` (emitting relocatable `.o` files instead of resolved addresses) - `onyx-ld` already accepts `.o` input, but the compiler doesn't emit it yet; use multi-file mode (`onyxcc -o prog.onx a.c b.c c.c`) as a workaround
-- Compound literals, designated initializers
-- Inline assembly (use the `__ecallN` builtins instead)
-- Optimization passes (constant folding, dead code elimination) - single-pass, no IR to optimize over
-- Testing on real Milk-V Duo S hardware (verified in QEMU via OnyxOS only)
+- ❌ C++ фронтенд (структура заголовков готова, парсера нет)
+- ❌ Режим `onyxcc -c` (эмиссия `.o` с релокациями вместо resolved адресов) — пока не реализован в `gen.c`/`emit.c`. Линковщик `onyx-ld` готов принимать `.o` файлы, но компилятор их ещё не эмитит. **Workaround**: используйте multi-file режим `onyxcc -o prog.onx a.c b.c c.c`.
+- ❌ Compound literals, designated initializers
+- ❌ Inline assembly (заменено на `__ecallN` builtins)
+- ❌ Запуск на реальном Milk-V Duo S (проверено только в QEMU через OnyxOS)
+- ❌ C++ templates / classes / namespaces
+- ❌ Оптимизации (const propagation, dead code elimination) — single-pass без IR
 
-----
-
-## Architecture
+## Архитектура
 
 ```
 OnyxCC
-├── include/
-│   ├── core/cc.h          # Shared types, options, buffers
-│   ├── core/compat.h      # Linux / OnyxOS freestanding compatibility
-│   ├── sys/onyxo.h        # .o object format (ONYO magic)
-│   ├── sys/onyx.h         # .onx format (kept in sync with OnyxKernel)
-│   ├── sys/syscalls.h     # OnyxOS syscall ABI
-│   ├── front/lexer.h      # Tokens
-│   ├── back/pp.h          # Preprocessor
-│   ├── core/types.h       # Type system
-│   ├── front/ast.h        # AST nodes + symbol table
-│   ├── front/parse.h      # Top-level parser
-│   ├── back/gen.h         # Single-pass codegen
-│   ├── arch/riscv64.h     # Instruction encoders
-│   └── back/emit.h        # .onx writer
+├── include/              # Заголовки
+│   ├── core/cc.h         # Общие типы, опции, буферы
+│   ├── core/compat.h     # Совместимость Linux/OnyxOS freestanding
+│   ├── sys/onyxo.h       # .o объектный формат (ONYO magic, version 1)
+│   ├── sys/onyx.h        # .onx формат (синхронизирован с OnyxKernel)
+│   ├── sys/syscalls.h    # OnyxOS syscall ABI
+│   ├── front/lexer.h    # Токены
+│   ├── back/pp.h         # Препроцессор
+│   ├── core/types.h      # Система типов
+│   ├── front/ast.h       # AST nodes + symbol table
+│   ├── front/parse.h     # Парсер top-level
+│   ├── back/gen.h        # Codegen (single-pass)
+│   ├── arch/riscv64.h    # Энкодеры инструкций
+│   └── back/emit.h       # .onx writer
 ├── src/
-│   ├── core/              # main.c, util.c, types.c, shim.c (freestanding libc shim)
-│   ├── front/              # lexer.c, ast.c, parse.c
-│   ├── back/               # pp.c, gen.c, emit.c
-│   ├── arch/                # riscv64.c
-│   └── tools/               # onyx-ld.c - the standalone linker
-├── libonyxc/               # libc
-│   ├── include/            # onyxc.h, stdio.h, stdlib.h, string.h, ctype.h,
-│   │                       # time.h, signal.h, errno.h, fcntl.h, unistd.h, limits.h
+│   ├── core/             # main.c, util.c, types.c, shim.c (freestanding libc shim)
+│   ├── front/            # lexer.c, ast.c, parse.c
+│   ├── back/             # pp.c, gen.c (~3400 строк), emit.c
+│   ├── arch/             # riscv64.c
+│   └── tools/            # onyx-ld.c — отдельный линковщик
+├── libonyxc/             # libc v0.5
+│   ├── include/          # onyxc.h, stdio.h, stdlib.h, string.h, ctype.h,
+│   │                     # time.h, signal.h, errno.h, fcntl.h, unistd.h, limits.h
 │   ├── src/
-│   │   ├── core/           # start.c (_start), syscalls.c (ecall wrappers)
-│   │   ├── io/              # stdio.c, stdlib.c, string.c, strerror.c, time.c
-│   │   └── ctype/           # ctype.c
-│   └── tests/               # libc smoke tests + Linux stubs
-├── tests/                   # test C programs
-└── Makefile
+│   │   ├── core/         # start.c (_start), syscalls.c (ecall wrappers)
+│   │   ├── io/           # stdio.c (FILE*/printf/scanf), stdlib.c (malloc/qsort),
+│   │   │                 # string.c (40+ funcs), strerror.c, time.c
+│   │   └── ctype/        # ctype.c
+│   └── tests/            # libc_smoke.c (11 tests PASS) + linux_stubs.c
+├── tests/                # 58+ тестовых C программ
+└── Makefile              # all / hello / onyxcc-riscv / onyxcc-onx / libonyxc /
+                          # selfhost-test / selfhost / test-runner
 ```
 
-### Compilation Pipeline
+### Конвейер компиляции
 
 ```
 input1.c input2.c ...
    │
    ▼  pp.c (per file)
-preprocessed.c   (macros expanded, #include inlined)
+preprocessed.c   (макросы раскрыты, #include вставлены)
    │
    ▼  lexer.c (per file)
 token stream
    │
    ▼  parse.c + gen.c (single-pass, shared symbol table)
-   │  ── g_text, g_rodata, g_data, g_bss accumulate across files
-   │  ── static symbols get per-file mangling to avoid collisions
+   │  ── g_text, g_rodata, g_data, g_bss (накапливаются между файлами)
+   │  ── static symbols получают per-file mangling чтобы избежать коллизий
    │
-   ▼  gen_finalize(entry_sym) - after all files are processed
+   ▼  gen_finalize(entry_sym) — после всех файлов
 resolved addresses, label fixups applied
    │
    ▼  emit.c
-output.onx  (header + text/rodata/data/bss segments)
+output.onx  (344-байт заголовок + сегменты text/rodata/data/bss)
 ```
 
-### The `.onx` format
+Подход single-pass: во время парсинга выражений сразу генерируется
+RISC-V код. AST строится только для top-level declarations и
+statements; выражения идут напрямую в кодогенератор. Это даёт
+линейное время компиляции и минимальное потребление памяти.
 
-`include/sys/onyx.h` is kept in sync with
-`OnyxKernel/kernel/src/proc/onx/` and `OnyxKernel/core/src/formats/header.rs`.
-See the comment block at the top of `onyx.h` for the exact byte layout.
+### Формат .onx
 
-----
+`include/onx.h` синхронизирован с
+`OnyxKernel/kernel/src/proc/onx.rs::load()` и
+`OnyxKernel/core/src/formats/header.rs`. Используется v1 (344-байтный
+заголовок, до 8 сегментов). Подробнее — в комментарии к `onx.h`.
 
-## Building
+## Сборка
 
-### On the host (Linux/x86_64) - for development outside OnyxOS
+### На хост-машине (Linux/x86_64) — для разработки вне OnyxOS
 
-```console
-$ make            # builds ./onyxcc (native Linux x86_64 ELF)
-$ make hello      # builds tests/hello_full.onx
-$ make test       # prints an .onx header
+```bash
+cd OnyxCC
+make            # собирает ./onyxcc (Linux x86_64 ELF)
+make hello      # собирает tests/hello_full.onx
+make test       # печатает заголовок .onx
 ```
 
-### Cross-compiling for OnyxOS - the `.onx` compiler itself
+### Cross-компиляция для OnyxOS — собственно `.onx` компилятор
 
-```console
-$ make onyxcc-riscv    # clang -> onyxcc.riscv.elf (RISC-V 64 ELF)
-$ make onyxcc-onx      # elf2onx -> onyxcc.onx (OnyxOS ring-1 binary)
+```bash
+make onyxcc-riscv    # clang-19 → onyxcc.riscv.elf (RISC-V64 ELF)
+make onyxcc-onx      # elf2onx  → onyxcc.onx (OnyxOS ring-1 binary)
 ```
 
-Requires `clang`/`lld` with RISC-V target support and `elf2onx` from
-`OnyxKernel/target/release/elf2onx`. Full pipeline:
+Требуется `clang-19` + `lld-19` (для RISC-V target) и `elf2onx`
+из `OnyxKernel/target/release/elf2onx`. Полный pipeline:
 
-```console
-# 1. Build elf2onx once:
-$ cd ../OnyxKernel && cargo build --release -p onyx_tools
+```bash
+# 1. Собрать elf2onx (один раз):
+cd ../OnyxKernel && cargo build --release -p onyx_tools
 
-# 2. Build onyxcc.onx:
-$ cd ../OnyxCompiller && make onyxcc-onx
+# 2. Собрать onyxcc.onx:
+cd ../OnyxCC && make onyxcc-onx
 ```
 
-### Self-hosting
+### Self-hosting (stage-1 — работает!)
 
-The compiler can compile its own source tree:
+Компилятор может скомпилировать сам себя (stage-1, все 11 source-файлов):
 
-```console
-$ make selfhost-test   # compile everything to /dev/null, sanity check only
-$ make selfhost        # compile -> onyxcc_self.onx
+```bash
+make selfhost-test   # компиляция всех исходников → /dev/null (проверка)
+make selfhost        # компиляция → onyxcc_self.onx (178KB)
 ```
 
-Running `onyxcc_self.onx` requires OnyxOS (QEMU or real hardware).
+Результат — `onyxcc_self.onx`, бинарник OnyxCC, скомпилированный самим OnyxCC.
+Для запуска требуется OnyxOS (QEMU или Milk-V Duo S).
 
-----
+## Использование
 
-## Usage
+```bash
+# Базовая компиляция
+onyxcc -o hello.onx hello.c
 
-```console
-$ onyxcc -o hello.onx hello.c                  # basic compilation
-$ onyxcc -e _start -o hello.onx hello.c        # explicit entry point
-$ onyxcc --ring1 -o service.onx service.c      # ring 1 (root space) binary
-$ onyxcc -I /usr/onyxc/include -DDEBUG=1 -o prog.onx prog.c
+# С явным entry point
+onyxcc -e _start -o hello.onx hello.c
+
+# Ring 1 (root space)
+onyxcc --ring1 -o service.onx service.c
+
+# Include path и макросы
+onyxcc -I /usr/onyxc/include -DDEBUG=1 -o prog.onx prog.c
 ```
 
-----
+## Roadmap
 
-## Integration with OnyxOS
+### v0.2 — Self-hosting foundation ✅
+- [x] Полная поддержка `switch`/`case`  ✅
+- [x] `goto` и метки  ✅
+- [x] Глобальные инициализаторы (массивы, строки, struct arrays)  ✅
+- [x] Variadic arguments (для `printf`-семейства)  ✅
+- [x] Self-hosting: компилятор компилирует сам себя (stage-1)  ✅
+- [x] Float/double в codegen (F/D расширения RISC-V)  ✅ (riscv64.c:318-375)
+- [ ] Линковка нескольких `.c` в один `.onx`
+- [ ] **Milestone:** onyxcc компилирует сам себя
 
-`OnyxOS/Makefile` can invoke `onyxcc` directly for userland binaries:
+### v0.3 — C++ фронтенд
+- [ ] Парсер C++ (классы, namespaces, перегрузка, ссылки)
+- [ ] Шаблоны (минимальные)
+- [ ] RAII / деструкторы
+- [ ] `new`/`delete`
+- [ ] **Milestone:** hello.cpp компилируется
+
+### v0.4 — Production-ready
+- [ ] Оптимизации (constant folding, dead code elimination)
+- [ ] Inline expansion для маленьких функций
+- [ ] Отладочная информация (DWARF или собственный формат)
+- [ ]_picolibc-совместимость_
+- [ ] **Milestone:** libonyxc + onyxcc собираются на OnyxOS под OnyxOS
+
+## Интеграция с OnyxOS
+
+`OnyxOS/Makefile` может быть расширен:
 
 ```makefile
+# in OnyxOS/Makefile
 ONYXCC ?= onyxcc
 ONYXCC_INCLUDE ?= $(ONYXCC_DIR)/libonyxc/include
 
 bin:
-	$(ONYXCC) --ring1 -o bin/init.onx init/init.c
-	$(ONYXCC) -o bin/login.onx init/login.c
-	$(ONYXCC) -o bin/osh.onx init/osh.c
+        $(ONYXCC) --ring1 -o bin/init.onx init/init.c
+        $(ONYXCC) -o bin/login.onx init/login.c
+        $(ONYXCC) -o bin/osh.onx init/osh.c
 ```
 
-Optional userspace applications (built with `onyxcc` against `libonyxc`) live
-in [OnyxApps](https://github.com/DivByDiamond/OnyxApps).
+## Лицензия
 
-----
+GPLv3 (в соответствии с лицензией всего проекта OnyxOS).
 
-## Related Projects
+## Связанные репозитории
 
-| Project | Description |
-|---------|-------------|
-| [OnyxOS](https://github.com/DivByDiamond/OnyxOS) | Meta-repository: build orchestration, docs, image assembly |
-| [OnyxBoot](https://github.com/DivByDiamond/OnyxBoot) | RISC-V bootloader (C++20) |
-| [OnyxKernel](https://github.com/DivByDiamond/OnyxKernel) | RISC-V kernel (Rust), defines the `.onx` format |
-| [OnyxApps](https://github.com/DivByDiamond/OnyxApps) | Userspace applications built with this compiler |
-
-For planned work, see [OnyxKernel/todo.md](https://github.com/DivByDiamond/OnyxKernel/blob/main/todo.md).
-
-----
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+- [OnyxOS](https://github.com/DivByDiamond/OnyxOS) — основная ОС, документация
+- [OnyxBoot](https://github.com/DivByDiamond/OnyxBoot) — загрузчик на C++
+- [OnyxKernel](https://github.com/DivByDiamond/OnyxKernel) — ядро на Rust, формат `.onx`
