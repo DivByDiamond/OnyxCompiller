@@ -1,6 +1,6 @@
 /*
  * syscalls.h — OnyxOS syscall ABI.
- * Synced with OnyxKernel/kernel/src/syscall/abi.rs (v0.4).
+ * Numbers generated from OnyxKernel/abi/syscalls.csv.
  *
  * Calling convention (RISC-V LP64):
  *   a7 = syscall number
@@ -9,113 +9,15 @@
  *
  * Trap: ecall instruction (CAUSE_U_ECALL handled by kernel/src/srv/trap.rs).
  *
- * Ring ACL (kernel/src/syscall/handler.rs):
- *   Ring 2 (user) may call: write, read, exit, yield, getpid, sbrk,
- *     open, close, lseek, stat, fstat, exec, readdir, getring, dropring,
- *     sigmask, write_fd, brk, mmap, munmap, mprotect, dup, chdir, getcwd,
- *     access, gettimeofday, fcntl, getuid, getgid, uname, nanosleep,
- *     clock_gettime, clock_getres, isatty, getentropy, getdents64, ioctl,
- *     sigaction, sigprocmask, sigreturn, execve, getppid, fork, waitpid,
- *     chan_connect, chan_send, chan_recv, chan_close, chan_open.
- *   Ring 1 (root) additionally: spawn, wait, kill, create, mkdir, unlink,
- *     rename, truncate, truncate2, ftruncate, utimens, pipe, setuid, setgid,
- *     fsync, symlink, chmod, fchmod, chan_create, chan_create_named,
- *     snapshot_*.
+ * Access policy is enforced by the kernel syscall ACL and handlers; see
+ * OnyxKernel/kernel/src/syscall/handler/acl.rs. Numbers do not grant access.
  */
 #ifndef ONYX_SYSCALLS_H
 #define ONYX_SYSCALLS_H
 
 #include <stdint.h>
 
-/* ── Original syscalls 1–49 (v0.3) ────────────────────────────────────── */
-#define SYS_write             1
-#define SYS_read              2
-#define SYS_exit              3
-#define SYS_yield             4
-#define SYS_getpid            5
-#define SYS_brk               6
-#define SYS_mmap              7
-#define SYS_open              8
-#define SYS_close             9
-#define SYS_lseek            10
-#define SYS_stat             11
-#define SYS_exec             12
-#define SYS_sbrk             13
-#define SYS_spawn            14
-#define SYS_wait             15
-#define SYS_readdir          16
-#define SYS_getring          17
-#define SYS_dropring         18
-#define SYS_snapshot_create  19
-#define SYS_snapshot_rollback 20
-#define SYS_snapshot_list    21
-#define SYS_kill             22
-#define SYS_sigmask          23
-#define SYS_write_fd         24
-#define SYS_create           25
-#define SYS_mkdir            26
-#define SYS_chan_create      27
-#define SYS_chan_connect     28
-#define SYS_chan_send        29
-#define SYS_chan_recv        30
-#define SYS_chan_close       31
-#define SYS_chan_create_named 32
-#define SYS_chan_open        33
-#define SYS_munmap           34
-#define SYS_dup              35
-#define SYS_pipe             36
-#define SYS_unlink           37
-#define SYS_rename           38
-#define SYS_chdir            39
-#define SYS_getcwd           40
-#define SYS_truncate         41   /* legacy: truncates to 0 */
-#define SYS_access           42
-#define SYS_gettimeofday     43
-#define SYS_fcntl            44
-#define SYS_getuid           45
-#define SYS_getgid           46
-#define SYS_utimens          47
-#define SYS_uname            48
-#define SYS_nanosleep        49
-
-/* ── New syscalls 50–77 (v0.4 — userspace-readiness update) ───────────── */
-#define SYS_fstat            50   /* fstat(fd, struct stat *) */
-#define SYS_waitpid          51   /* waitpid(pid, *status, options) */
-#define SYS_getdents64       52   /* getdents64(fd, *buf, len) */
-#define SYS_ioctl            53   /* ioctl(fd, req, arg) */
-#define SYS_mprotect         54   /* mprotect(addr, len, prot) */
-#define SYS_sigaction        55   /* sigaction(signum, *act, *oldact) */
-#define SYS_sigprocmask      56   /* sigprocmask(how, *set, *oldset) */
-#define SYS_sigreturn        57   /* sigreturn() */
-#define SYS_execve           58   /* execve(path, argv, envp) */
-#define SYS_getppid          59   /* getppid() */
-#define SYS_setpgid          60   /* setpgid(pid, pgid) */
-#define SYS_setsid           61   /* setsid() */
-#define SYS_getpgid          62   /* getpgid(pid) */
-#define SYS_fork             63   /* fork() — vfork-style */
-#define SYS_clock_gettime    64   /* clock_gettime(clk_id, *ts) */
-#define SYS_clock_getres     65   /* clock_getres(clk_id, *res) */
-#define SYS_isatty           66   /* isatty(fd) */
-#define SYS_getentropy       67   /* getentropy(buf, len) */
-#define SYS_setuid           68   /* setuid(uid) — root only */
-#define SYS_setgid           69   /* setgid(gid) — root only */
-#define SYS_fsync            70   /* fsync(fd) */
-#define SYS_truncate2        71   /* truncate(path, length) — POSIX */
-#define SYS_ftruncate        72   /* ftruncate(fd, length) */
-#define SYS_readlink         73   /* readlink(path, buf, len) */
-#define SYS_symlink          74   /* symlink(target, linkpath) */
-#define SYS_chmod            75   /* chmod(path, mode) */
-#define SYS_fchmod           76   /* fchmod(fd, mode) */
-#define SYS_getdents         77   /* compat alias for getdents64 */
-#define SYS_net_connect      80   /* net_connect(ip_ptr, port) -> conn_id */
-#define SYS_net_send         81   /* net_send(conn_id, buf, len) -> bytes */
-#define SYS_net_recv         82   /* net_recv(conn_id, buf, len) -> bytes */
-#define SYS_net_close        83   /* net_close(conn_id) -> 0 */
-#define SYS_net_resolve      89   /* net_resolve(name_ptr, name_len, ip_out) -> 0/-errno */
-#define SYS_chown            84   /* chown(path, uid, gid) */
-#define SYS_fchown           85   /* fchown(fd, uid, gid) */
-#define SYS_mouse_read       86   /* mouse_read(*event) */
-#define SYS_poll             87   /* poll(*fds, nfds, timeout) */
+#include "syscall_numbers.h"
 
 /* ── Constants used by syscalls ───────────────────────────────────────── */
 

@@ -1,11 +1,5 @@
+#include "../include/sys/syscall_numbers.h"
 typedef unsigned long size_t;
-
-#define SYS_write        1
-#define SYS_exit         3
-#define SYS_net_connect 80
-#define SYS_net_send    81
-#define SYS_net_recv    82
-#define SYS_net_close   83
 
 long __ecall2(long n, long a, long b);
 long __ecall3(long n, long a, long b, long c);

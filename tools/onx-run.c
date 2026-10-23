@@ -246,37 +246,7 @@ static void setup_stack(int argc, char **argv) {
 }
 
 /* ── Syscalls (OnyxKernel ABI) ──────────────────────────────────────── */
-#define SYS_write   1
-#define SYS_read    2
-#define SYS_exit    3
-#define SYS_yield   4
-#define SYS_getpid  5
-#define SYS_brk     6
-#define SYS_mmap    7
-#define SYS_open    8
-#define SYS_close   9
-#define SYS_lseek  10
-#define SYS_stat   11
-#define SYS_sbrk   13
-#define SYS_munmap 34
-#define SYS_dup    35
-#define SYS_chdir  39
-#define SYS_getcwd 40
-#define SYS_truncate2 71
-#define SYS_ftruncate 72
-#define SYS_access 42
-#define SYS_gettimeofday 43
-#define SYS_fcntl  44
-#define SYS_nanosleep 49
-#define SYS_fstat  50
-#define SYS_ioctl  53
-#define SYS_execve 58
-#define SYS_clock_gettime 64
-#define SYS_clock_getres 65
-#define SYS_isatty 66
-#define SYS_getentropy 67
-#define SYS_unlink 37
-#define SYS_rename 38
+#include "../include/sys/syscall_numbers.h"
 
 #define O_ACCMODE_LINUX 3
 
