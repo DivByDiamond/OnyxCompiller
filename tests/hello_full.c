@@ -1,3 +1,4 @@
+#include "../include/sys/syscall_numbers.h"
 /*
  * hello_full.c — runnable hello world with _start + syscall stubs.
  *
@@ -7,9 +8,6 @@
 
 typedef unsigned long size_t;
 typedef long ssize_t;
-
-#define SYS_write 1
-#define SYS_exit  3
 
 /* onyxcc built-ins: ecall with N args, a7=first arg, returns a0. */
 long __ecall1(long n);
