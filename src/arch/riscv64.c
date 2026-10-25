@@ -103,6 +103,17 @@ void rv_addi_imm(int rd, int rs1, int64_t imm) {
     int64_t hi = (v - lo) & ~0xFFFULL;
     rv_lui(tmp, (uint32_t)((hi >> 12) & 0xFFFFF) & 0xFFFFF);
     rv_addi(tmp, tmp, (int)lo);
+    if (v >= 0x80000000LL && v <= 0xFFFFFFFFLL) {
+        /* 32-bit unsigned constant (e.g. the Linux-compatible ioctl
+         * numbers like TIOCGPTN 0x80045430): `lui` sign-extends bit 31, so
+         * the value above is 0xFFFFFFFF80045430 instead of 0x80045430.
+         * Clear the upper 32 bits again — a plain lui+addi is only exact
+         * for [-2^31, 2^31-1]. Found live: open("/dev/ptmx") succeeded but
+         * ioctl(TIOCGPTN) reached the kernel as 0xFFFFFFFF80045430 and came
+         * back ENOSYS, so pty_open() failed for every app. */
+        rv_slli(tmp, tmp, 32);
+        rv_srli(tmp, tmp, 32);
+    }
     rv_add(rd, rs1, tmp);
 }
 

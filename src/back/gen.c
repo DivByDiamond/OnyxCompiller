@@ -272,11 +272,11 @@ static void materialize(val_t *v, int reg) {
              * returned &struct and every same-register address use
              * pointed at the wrong member. */
             if (v->reg != reg) {
-                rv_addi(reg, v->reg, (int)v->offset);
+                rv_addi_imm(reg, v->reg, v->offset);
                 v->reg = reg;
                 v->offset = 0;
             } else if (v->offset != 0) {
-                rv_addi(reg, reg, (int)v->offset);
+                rv_addi_imm(reg, reg, v->offset);
                 v->offset = 0;
             }
             break;
@@ -382,7 +382,7 @@ static void materialize_float_const(val_t *v, int freg) {
     uint32_t lui_off = (uint32_t)g_text.size;
     rv_lui(RV_T0, 0);
     uint32_t addi_off = (uint32_t)g_text.size;
-    rv_addi(RV_T0, RV_T0, (int)rodata_off);
+    rv_addi_imm(RV_T0, RV_T0, (int64_t)rodata_off);
     if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
     g_rodata_fixups[g_n_rodata_fixups].rodata_off = rodata_off;
     g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
@@ -844,7 +844,7 @@ static void emit_load_global_addr(int reg, int sym_idx, int64_t add_off) {
     uint32_t lui_off = (uint32_t)g_text.size;
     rv_lui(reg, 0);
     uint32_t addi_off = (uint32_t)g_text.size;
-    rv_addi(reg, reg, (int)add_off);
+    rv_addi_imm(reg, reg, (int64_t)add_off);
     if (g_n_fixups >= 4096) cc_fatal("too many global refs");
     g_fixups[g_n_fixups].sym_idx = sym_idx;
     g_fixups[g_n_fixups].patch_lui = lui_off;
@@ -1050,7 +1050,7 @@ static void spill_lval(val_t *v) {
     if (v->offset == 0) {
         rv_sd(v->reg, RV_FP, (int)slot);
     } else {
-        rv_addi(RV_T3, v->reg, (int)v->offset);
+        rv_addi_imm(RV_T3, v->reg, v->offset);
         rv_sd(RV_T3, RV_FP, (int)slot);
     }
     v->kind = VAL_SPILL;
@@ -1189,7 +1189,7 @@ static val_t parse_postfix(lexer_t *lx, val_t v) {
                     if (v.kind == VAL_SYM || v.kind == VAL_SPILL) {
                         materialize(&v, addr_reg);
                     } else {
-                        rv_addi(addr_reg, v.reg, (int)v.offset);
+                        rv_addi_imm(addr_reg, v.reg, v.offset);
                     }
                     uint64_t st = type_sizeof(v.type);
                     switch (st) {
@@ -1243,7 +1243,7 @@ static val_t parse_primary(lexer_t *lx) {
             uint32_t lui_off = (uint32_t)g_text.size;
             rv_lui(RV_T0, 0);
             uint32_t addi_off = (uint32_t)g_text.size;
-            rv_addi(RV_T0, RV_T0, (int)off);
+            rv_addi_imm(RV_T0, RV_T0, off);
             /* Record rodata fixup. */
             if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
             g_rodata_fixups[g_n_rodata_fixups].rodata_off = off;
@@ -1303,7 +1303,7 @@ static val_t parse_primary(lexer_t *lx) {
                         }
                         /* Store the element. */
                         load_value(&elem, RV_T1);
-                        rv_addi(RV_T2, RV_T0, (int)elem_off);
+                        rv_addi_imm(RV_T2, RV_T0, (int64_t)elem_off);
                         uint64_t elem_sz = type_sizeof(elem.type);
                         switch (elem_sz) {
                             case 1: rv_sb(RV_T1, RV_T2, 0); break;
@@ -1646,7 +1646,7 @@ static val_t parse_primary(lexer_t *lx) {
                 uint32_t lui_off = (uint32_t)g_text.size;
                 rv_lui(RV_T0, 0);
                 uint32_t addi_off = (uint32_t)g_text.size;
-                rv_addi(RV_T0, RV_T0, (int)off);
+                rv_addi_imm(RV_T0, RV_T0, off);
                 if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
                 g_rodata_fixups[g_n_rodata_fixups].rodata_off = off;
                 g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
@@ -1835,7 +1835,7 @@ static val_t parse_unary(lexer_t *lx) {
             if (e.kind == VAL_SYM || e.kind == VAL_SPILL) {
                 materialize(&e, addr_reg);
             } else {
-                rv_addi(addr_reg, e.reg, (int)e.offset);
+                rv_addi_imm(addr_reg, e.reg, e.offset);
             }
             uint64_t st = type_sizeof(e.type);
             switch (st) {
@@ -1891,7 +1891,7 @@ static void gen_store(val_t *lhs, val_t *rhs, int op) {
         if (lhs->kind == VAL_SYM || lhs->kind == VAL_SPILL) {
             materialize(lhs, addr_reg);
         } else {
-            rv_addi(addr_reg, lhs->reg, (int)lhs->offset);
+            rv_addi_imm(addr_reg, lhs->reg, lhs->offset);
         }
         /* Store float reg to memory. */
         bool is_d = (lhs->type->kind == TY_DOUBLE || lhs->type->kind == TY_LDOUBLE);
@@ -1933,7 +1933,7 @@ static void gen_store(val_t *lhs, val_t *rhs, int op) {
     if (lhs->kind == VAL_SYM || lhs->kind == VAL_SPILL) {
         materialize(lhs, addr_reg);
     } else {
-        rv_addi(addr_reg, lhs->reg, (int)lhs->offset);
+        rv_addi_imm(addr_reg, lhs->reg, lhs->offset);
     }
     uint64_t st = type_sizeof(lhs->type);
     switch (st) {
@@ -2117,7 +2117,7 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
             if (lhs.offset == 0) {
                 rv_sd(lhs.reg, RV_FP, (int)slot);
             } else {
-                rv_addi(RV_T3, lhs.reg, (int)lhs.offset);
+                rv_addi_imm(RV_T3, lhs.reg, lhs.offset);
                 rv_sd(RV_T3, RV_FP, (int)slot);
             }
             lhs.kind = VAL_SPILL;
@@ -2151,7 +2151,7 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
             if (rhs.offset == 0) {
                 rv_sd(rhs.reg, RV_FP, (int)slot);
             } else {
-                rv_addi(RV_T3, rhs.reg, (int)rhs.offset);
+                rv_addi_imm(RV_T3, rhs.reg, rhs.offset);
                 rv_sd(RV_T3, RV_FP, (int)slot);
             }
             rhs.kind = VAL_SPILL;
@@ -2360,7 +2360,7 @@ static val_t parse_assign(lexer_t *lx) {
             if (lhs.offset == 0) {
                 rv_sd(lhs.reg, RV_FP, (int)slot);
             } else {
-                rv_addi(RV_T3, lhs.reg, (int)lhs.offset);
+                rv_addi_imm(RV_T3, lhs.reg, lhs.offset);
                 rv_sd(RV_T3, RV_FP, (int)slot);
             }
             lhs.kind = VAL_SPILL;
@@ -2705,7 +2705,7 @@ static void parse_stmt_body(lexer_t *lx) {
                     uint32_t lui_off = (uint32_t)g_text.size;
                     rv_lui(RV_T1, 0);
                     uint32_t addi_off = (uint32_t)g_text.size;
-                    rv_addi(RV_T1, RV_T1, (int)ro_off);
+                    rv_addi_imm(RV_T1, RV_T1, (int64_t)ro_off);
                     if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
                     g_rodata_fixups[g_n_rodata_fixups].rodata_off = ro_off;
                     g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
@@ -2774,7 +2774,7 @@ static void parse_stmt_body(lexer_t *lx) {
                     uint32_t lui_off = (uint32_t)g_text.size;
                     rv_lui(RV_T1, 0);
                     uint32_t addi_off = (uint32_t)g_text.size;
-                    rv_addi(RV_T1, RV_T1, (int)ro_off);
+                    rv_addi_imm(RV_T1, RV_T1, (int64_t)ro_off);
                     if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
                     g_rodata_fixups[g_n_rodata_fixups].rodata_off = ro_off;
                     g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
