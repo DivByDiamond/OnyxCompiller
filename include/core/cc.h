@@ -18,6 +18,10 @@
 #endif
 
 /* ---- Limits ------------------------------------------------------------ */
+#define CC_MAX_INPUT_FILES 256
+#define CC_MAX_REFS 65536
+#define CC_LIB_SOURCE_COUNT 16
+
 #define CC_MAX_TOKEN_LEN   256
 #define CC_MAX_IDENT        64
 #define CC_MAX_PATH        256
@@ -69,10 +73,11 @@ typedef struct {
 } cc_pos_t;
 
 /* ---- Util: bump arena -------------------------------------------------- */
-/* One-shot bump allocator used for AST nodes. We never free individual
- * nodes; on a top-level declaration boundary we reset the arena. */
+/* Lazily allocated chunks keep returned pointers stable until reset/free.
+ * size is a logical allocation limit, not an eagerly reserved block. */
 typedef struct cc_arena {
-    char *base;
+    struct cc_arena_chunk *first;
+    struct cc_arena_chunk *current;
     size_t size;
     size_t used;
 } cc_arena_t;
@@ -113,7 +118,7 @@ extern uint64_t g_entry;     /* set by gen when _start is emitted */
 /* ---- CLI options ------------------------------------------------------ */
 typedef struct {
     const char *input;          /* primary input file (first one) */
-    const char *input_files[30]; /* all input files (user files + auto-linked libc) */
+    const char *input_files[CC_MAX_INPUT_FILES]; /* all input files (user files + auto-linked libc) */
     int n_input_files;
     int current_file_idx;       /* index of file currently being compiled */
     const char *output;         /* default: a.onx */
@@ -123,6 +128,7 @@ typedef struct {
     bool dump_tokens;
     bool dump_ast;
     bool preprocess_only;       /* -E: dump preprocessed source, no codegen */
+    bool syntax_only;
     bool nostdlib;              /* -nostdlib: skip libonyxc auto-link */
     const char *include_paths[16];
     int n_include_paths;

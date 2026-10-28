@@ -20,6 +20,7 @@
  * Exit status = program's exit code.
  */
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -54,6 +55,7 @@ static uint8_t *page_get(uint64_t addr, bool fault_on_nomap) {
     if (addr >= ADDR_SPACE_SIZE) {
         fprintf(stderr, "onx-run: fault: address 0x%llx out of range (pc=0x%llx)\n",
                 (unsigned long long)addr, (unsigned long long)g_pc);
+        trace_dump();
         exit(139);
     }
     uint64_t pn = addr >> PAGE_BITS;
@@ -114,6 +116,7 @@ static uint64_t g_freg[32];      /* raw bits (float/double) */
 static uint64_t g_exit_code = 0;
 static bool     g_exited = false;
 static bool     g_verbose = false;
+static uint32_t g_fcsr;
 
 /* ── Host file table ────────────────────────────────────────────────── */
 #define MAX_HOST_FILES 32
@@ -176,7 +179,8 @@ static void load_onx(const char *path) {
         }
         seg.offset = (uint32_t)sh[24] | ((uint32_t)sh[25] << 8) |
                      ((uint32_t)sh[26] << 16) | ((uint32_t)sh[27] << 24);
-        for (uint64_t a = seg.vaddr; a < seg.vaddr + seg.memsz; a += PAGE_SIZE) {
+        for (uint64_t a = seg.vaddr & ~(uint64_t)(PAGE_SIZE - 1);
+             seg.memsz && a < seg.vaddr + seg.memsz; a += PAGE_SIZE) {
             page_get(a, false);
         }
         if (seg.filesz) {
@@ -365,7 +369,7 @@ static long do_syscall(void) {
             char path[1024];
             mem_read_str(a0, path, sizeof(path));
             int host_fd = open(path, host_oflags((int)a1), 0644);
-            if (host_fd < 0) return (long)-2;
+            if (host_fd < 0) return (long)-errno;
             int fd = fd_alloc(host_fd, strdup(path));
             if (fd < 0) { close(host_fd); return (long)-24; }
             return fd;
@@ -704,7 +708,7 @@ static void step(void) {
                 case 7: g_reg[rd] = g_reg[rs1] & imm; break;
                 case 1: g_reg[rd] = g_reg[rs1] << shamt; break;
                 case 5:
-                    if ((insn >> 26) == 0x20) g_reg[rd] = (uint64_t)((int64_t)g_reg[rs1] >> shamt);
+                    if ((insn >> 26) == 0x10) g_reg[rd] = (uint64_t)((int64_t)g_reg[rs1] >> shamt);
                     else g_reg[rd] = g_reg[rs1] >> shamt;
                     break;
                 default: illegal(insn);
@@ -777,7 +781,7 @@ static void step(void) {
                 case 0: g_reg[rd] = (uint64_t)(int32_t)(a + (int32_t)imm); break;
                 case 1: g_reg[rd] = (uint64_t)(int32_t)((uint32_t)a << shamt); break;
                 case 5:
-                    if ((insn >> 26) == 0x20) g_reg[rd] = (uint64_t)(int32_t)(a >> shamt);
+                    if ((insn >> 26) == 0x10) g_reg[rd] = (uint64_t)(int32_t)(a >> shamt);
                     else g_reg[rd] = (uint64_t)(int32_t)((uint32_t)a >> shamt);
                     break;
                 default: illegal(insn);
@@ -833,6 +837,19 @@ static void step(void) {
             } else if (insn == 0x00100073) {  /* EBREAK */
                 fprintf(stderr, "onx-run: ebreak at 0x%llx\n", (unsigned long long)g_pc);
                 exit(133);
+            } else if (funct3 && ((insn >> 20) >= 1) && ((insn >> 20) <= 3)) {
+                unsigned csr = insn >> 20;
+                unsigned shift = csr == 2 ? 5 : 0;
+                uint32_t mask = csr == 1 ? 31 : csr == 2 ? 7 : 255;
+                uint32_t old = (g_fcsr >> shift) & mask;
+                uint32_t source = funct3 >= 5 ? (uint32_t)rs1 : (uint32_t)g_reg[rs1];
+                unsigned operation = funct3 & 3;
+                if (operation == 0) illegal(insn);
+                if (operation == 1 || rs1 != 0) {
+                    uint32_t next = operation == 1 ? source : operation == 2 ? old | source : old & ~source;
+                    g_fcsr = (g_fcsr & ~(mask << shift)) | ((next & mask) << shift);
+                }
+                g_reg[rd] = old;
             } else {
                 illegal(insn);
             }

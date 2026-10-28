@@ -33,16 +33,24 @@ jobs:
           key: onyxcc-${{ runner.os }}-${{ hashFiles('src/**', 'include/**', 'libonyxc/**', 'CMakeLists.txt', 'Makefile') }}
           restore-keys: onyxcc-${{ runner.os }}-
 
-      - name: Build host onyxcc
-        run: make -j$(nproc)
+      - name: Build host tools from source
+        # Prebuilt executables are tracked; checkout mtimes cannot establish
+        # that they correspond to the current source or syscall snapshot.
+        run: make -B -j$(nproc) all tools/onx-run
+
+      - name: Frontend, target runtime and driver checks
+        run: make check
+
+      - name: Native allocator and libc sanitizer checks
+        run: make check-native
 
       - name: Self-hosting test (compile own sources)
         run: make selfhost-test
 
-      - name: Self-hosting full build
+      - name: Experimental self-hosted artifact build
         run: make selfhost
 
-      - name: Upload onyxcc_self.onx
+      - name: Upload experimental onyxcc_self.onx
         uses: actions/upload-artifact@v6
         with:
           name: onyxcc_self

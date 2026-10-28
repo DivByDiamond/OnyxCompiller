@@ -51,6 +51,7 @@ static void usage(void) {
         "  -e, --entry   <sym>   Entry symbol (default: _start)\n"
         "      --ring1            Emit RING1 flag (binary runs in root space)\n"
         "      --nostdlib         Do not auto-link libonyxc (freestanding)\n"
+        "      -fsyntax-only      Check translation units without linking/output\n"
         "  -v, --verbose         Verbose diagnostics\n"
         "      --dump-tokens      Print token stream after lex\n"
         "  -h, --help            Show this help\n"
@@ -60,7 +61,7 @@ static void usage(void) {
         "  onyxcc -o prog.onx main.c                  # single file\n"
         "\n"
         "Environment:\n"
-        "  ONYXCC_INCLUDE  Default include path (e.g. /usr/onyxc/include)\n"
+        "  ONYXCC_INCLUDE  Default include path (e.g. /usr/onyxc/lib/include/core)\n"
         "\n");
 }
 
@@ -74,6 +75,7 @@ static struct option long_opts[] = {
     {"verbose",    no_argument,       0, 'v'},
     {"dump-tokens",no_argument,       0, 'T'},
     {"preprocess", no_argument,       0, 'E'},
+    {"syntax-only", no_argument,      0, 'S'},
     {"help",       no_argument,       0, 'h'},
     {0, 0, 0, 0},
 };
@@ -91,7 +93,7 @@ int main(int argc, char **argv) {
 
     int c;
     int opt_idx = 0;
-    while ((c = getopt_long(argc, argv, "I:D:o:e:vhEN", long_opts, &opt_idx)) != -1) {
+    while ((c = getopt_long(argc, argv, "I:D:o:e:f:vhENS", long_opts, &opt_idx)) != -1) {
         switch (c) {
             case 'I':
                 if (g_opts.n_include_paths < 16)
@@ -100,6 +102,14 @@ int main(int argc, char **argv) {
             case 'D':
                 if (g_opts.n_define_macros < 64)
                     g_opts.define_macros[g_opts.n_define_macros++] = optarg;
+                break;
+            case 'S': g_opts.syntax_only = true; break;
+            case 'f':
+                if (strcmp(optarg, "syntax-only") != 0) {
+                    fprintf(stderr, "onyxcc: unsupported -f option: %s\n", optarg);
+                    return 1;
+                }
+                g_opts.syntax_only = true;
                 break;
             case 'o': g_opts.output = optarg; break;
             case 'e': g_opts.entry_sym = optarg; break;
@@ -138,7 +148,12 @@ int main(int argc, char **argv) {
 
     /* Collect all input files. */
     g_opts.n_input_files = 0;
-    for (int i = optind; i < argc && g_opts.n_input_files < 30; i++) {
+    if (argc - optind > CC_MAX_INPUT_FILES - (g_opts.nostdlib ? 0 : CC_LIB_SOURCE_COUNT)) {
+        fprintf(stderr, "onyxcc: too many input files (maximum %d)\n",
+                CC_MAX_INPUT_FILES - (g_opts.nostdlib ? 0 : CC_LIB_SOURCE_COUNT));
+        return 1;
+    }
+    for (int i = optind; i < argc; i++) {
         g_opts.input_files[g_opts.n_input_files++] = argv[i];
     }
 
@@ -158,7 +173,7 @@ int main(int argc, char **argv) {
             /* Locate libonyxc relative to the executable:
              *   <exe-dir>/libonyxc          (repo layout: OnyxCompiller/)
              *   <exe-dir>/../libonyxc       (installed alongside)
-             *   /usr/onyxc/lib/libonyxc     (system install) */
+             *   /usr/onyxc/lib     (system install) */
             char exepath[CC_MAX_PATH * 2] = {0};
             ssize_t n = -1;
 #ifndef CC_FREESTANDING
@@ -185,7 +200,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (libdir[0] == 0) {
-                snprintf(libdir, sizeof(libdir), "/usr/onyxc/lib/libonyxc");
+                snprintf(libdir, sizeof(libdir), "/usr/onyxc/lib");
             }
         }
         /* Sanity: start_cc.c must exist there. */
@@ -204,15 +219,21 @@ int main(int argc, char **argv) {
                 "/src/core/syscalls.c",
                 "/src/io/stdio.c",
                 "/src/io/stdlib.c",
+                "/src/memory/alloc.c",
                 "/src/io/string.c",
                 "/src/io/strerror.c",
                 "/src/ctype/ctype.c",
                 "/src/io/time.c",
                 "/src/io/termios.c",
                 "/src/io/math.c",
+                "/src/math/ieee.c",
+                "/src/locale/locale.c",
+                "/src/process/runtime.c",
+                "/src/format/float.c",
+                "/src/convert/strtod.c",
             };
-            static char libpaths[10][CC_MAX_PATH * 2];
-            for (int i = 0; i < 10; i++) {
+            static char libpaths[CC_LIB_SOURCE_COUNT][CC_MAX_PATH * 2];
+            for (int i = 0; i < CC_LIB_SOURCE_COUNT; i++) {
                 snprintf(libpaths[i], sizeof(libpaths[i]), "%s%s", libdir, libsrcs[i]);
                 g_opts.input_files[g_opts.n_input_files++] = libpaths[i];
             }
@@ -249,7 +270,7 @@ int main(int argc, char **argv) {
 
     /* Init arenas, types, symbol table (shared across all files). */
     cc_arena_init(&g_ast_arena, 256 * 1024 * 1024);  /* 256 MiB for AST (auto-linked libc, multi-file apps) */
-    cc_arena_init(&g_type_arena, 256 * 1024 * 1024); /* 256 MiB for types */
+    cc_arena_init(&g_type_arena, 1024UL * 1024 * 1024); /* 256 MiB for types */
     types_init(&g_type_arena);
     tags_init();
     symtab_init();
@@ -310,8 +331,11 @@ int main(int argc, char **argv) {
         free(pp_src);
     }
 
+    if (cc_get_errors() > 0) { rc = 1; goto cleanup; }
+    if (g_opts.syntax_only) goto cleanup;
     /* 5. Finalize (resolve addresses) — once after all files. */
     gen_finalize(g_opts.entry_sym);
+    if (cc_get_errors() > 0) { rc = 1; goto cleanup; }
 
     /* 6. Emit .onx. */
     rc = onx_emit(g_opts.output, &g_text, &g_rodata, &g_data,

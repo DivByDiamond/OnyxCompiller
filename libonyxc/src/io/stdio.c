@@ -23,6 +23,7 @@
 #include "onyxc.h"
 #include <errno.h>
 #include <fcntl.h>
+#include "../format/internal.h"
 
 /* ── errno storage ──────────────────────────────────────────────────── */
 static int g_errno = 0;
@@ -41,6 +42,10 @@ int *___errno_location(void) { return &g_errno; }
 #define _IO_UNREAD    0x0040    /* read buffer has data */
 #define _IO_LINE_BUF  0x0080
 #define _IO_IS_STDIO  0x0100
+#define _IO_OWN_BUF   0x0200
+#define _IO_UNBUF     0x0400
+#define _IO_PUSHBACK  0x0800
+#define _IO_APPEND    0x1000
 
 struct __FILE_s {
     int fd;
@@ -50,9 +55,10 @@ struct __FILE_s {
     size_t buf_size;   /* buffer capacity */
     size_t buf_start;  /* read: start of valid data; write: 0 */
     size_t buf_end;    /* read: end of valid data; write: end of dirty data */
+    unsigned char pushback;
+    char single_byte;
 };
 
-typedef struct __FILE_s FILE;
 
 /* Pre-allocated FILE slots. */
 static struct __FILE_s g_streams[FILE_MAX];
@@ -88,7 +94,7 @@ static void streams_init(void) {
     g_stdout_obj.buf = g_stdout_buf;
     g_stdout_obj.buf_size = FILE_BUF_SIZE;
     g_stderr_obj.fd = 2;
-    g_stderr_obj.flags = _IO_WRITE | _IO_IS_STDIO | _IO_LINE_BUF;
+    g_stderr_obj.flags = _IO_WRITE | _IO_IS_STDIO | _IO_UNBUF;
     g_stderr_obj.buf = g_stderr_buf;
     g_stderr_obj.buf_size = FILE_BUF_SIZE;
 }
@@ -101,10 +107,17 @@ typedef struct {
     int    fd;        /* -1 = pure buffer; >=0 = write to fd */
     int    total;
     int    err;
+    FILE  *stream;
 } fmt_ctx_t;
 
 static void fmt_emit(fmt_ctx_t *c, char ch) {
     if (c->err) return;
+    if (c->total == INT_MAX) { errno = EINVAL; c->err = 1; return; }
+    if (c->stream) {
+        if (fputc((unsigned char)ch, c->stream) == EOF) c->err = 1;
+        else c->total++;
+        return;
+    }
     if (c->buf) {
         if (c->pos < c->cap) {
             c->buf[c->pos++] = ch;
@@ -125,6 +138,12 @@ static void fmt_emit(fmt_ctx_t *c, char ch) {
         if (n < 0) { c->err = 1; return; }
     }
     c->total++;
+}
+
+static int float_emit(void *context, char ch) {
+    fmt_ctx_t *c = context;
+    fmt_emit(c, ch);
+    return c->err ? -1 : 0;
 }
 
 static void fmt_emit_str(fmt_ctx_t *c, const char *s, size_t n) {
@@ -305,12 +324,16 @@ static int vformat_run(fmt_ctx_t *c, const char *fmt, va_list ap) {
         /* Width — number or "*". */
         if (*fmt == '*') {
             int w = va_arg(ap, int);
+            if (w == INT_MIN) { errno = EINVAL; c->err = 1; return -1; }
             if (w < 0) { sp.flag_minus = 1; w = -w; }
             sp.width = w;
             fmt++;
         } else {
             int w = 0;
-            while (*fmt >= '0' && *fmt <= '9') { w = w * 10 + (*fmt - '0'); fmt++; }
+            while (*fmt >= '0' && *fmt <= '9') {
+                if (w > (INT_MAX - (*fmt - '0')) / 10) { errno = EINVAL; c->err = 1; return -1; }
+                w = w * 10 + (*fmt - '0'); fmt++;
+            }
             if (w > 0) sp.width = w;
         }
 
@@ -323,7 +346,10 @@ static int vformat_run(fmt_ctx_t *c, const char *fmt, va_list ap) {
                 fmt++;
             } else {
                 int p = 0;
-                while (*fmt >= '0' && *fmt <= '9') { p = p * 10 + (*fmt - '0'); fmt++; }
+                while (*fmt >= '0' && *fmt <= '9') {
+                    if (p > (INT_MAX - (*fmt - '0')) / 10) { errno = EINVAL; c->err = 1; return -1; }
+                    p = p * 10 + (*fmt - '0'); fmt++;
+                }
                 sp.precision = p;
             }
         }
@@ -423,37 +449,12 @@ static int vformat_run(fmt_ctx_t *c, const char *fmt, va_list ap) {
             }
             case '%': fmt_emit(c, '%'); break;
             case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': {
-                /* Limited float support: print integer part + fractional part
-                 * to precision digits. Truncated, no rounding. */
-                double d = va_arg(ap, double);
-                if (d < 0) { fmt_emit(c, '-'); d = -d; }
-                long long ip = (long long)d;
-                double fp = d - (double)ip;
-                int prec0 = sp.precision >= 0 ? sp.precision : 6;
-                if (prec0 > 0) {
-                    /* Round first, then print the (possibly carried) integer
-                     * part — avoids 2.5 printing as 2.49. */
-                    double scale = 1.0;
-                    for (int i = 0; i < prec0; i++) scale *= 10.0;
-                    double fr = (d - (double)ip) * scale;
-                    long long frac = (long long)(fr + 0.5);
-                    if (frac >= (long long)scale) {
-                        ip += 1;
-                        frac -= (long long)scale;
-                    }
-                    fmt_emit_uint(c, (unsigned long long)ip, 10, 0);
-                    fmt_emit(c, '.');
-                    char digs[24];
-                    int nd = 0;
-                    for (int i = 0; i < prec0; i++) {
-                        digs[nd++] = (char)('0' + (frac % 10));
-                        frac /= 10;
-                    }
-                    while (nd > 0) fmt_emit(c, digs[--nd]);
-                } else {
-                    fmt_emit_uint(c, (unsigned long long)ip, 10, 0);
-                }
-                break;
+                double value = va_arg(ap, double);
+                unsigned flags = (sp.flag_minus ? ONYX_FMT_MINUS : 0) |
+                    (sp.flag_plus ? ONYX_FMT_PLUS : 0) | (sp.flag_space ? ONYX_FMT_SPACE : 0) |
+                    (sp.flag_hash ? ONYX_FMT_HASH : 0) | (sp.flag_zero ? ONYX_FMT_ZERO : 0);
+                if (_onyx_format_float(value, spec, sp.precision, sp.width,
+                    flags, float_emit, c) < 0) c->err = 1;
                 break;
             }
             default:
@@ -467,23 +468,16 @@ static int vformat_run(fmt_ctx_t *c, const char *fmt, va_list ap) {
 
 /* Public: write to fd, with optional buffer. */
 int vfprintf(FILE *fp, const char *fmt, va_list ap) {
-    streams_init();
-    if (!fp) fp = stdout;
     fmt_ctx_t c;
-    c.buf = fp->buf;
-    c.pos = fp->buf_end;
-    c.cap = fp->buf_size;
-    c.fd = (fp->flags & _IO_WRITE) ? fp->fd : -1;
-    c.total = 0;
-    c.err = 0;
+    streams_init();
+    if (!fp || !fmt) { errno = EINVAL; return EOF; }
+    c.buf = NULL;
+    c.pos = c.cap = 0;
+    c.fd = -1;
+    c.total = c.err = 0;
+    c.stream = fp;
     int total = vformat_run(&c, fmt, ap);
-    /* Flush remaining buffer to fd. */
-    if (c.pos > 0 && c.fd >= 0) {
-        long n = _onyx_write(c.fd, fp->buf, c.pos);
-        if (n < 0) c.err = 1;
-    }
-    fp->buf_end = 0;   /* reset write buffer */
-    return c.err ? -1 : total;
+    return c.err ? EOF : total;
 }
 
 int vprintf(const char *fmt, va_list ap) {
@@ -498,13 +492,14 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
     c.fd = -1;
     c.total = 0;
     c.err = 0;
+    c.stream = NULL;
     int total = vformat_run(&c, fmt, ap);
     /* Always null-terminate. */
     if (cap > 0) {
         buf[(c.pos < cap) ? c.pos : cap - 1] = '\0';
     }
     (void)total;
-    return c.total;
+    return c.err ? -1 : c.total;
 }
 
 int vsprintf(char *buf, const char *fmt, va_list ap) {
@@ -825,22 +820,29 @@ int vfscanf(FILE *fp, const char *fmt, va_list ap) {
 
 /* ── FILE* I/O ───────────────────────────────────────────────────────── */
 static int file_flush_locked(FILE *fp) {
-    if (!(fp->flags & _IO_WRITE)) return 0;
-    if (fp->buf_end == 0) return 0;
-    long n = _onyx_write(fp->fd, fp->buf, fp->buf_end);
-    if (n < 0) {
-        fp->flags |= _IO_ERR;
-        errno = (int)(-n);
-        return -1;
+    size_t sent = 0;
+    if (!(fp->flags & _IO_DIRTY)) return 0;
+    while (sent < fp->buf_end) {
+        long n = _onyx_write(fp->fd, fp->buf + sent, fp->buf_end - sent);
+        if (n <= 0) {
+            fp->flags |= _IO_ERR;
+            errno = n < 0 ? (int)(-n) : EIO;
+            /* Preserve bytes not written so a later flush can retry. */
+            if (sent) memmove(fp->buf, fp->buf + sent, fp->buf_end - sent);
+            fp->buf_end -= sent;
+            return -1;
+        }
+        sent += (size_t)n;
+        fp->pos += n;
     }
-    fp->pos += n;
     fp->buf_end = 0;
+    fp->flags &= ~_IO_DIRTY;
     return 0;
 }
 
 static int file_fill_locked(FILE *fp) {
-    if (!(fp->flags & _IO_READ)) return -1;
-    long n = _onyx_read(fp->fd, fp->buf, fp->buf_size);
+    if (fp->flags & _IO_EOF) return 0;
+    long n = _onyx_read(fp->fd, fp->buf, (fp->flags & _IO_UNBUF) ? 1 : fp->buf_size);
     if (n < 0) {
         fp->flags |= _IO_ERR;
         errno = (int)(-n);
@@ -852,72 +854,133 @@ static int file_fill_locked(FILE *fp) {
     }
     fp->buf_start = 0;
     fp->buf_end = (size_t)n;
+    fp->pos += n;
     return (int)n;
 }
 
-FILE *fopen(const char *path, const char *mode) {
-    streams_init();
-    int flags = 0;
-    int open_flags = 0;
-    int open_mode = 0644;
-    /* Parse mode. */
-    if (mode[0] == 'r') {
-        flags = _IO_READ;
-        open_flags = O_RDONLY;
-        if (mode[1] == '+') { flags = _IO_RDWR; open_flags = O_RDWR; }
-    } else if (mode[0] == 'w') {
-        flags = _IO_WRITE;
-        open_flags = O_WRONLY | O_CREAT | O_TRUNC;
-        if (mode[1] == '+') { flags = _IO_RDWR; open_flags = O_RDWR | O_CREAT | O_TRUNC; }
-    } else if (mode[0] == 'a') {
-        flags = _IO_WRITE;
-        open_flags = O_WRONLY | O_CREAT | O_APPEND;
-        if (mode[1] == '+') { flags = _IO_RDWR; open_flags = O_RDWR | O_CREAT | O_APPEND; }
-    } else {
-        errno = EINVAL;
-        return NULL;
+static int prepare_read(FILE *fp) {
+    if (!(fp->flags & (_IO_READ | _IO_RDWR))) {
+        fp->flags |= _IO_ERR; errno = EBADF; return EOF;
     }
-    long fd = _onyx_open(path, open_flags, open_mode);
-    if (fd < 0) {
-        errno = (int)(-fd);
-        return NULL;
-    }
-    /* Find a free slot. */
-    for (int i = 0; i < FILE_MAX; i++) {
-        if (g_streams[i].fd == -1) {
-            g_streams[i].fd = (int)fd;
-            g_streams[i].flags = flags;
-            g_streams[i].pos = 0;
-            g_streams[i].buf_start = 0;
-            g_streams[i].buf_end = 0;
-            return &g_streams[i];
-        }
-    }
-    _onyx_close((int)fd);
-    errno = EMFILE;
-    return NULL;
-}
-
-int fclose(FILE *fp) {
-    if (!fp) { errno = EBADF; return -1; }
-    if (fp->flags & _IO_IS_STDIO) {
-        /* Don't actually close std streams. */
-        file_flush_locked(fp);
-        return 0;
-    }
-    file_flush_locked(fp);
-    _onyx_close(fp->fd);
-    fp->fd = -1;
-    fp->flags = 0;
+    if (file_flush_locked(fp) < 0) return EOF;
+    fp->flags |= _IO_UNREAD;
     return 0;
 }
 
+static int discard_input(FILE *fp) {
+    if (fp->flags & _IO_UNREAD) {
+        long unread = (long)(fp->buf_end - fp->buf_start);
+        if (fp->flags & _IO_PUSHBACK) unread++;
+        if (unread) {
+            long r = _onyx_lseek(fp->fd, -unread, SEEK_CUR);
+            if (r < 0) { errno = (int)-r; fp->flags |= _IO_ERR; return EOF; }
+            fp->pos = r;
+        }
+        fp->buf_start = fp->buf_end = 0;
+        fp->flags &= ~(_IO_UNREAD | _IO_PUSHBACK);
+    }
+    return 0;
+}
+
+static int prepare_write(FILE *fp) {
+    if (!(fp->flags & (_IO_WRITE | _IO_RDWR))) {
+        fp->flags |= _IO_ERR; errno = EBADF; return EOF;
+    }
+    return discard_input(fp);
+}
+
+static int open_mode(const char *mode, int *flags, int *open_flags) {
+    int i, plus = 0, binary = 0;
+    if (!mode || !*mode) { errno = EINVAL; return -1; }
+    for (i = 1; mode[i]; ++i) {
+        if (mode[i] == '+' && !plus) plus = 1;
+        else if (mode[i] == 'b' && !binary) binary = 1;
+        else { errno = EINVAL; return -1; }
+    }
+    if (mode[0] == 'r') {
+        *flags = plus ? _IO_RDWR : _IO_READ;
+        *open_flags = plus ? O_RDWR : O_RDONLY;
+    } else if (mode[0] == 'w' || mode[0] == 'a') {
+        *flags = plus ? _IO_RDWR : _IO_WRITE;
+        *open_flags = (plus ? O_RDWR : O_WRONLY) | O_CREAT;
+        *open_flags |= mode[0] == 'w' ? O_TRUNC : O_APPEND;
+        if (mode[0] == 'a') *flags |= _IO_APPEND;
+    } else { errno = EINVAL; return -1; }
+    return 0;
+}
+
+FILE *fopen(const char *path, const char *mode) {
+    int flags, open_flags, i;
+    long fd;
+    streams_init();
+    if (!path) { errno = EINVAL; return NULL; }
+    if (open_mode(mode, &flags, &open_flags) < 0) return NULL;
+    for (i = 0; i < FILE_MAX; ++i) if (g_streams[i].fd == -1) break;
+    if (i == FILE_MAX) { errno = EMFILE; return NULL; }
+    fd = _onyx_open(path, open_flags, 0644);
+    if (fd < 0) { errno = (int)-fd; return NULL; }
+    g_streams[i].fd = (int)fd;
+    g_streams[i].flags = flags;
+    g_streams[i].pos = 0;
+    g_streams[i].buf = g_stream_bufs[i];
+    g_streams[i].buf_size = FILE_BUF_SIZE;
+    g_streams[i].buf_start = g_streams[i].buf_end = 0;
+    return &g_streams[i];
+}
+
+int fclose(FILE *fp) {
+    int result;
+    long closed;
+    streams_init();
+    if (!fp || fp->fd < 0) { errno = EBADF; return EOF; }
+    result = file_flush_locked(fp);
+    closed = _onyx_close(fp->fd);
+    if (closed < 0) { errno = (int)-closed; result = EOF; }
+    if (fp->flags & _IO_OWN_BUF) free(fp->buf);
+    fp->fd = -1;
+    fp->flags = 0;
+    fp->buf = NULL;
+    fp->buf_size = fp->buf_start = fp->buf_end = 0;
+    return result;
+}
+
+FILE *freopen(const char *path, const char *mode, FILE *fp) {
+    int flags, open_flags, standard;
+    long fd;
+    streams_init();
+    if (!fp) { errno = EINVAL; return NULL; }
+    standard = fp->flags & _IO_IS_STDIO;
+    if (!path || open_mode(mode, &flags, &open_flags) < 0) {
+        fclose(fp); errno = EINVAL; return NULL;
+    }
+    fclose(fp);
+    fd = _onyx_open(path, open_flags, 0644);
+    if (fd < 0) { errno = (int)-fd; return NULL; }
+    fp->buf = malloc(FILE_BUF_SIZE);
+    if (!fp->buf) { _onyx_close((int)fd); errno = ENOMEM; return NULL; }
+    fp->fd = (int)fd;
+    fp->flags = flags | standard | _IO_OWN_BUF;
+    fp->pos = 0;
+    fp->buf_size = FILE_BUF_SIZE;
+    fp->buf_start = fp->buf_end = 0;
+    return fp;
+}
+
 size_t fread(void *buf, size_t sz, size_t count, FILE *fp) {
+    streams_init();
+    if (!sz || !count) return 0;
     if (!fp || !buf) { errno = EFAULT; return 0; }
+    if (count > (size_t)-1 / sz) { fp->flags |= _IO_ERR; errno = EINVAL; return 0; }
+    if (prepare_read(fp) < 0) return 0;
     size_t want = sz * count;
     size_t got = 0;
     char *out = (char *)buf;
     while (got < want) {
+        if (fp->flags & _IO_PUSHBACK) {
+            out[got++] = (char)fp->pushback;
+            fp->flags &= ~_IO_PUSHBACK;
+            continue;
+        }
         if (fp->buf_start >= fp->buf_end) {
             int n = file_fill_locked(fp);
             if (n <= 0) break;
@@ -933,7 +996,15 @@ size_t fread(void *buf, size_t sz, size_t count, FILE *fp) {
 }
 
 size_t fwrite(const void *buf, size_t sz, size_t count, FILE *fp) {
+    streams_init();
+    if (!sz || !count) return 0;
     if (!fp || !buf) { errno = EFAULT; return 0; }
+    if (prepare_write(fp) < 0) return 0;
+    if (count > (size_t)-1 / sz) {
+        fp->flags |= _IO_ERR;
+        errno = EINVAL;
+        return 0;
+    }
     size_t want = sz * count;
     const char *in = (const char *)buf;
     size_t put = 0;
@@ -946,12 +1017,14 @@ size_t fwrite(const void *buf, size_t sz, size_t count, FILE *fp) {
         size_t take = avail < need ? avail : need;
         memcpy(fp->buf + fp->buf_end, in + put, take);
         fp->buf_end += take;
+        fp->flags |= _IO_DIRTY;
         put += take;
+        if ((fp->flags & _IO_UNBUF) && file_flush_locked(fp) < 0) return (put - take) / sz;
         if (fp->flags & _IO_LINE_BUF) {
             /* Line-buffered: flush on newline. */
             for (size_t i = fp->buf_end - take; i < fp->buf_end; i++) {
                 if (fp->buf[i] == '\n') {
-                    file_flush_locked(fp);
+                    if (file_flush_locked(fp) < 0) return (put - take) / sz;
                     break;
                 }
             }
@@ -961,7 +1034,13 @@ size_t fwrite(const void *buf, size_t sz, size_t count, FILE *fp) {
 }
 
 int fgetc(FILE *fp) {
-    if (!fp) return -1;
+    streams_init();
+    if (!fp) { errno = EBADF; return EOF; }
+    if (prepare_read(fp) < 0) return EOF;
+    if (fp->flags & _IO_PUSHBACK) {
+        fp->flags &= ~_IO_PUSHBACK;
+        return fp->pushback;
+    }
     if (fp->buf_start >= fp->buf_end) {
         if (file_fill_locked(fp) <= 0) return -1;
     }
@@ -1060,25 +1139,46 @@ long getdelim(char **lineptr, size_t *n, int delim, FILE *fp) {
     return (long)len;
 }
 
+int ungetc(int ch, FILE *fp) {
+    streams_init();
+    if (!fp || ch == EOF) return EOF;
+    if (prepare_read(fp) < 0 || (fp->flags & _IO_PUSHBACK)) return EOF;
+    fp->pushback = (unsigned char)ch;
+    fp->flags = (fp->flags | _IO_PUSHBACK) & ~_IO_EOF;
+    return fp->pushback;
+}
+
 int fseek(FILE *fp, long offset, int whence) {
-    if (!fp) { errno = EBADF; return -1; }
-    file_flush_locked(fp);
-    long r = _onyx_lseek(fp->fd, offset, whence);
-    if (r < 0) { errno = (int)(-r); return -1; }
+    long r;
+    streams_init();
+    if (!fp || fp->fd < 0) { errno = EBADF; return EOF; }
+    if (file_flush_locked(fp) < 0) return EOF;
+    if (whence == SEEK_CUR && (fp->flags & _IO_UNREAD)) {
+        long unread = (long)(fp->buf_end - fp->buf_start);
+        if (fp->flags & _IO_PUSHBACK) unread++;
+        if (offset < LONG_MIN + unread) { errno = EINVAL; return EOF; }
+        offset -= unread;
+    }
+    r = _onyx_lseek(fp->fd, offset, whence);
+    if (r < 0) { errno = (int)-r; return EOF; }
     fp->pos = r;
     fp->buf_start = fp->buf_end = 0;
-    fp->flags &= ~_IO_EOF;
+    fp->flags &= ~(_IO_EOF | _IO_UNREAD | _IO_PUSHBACK);
     return 0;
 }
 
 long ftell(FILE *fp) {
-    if (!fp) return -1;
     long adjust = 0;
-    if (fp->flags & _IO_READ) {
+    streams_init();
+    if (!fp || fp->fd < 0) { errno = EBADF; return -1; }
+    long physical = _onyx_lseek(fp->fd, 0,
+        ((fp->flags & (_IO_APPEND | _IO_DIRTY)) == (_IO_APPEND | _IO_DIRTY)) ? SEEK_END : SEEK_CUR);
+    if (physical < 0) { errno = (int)-physical; return -1; }
+    fp->pos = physical;
+    if (fp->flags & _IO_UNREAD) {
         adjust = (long)(fp->buf_end - fp->buf_start);
-    } else if (fp->flags & _IO_WRITE) {
-        adjust = (long)fp->buf_end;
-    }
+        if (fp->flags & _IO_PUSHBACK) adjust++;
+    } else if (fp->flags & _IO_DIRTY) return fp->pos + (long)fp->buf_end;
     return fp->pos - adjust;
 }
 
@@ -1086,19 +1186,50 @@ int feof(FILE *fp) { return fp && (fp->flags & _IO_EOF) ? 1 : 0; }
 int ferror(FILE *fp) { return fp && (fp->flags & _IO_ERR) ? 1 : 0; }
 void clearerr(FILE *fp) { if (fp) fp->flags &= ~(_IO_EOF | _IO_ERR); }
 void rewind(FILE *fp) { fseek(fp, 0, SEEK_SET); if (fp) fp->flags &= ~_IO_ERR; }
-int fileno(FILE *fp) { return fp ? fp->fd : -1; }
+int fileno(FILE *fp) { streams_init(); return fp ? fp->fd : -1; }
 
 int fflush(FILE *fp) {
+    int result = 0;
+    streams_init();
     if (!fp) {
-        /* Flush all open streams. */
         for (int i = 0; i < FILE_MAX; i++) {
-            if (g_streams[i].fd != -1) file_flush_locked(&g_streams[i]);
+            if (g_streams[i].fd != -1 && file_flush_locked(&g_streams[i]) < 0) result = EOF;
         }
-        file_flush_locked(stdout);
-        file_flush_locked(stderr);
-        return 0;
+        if (file_flush_locked(stdout) < 0) result = EOF;
+        if (file_flush_locked(stderr) < 0) result = EOF;
+        return result;
     }
-    return file_flush_locked(fp);
+    if (fp->fd < 0) { errno = EBADF; return EOF; }
+    if (file_flush_locked(fp) < 0) return EOF;
+    return discard_input(fp);
+}
+
+int setvbuf(FILE *fp, char *buf, int mode, size_t size) {
+    char *replacement = buf;
+    int owned = 0;
+    streams_init();
+    if (!fp || fp->fd < 0 || (mode != _IOFBF && mode != _IOLBF && mode != _IONBF)) {
+        errno = EINVAL; return -1;
+    }
+    if (mode == _IONBF) { replacement = &fp->single_byte; size = 1; }
+    else {
+        if (!size) { if (buf) { errno = EINVAL; return -1; } size = FILE_BUF_SIZE; }
+        if (!replacement) {
+            replacement = malloc(size);
+            if (!replacement) { errno = ENOMEM; return -1; }
+            owned = _IO_OWN_BUF;
+        }
+    }
+    if (fflush(fp) < 0) { if (owned) free(replacement); return -1; }
+    if (fp->flags & _IO_OWN_BUF) free(fp->buf);
+    fp->buf = replacement;
+    fp->buf_size = size;
+    fp->buf_start = fp->buf_end = 0;
+    fp->flags &= ~(_IO_OWN_BUF | _IO_LINE_BUF | _IO_UNBUF);
+    fp->flags |= owned;
+    if (mode == _IOLBF) fp->flags |= _IO_LINE_BUF;
+    if (mode == _IONBF) fp->flags |= _IO_UNBUF;
+    return 0;
 }
 
 int remove(const char *path) {
@@ -1114,28 +1245,42 @@ int rename(const char *oldp, const char *newp) {
 }
 
 FILE *tmpfile(void) {
-    static int counter = 0;
-    char name[] = "/tmp/tmpXXXXXX";
-    int pid = (int)_onyx_getpid();
-    for (int i = 0; i < 6; i++) {
-        name[9 + i] = 'A' + ((pid ^ counter ^ (i * 13)) % 26);
+    char name[L_tmpnam];
+    int i, attempt;
+    long fd = -1;
+    streams_init();
+    for (i = 0; i < FILE_MAX; ++i) if (g_streams[i].fd == -1) break;
+    if (i == FILE_MAX) { errno = EMFILE; return NULL; }
+    for (attempt = 0; attempt < 64; ++attempt) {
+        tmpnam(name);
+        fd = _onyx_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) break;
+        if (fd != -EEXIST) { errno = (int)-fd; return NULL; }
     }
-    counter++;
-    return fopen(name, "w+");
+    if (fd < 0) { errno = EEXIST; return NULL; }
+    long removed = _onyx_unlink(name);
+    if (removed < 0) { _onyx_close((int)fd); errno = (int)-removed; return NULL; }
+    g_streams[i].fd = (int)fd;
+    g_streams[i].flags = _IO_RDWR;
+    g_streams[i].pos = 0;
+    g_streams[i].buf = g_stream_bufs[i];
+    g_streams[i].buf_size = FILE_BUF_SIZE;
+    g_streams[i].buf_start = g_streams[i].buf_end = 0;
+    return &g_streams[i];
 }
 
 char *tmpnam(char *buf) {
-    static char internal[32];
-    static int counter = 0;
+    static char internal[L_tmpnam];
+    static unsigned long counter;
+    const char *digits = "0123456789abcdef";
     char *out = buf ? buf : internal;
-    int pid = (int)_onyx_getpid();
-    int n = 0;
-    const char *prefix = "/tmp/tmp";
-    while (prefix[n]) { out[n] = prefix[n]; n++; }
-    for (int i = 0; i < 6; i++) {
-        out[n++] = 'A' + ((pid ^ counter ^ (i * 7)) % 26);
-    }
-    out[n] = 0;
-    counter++;
+    unsigned long pid = (unsigned long)_onyx_getpid();
+    unsigned long serial = counter++;
+    int i;
+    memcpy(out, "/tmp/o", 6);
+    for (i = 0; i < 8; ++i) out[6 + i] = digits[(pid >> (28 - 4 * i)) & 15];
+    out[14] = '-';
+    for (i = 0; i < 16; ++i) out[15 + i] = digits[(serial >> (60 - 4 * i)) & 15];
+    out[31] = 0;
     return out;
 }

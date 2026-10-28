@@ -68,13 +68,13 @@ struct type {
     uint64_t length;       /* 0 = unsized */
     bool is_incomplete;    /* e.g. int x[] in a struct field */
     /* For functions: */
-    func_param_t params[CC_MAX_FUNC_PARAMS];
+    func_param_t *params; /* lazy arena payload, capacity CC_MAX_FUNC_PARAMS */
     int nparams;
     bool is_varargs;
     type_t *ret;
     /* For structs/unions: */
     char tag[CC_MAX_IDENT];
-    struct_field_t fields[CC_MAX_STRUCT_FIELDS];
+    struct_field_t *fields; /* lazy arena payload, capacity CC_MAX_STRUCT_FIELDS */
     int nfields;
     uint64_t size;
     uint64_t align;
@@ -91,6 +91,9 @@ extern type_t ty_void, ty_bool, ty_char, ty_schar, ty_uchar,
 
 void types_init(cc_arena_t *arena);
 
+type_t *type_make_function(type_t *ret);
+void type_ensure_params(type_t *type);
+void type_ensure_fields(type_t *type);
 type_t *type_make_ptr(type_t *base);
 type_t *type_make_array(type_t *base, uint64_t length);
 type_t *type_make_const(type_t *base);

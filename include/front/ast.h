@@ -125,6 +125,8 @@ typedef enum {
 typedef struct decl decl_t;
 
 struct decl {
+    bool is_static;
+    bool is_extern;
     decl_kind_t kind;
     cc_pos_t pos;
     type_t *type;
@@ -133,7 +135,7 @@ struct decl {
     stmt_t *body;
     /* For variables: initializer (constant or zero). */
     expr_t *init;
-    /* Storage class flags come from type (is_static etc.). */
+    /* Storage class belongs to this declaration, never to a shared type. */
     decl_t *next;
 };
 

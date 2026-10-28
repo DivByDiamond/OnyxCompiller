@@ -42,6 +42,9 @@ extern "C" {
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
 
+typedef int sig_atomic_t;
+typedef void (*onyx_sighandler_t)(int);
+onyx_sighandler_t signal(int number, onyx_sighandler_t handler);
 typedef long sigset_t;
 
 /* SIG_DFL/IGN/ERR — typed as function pointers but stored as integers.

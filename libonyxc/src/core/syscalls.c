@@ -157,6 +157,10 @@ long _onyx_fsync(int fd) {
     return _onyx_syscall1(SYS_fsync, fd);
 }
 
+long _onyx_chown(const char *path, int uid, int gid) {
+    return _onyx_syscall3(SYS_chown, (long)path, uid, gid);
+}
+
 /* Memory */
 long _onyx_mmap(long addr, long len, long prot, long flags, long fd, long off) {
     return _onyx_syscall6(SYS_mmap, addr, len, prot, flags, fd, off);

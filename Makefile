@@ -1,4 +1,4 @@
-# OnyxCC — C/C++ → RISC-V64 → .onx compiler for OnyxOS
+# OnyxCC — C subset → RISC-V64 → .onx compiler for OnyxOS
 #
 # Build targets:
 #   make                 # build host onyxcc (Linux/x86_64)
@@ -9,6 +9,8 @@
 #   make libonyxc        # build libonyxc (host verification)
 #   make selfhost-test   # compile onyxcc sources with onyxcc (stage-1 verification)
 #   make selfhost        # full onyxcc self-build → onyxcc_self.onx (experimental)
+#   make check           # frontend, runtime and multi-file driver checks
+#   make check-native    # native ASan/UBSan allocator/libc harnesses
 #   make test            # compile and dump hello.onx header
 #   make clean
 #
@@ -24,12 +26,16 @@ ONYXCC_SRCS = \
 	src/core/util.c \
 	src/front/lexer.c \
 	src/back/pp.c \
+	src/back/pp_expr.c \
 	src/core/types.c \
 	src/front/ast.c \
 	src/front/parse.c \
+	src/front/constant/eval.c \
+	src/front/constant/operations.c \
 	src/front/decl.c \
 	src/back/gen.c \
 	src/arch/riscv64.c \
+	src/arch/context.c \
 	src/back/emit.c
 
 ONYXCC_OBJS = $(ONYXCC_SRCS:.c=.o)
@@ -49,7 +55,7 @@ RISCV_FLAGS  = --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d -mcmodel=m
 
 SELFHOST_FLAGS = -DCC_FREESTANDING -N -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
 
-.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld
+.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld check check-native
 
 all: $(ONYXCC) $(ONYXLD)
 
@@ -67,7 +73,7 @@ $(ONYXCC): $(ONYXCC_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Header deps (manual — keeps the build honest without -MMD complexity).
-CCHEADERS = $(wildcard include/*.h include/*/*.h)
+CCHEADERS = $(wildcard include/*.h include/*/*.h src/front/constant/*.h)
 
 %.o: %.c $(CCHEADERS)
 	$(CC) $(CFLAGS) -Iinclude -Iinclude/core -Iinclude/front -Iinclude/back -Iinclude/arch -Iinclude/sys -c -o $@ $<
@@ -125,12 +131,26 @@ selfhost-test: $(ONYXCC)
 
 # Full self-hosting build (stage-1): produces an .onx binary.
 selfhost: $(ONYXCC)
-	./$(ONYXCC) $(SELFHOST_FLAGS) -o onyxcc_self.onx -e _start $(ONYXCC_SRCS) src/core/shim.c
+	./$(ONYXCC) $(SELFHOST_FLAGS) --ring1 -o onyxcc_self.onx -e _start $(ONYXCC_SRCS) src/core/shim.c
 	@echo "--- onyxcc_self.onx ready ---"
 	@ls -la onyxcc_self.onx
 
 test-runner: $(ONYXCC)
 	@bash scripts/test_runner.sh
+
+# Host emulator builds against the checked-in syscall-number snapshot.
+tools/onx-run: tools/onx-run.c include/sys/syscall_numbers.h
+	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -o $@ $< -lm $(LDFLAGS)
+
+# Compile-only acceptance and executed behavior are distinct checks.
+check: all tools/onx-run
+	bash scripts/test_runner.sh
+	bash scripts/integration-runner.sh
+	python3 tests/driver/run.py
+
+# These harnesses use host ASan/UBSan and do not execute target code.
+check-native:
+	@set -e; for suite in $(wildcard tests/*-native/run.sh); do bash "$$suite"; done
 
 clean:
 	rm -f $(ONYXCC) $(ONYXCC_OBJS) src/core/*.o src/front/*.o src/back/*.o src/arch/*.o tests/*.onx onyxcc.riscv.elf onyxcc.onx onyxcc_self.onx

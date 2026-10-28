@@ -147,11 +147,7 @@ static inline long _onyx_syscall5(long n, long a, long b, long c, long d, long e
     return __ecall6(n, a, b, c, d, e);
 }
 static inline long _onyx_syscall6(long n, long a, long b, long c, long d, long e, long f) {
-    /* 6 args + nr = 7 values; a5 is reused by folding: not needed by any
-     * current syscall except mmap(fd, off are 0), so pass f via a5 through
-     * the __ecall6 builtin with the last argument merged — kept for ABI
-     * completeness via a custom expansion. */
-    return __ecall6(n, a, b, c, d, e); (void)f;
+    return __ecall7(n, a, b, c, d, e, f);
 }
 
 #else /* !__onyx__ — clang/gcc path with real inline asm */

@@ -56,6 +56,12 @@ for src in "$TEST_DIR"/*.c; do
         continue
     fi
 
+    if [ $rc -ne 0 ]; then
+        fail=$((fail + 1))
+        failures+=("$name: EXIT $rc")
+        continue
+    fi
+
     # Compare.
     if [ "$actual" == "$expected" ]; then
         pass=$((pass + 1))

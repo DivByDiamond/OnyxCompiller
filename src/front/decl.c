@@ -74,6 +74,7 @@ void parse_param_list(lexer_t *lx, type_t *ftype) {
         if (ptyp->kind == TY_FUNC)  ptyp = type_make_ptr(ptyp);
 
         if (ftype->nparams < CC_MAX_FUNC_PARAMS) {
+            type_ensure_params(ftype);
             func_param_t *pp = &ftype->params[ftype->nparams++];
             strncpy(pp->name, pname, CC_MAX_IDENT - 1);
             pp->name[CC_MAX_IDENT - 1] = 0;
@@ -88,13 +89,7 @@ void parse_param_list(lexer_t *lx, type_t *ftype) {
 type_t *parse_type_suffix(lexer_t *lx, type_t *base) {
     if (lx->cur.kind == T_LPAREN) {
         lex_next(lx);
-        type_t *ft = (type_t *)cc_arena_alloc(&g_type_arena, sizeof(type_t), 8);
-        memset(ft, 0, sizeof(*ft));
-        ft->kind = TY_FUNC;
-        ft->ret = base;
-        ft->size = 8;
-        ft->align = 8;
-        ft->is_complete = true;
+        type_t *ft = type_make_function(base);
         parse_param_list(lx, ft);
         parse_expect(T_RPAREN, "expected ')' after parameter list");
         /* (void) means no parameters. */
