@@ -22,7 +22,8 @@
 #define M_SQRT2    1.41421356237309504880
 #define M_SQRT1_2  0.70710678118654752440
 
-#define HUGE_VAL  1e308
+#define HUGE_VAL  (1.0 / 0.0)
+#define HUGE_VALF (1.0f / 0.0f)
 #define INFINITY  (1.0 / 0.0)
 #define NAN       (0.0 / 0.0)
 
@@ -44,6 +45,12 @@ double cos(double x);
 double tan(double x);
 double atan2(double y, double x);
 double round(double x);
+double frexp(double x, int *exponent);
+double ldexp(double x, int exponent);
+double modf(double x, double *integer);
+double asin(double x);
+double acos(double x);
+double log2(double x);
 
 float sqrtf(float x);
 float fabsf(float x);

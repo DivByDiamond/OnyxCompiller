@@ -48,6 +48,23 @@ static type_t *type_alloc(void) {
     return (type_t *)cc_arena_alloc(g_type_arena, sizeof(type_t), 8);
 }
 
+type_t *type_make_function(type_t *ret) {
+    type_t *t = type_alloc();
+    t->kind = TY_FUNC; t->ret = ret;
+    t->size = 8; t->align = 8; t->is_complete = true;
+    return t;
+}
+
+void type_ensure_params(type_t *t) {
+    if (!t->params) t->params = cc_arena_alloc(g_type_arena,
+        CC_MAX_FUNC_PARAMS * sizeof(*t->params), 8);
+}
+
+void type_ensure_fields(type_t *t) {
+    if (!t->fields) t->fields = cc_arena_alloc(g_type_arena,
+        CC_MAX_STRUCT_FIELDS * sizeof(*t->fields), 8);
+}
+
 type_t *type_make_ptr(type_t *base) {
     type_t *t = type_alloc();
     t->kind = TY_PTR;
@@ -76,8 +93,7 @@ type_t *type_make_array(type_t *base, uint64_t length) {
 }
 
 type_t *type_make_const(type_t *base) {
-    type_t *t = type_alloc();
-    *t = *base;
+    type_t *t = type_dup(base);
     t->is_const = true;
     return t;
 }
@@ -85,6 +101,14 @@ type_t *type_make_const(type_t *base) {
 type_t *type_dup(type_t *src) {
     type_t *t = type_alloc();
     *t = *src;
+    if (src->params) {
+        t->params = cc_arena_alloc(g_type_arena, CC_MAX_FUNC_PARAMS * sizeof(*t->params), 8);
+        memcpy(t->params, src->params, CC_MAX_FUNC_PARAMS * sizeof(*t->params));
+    }
+    if (src->fields) {
+        t->fields = cc_arena_alloc(g_type_arena, CC_MAX_STRUCT_FIELDS * sizeof(*t->fields), 8);
+        memcpy(t->fields, src->fields, CC_MAX_STRUCT_FIELDS * sizeof(*t->fields));
+    }
     return t;
 }
 
@@ -188,9 +212,8 @@ type_t *type_common(type_t *a, type_t *b) {
     if (a->kind == TY_FLOAT   || b->kind == TY_FLOAT)   return &ty_float;
 
     /* Both integer. Compute the common type by rank and signedness. */
-    /* MVP: if either is unsigned long, result is unsigned long.
-     *      if either is long and the other is unsigned int, result is unsigned long.
-     *      if sizes match, signed wins if both signed; else unsigned. */
+    /* LP64: a wider signed type represents all values of a narrower
+     * unsigned type; unsigned wins when widths are equal. */
     uint64_t sa = a->size, sb = b->size;
     if (sa > sb) return a;
     if (sb > sa) return b;

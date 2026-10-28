@@ -55,9 +55,14 @@ void cc_error_at(const char *file, int line, const char *fmt, ...) {
 }
 
 /* ---- Arena ------------------------------------------------------------ */
+typedef struct cc_arena_chunk {
+    struct cc_arena_chunk *next;
+    size_t capacity;
+    size_t used;
+} cc_arena_chunk_t;
+
 void cc_arena_init(cc_arena_t *a, size_t size) {
-    a->base = (char *)malloc(size);
-    if (!a->base) cc_fatal("arena: out of memory (%zu bytes)", size);
+    a->first = a->current = NULL;
     a->size = size;
     a->used = 0;
 }
@@ -65,23 +70,59 @@ void cc_arena_init(cc_arena_t *a, size_t size) {
 void *cc_arena_alloc(cc_arena_t *a, size_t n, size_t align) {
     if (align == 0) align = 1;
     size_t mask = align - 1;
-    size_t aligned = (a->used + mask) & ~mask;
-    if (aligned + n > a->size) {
-        cc_fatal("arena: exhausted (%zu + %zu > %zu)", aligned, n, a->size);
+    if (align & mask) cc_fatal("arena: alignment must be a power of two");
+    if (n > (size_t)-1 - mask) cc_fatal("arena: allocation size overflow");
+    if (!n) return NULL;
+    if (a->used > a->size || n > a->size - a->used) cc_fatal("arena: exhausted");
+    cc_arena_chunk_t *chunk = a->current;
+    cc_arena_chunk_t *last = NULL;
+    size_t padding = 0;
+    while (chunk) {
+        uintptr_t address = (uintptr_t)(chunk + 1) + chunk->used;
+        padding = (0 - address) & mask;
+        if (padding <= chunk->capacity - chunk->used &&
+            n <= chunk->capacity - chunk->used - padding) break;
+        last = chunk;
+        chunk = chunk->next;
     }
-    void *p = a->base + aligned;
-    a->used = aligned + n;
+    if (!chunk) {
+        size_t capacity = n + mask;
+        size_t remaining = a->size - a->used;
+        if (capacity < 65536) capacity = remaining < 65536 ? remaining : 65536;
+        if (capacity > (size_t)-1 - sizeof(cc_arena_chunk_t))
+            cc_fatal("arena: chunk size overflow");
+        chunk = (cc_arena_chunk_t *)malloc(sizeof(cc_arena_chunk_t) + capacity);
+        if (!chunk) cc_fatal("arena: out of memory (%zu bytes)", capacity);
+        chunk->next = NULL;
+        chunk->capacity = capacity;
+        chunk->used = 0;
+        if (last) last->next = chunk;
+        else a->first = chunk;
+        padding = (0 - (uintptr_t)(chunk + 1)) & mask;
+    }
+    if (padding > a->size - a->used - n) cc_fatal("arena: exhausted by alignment");
+    void *p = (char *)(chunk + 1) + chunk->used + padding;
+    chunk->used += padding + n;
+    a->current = chunk;
+    a->used += padding + n;
     memset(p, 0, n);
     return p;
 }
 
 void cc_arena_reset(cc_arena_t *a) {
+    for (cc_arena_chunk_t *c = a->first; c; c = c->next) c->used = 0;
+    a->current = a->first;
     a->used = 0;
 }
 
 void cc_arena_free(cc_arena_t *a) {
-    free(a->base);
-    a->base = NULL;
+    cc_arena_chunk_t *chunk = a->first;
+    while (chunk) {
+        cc_arena_chunk_t *next = chunk->next;
+        free(chunk);
+        chunk = next;
+    }
+    a->first = a->current = NULL;
     a->size = a->used = 0;
 }
 
@@ -103,6 +144,7 @@ static void buf_grow(cc_buf_t *b, size_t need) {
 }
 
 void cc_buf_push(cc_buf_t *b, const void *p, size_t n) {
+    if (!n) return;
     buf_grow(b, b->size + n);
     memcpy(b->data + b->size, p, n);
     b->size += n;

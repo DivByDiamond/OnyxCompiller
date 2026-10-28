@@ -3,12 +3,12 @@ set -euo pipefail
 
 TIMEOUT_SEC=10
 
-# OnyxCC test runner - compiles all tests/*.c and reports PASS/FAIL.
+# OnyxCC test runner - checks all tests/*.c without linking and reports PASS/FAIL.
 
 ONYXCC="./onyxcc"
 TEST_DIR="tests"
 TMPDIR="/tmp/onyxcc_test"
-INCLUDES="-N -I libonyxc/include/core -I libonyxc/include/io -I libonyxc/include/ctype -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys"
+INCLUDES="-fsyntax-only -N -I libonyxc/include/core -I libonyxc/include/io -I libonyxc/include/ctype -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys"
 VERBOSE=false
 
 while getopts "v" opt; do
@@ -56,14 +56,14 @@ for src in "${test_files[@]}"; do
     fi
 
     if [ "$rc" -eq 0 ]; then
-        if [ -f "$out" ]; then
+        if [ ! -f "$out" ]; then
             pass=$((pass + 1))
             if [ "$VERBOSE" = true ]; then
                 echo "  PASS  $name"
             fi
         else
             fail=$((fail + 1))
-            msg="no output file produced"
+            msg="syntax-only check unexpectedly produced an output file"
             failures="${failures}  FAIL  $name - $msg\n"
             if [ "$VERBOSE" = true ]; then
                 echo "  FAIL  $name - $msg"

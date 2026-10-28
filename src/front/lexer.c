@@ -377,10 +377,13 @@ static void lex_number(lexer_t *lx, token_t *t) {
             }
         }
         t->ival = v;
-        if (is_unsigned && is_longlong) t->kind = T_ULONG;
-        else if (is_longlong) t->kind = T_LONG;
-        else if (is_unsigned) t->kind = T_UINT;
-        else t->kind = T_INT;
+        if (is_unsigned) {
+            t->kind = (is_long || is_longlong || v > 4294967295ULL) ? T_ULONG : T_UINT;
+        } else if (is_long || is_longlong || v > 2147483647ULL) {
+            if ((is_hex || is_octal) && !is_long && !is_longlong && v <= 4294967295ULL)
+                t->kind = T_UINT;
+            else t->kind = v > 9223372036854775807ULL ? T_ULONG : T_LONG;
+        } else t->kind = T_INT;
     }
 }
 

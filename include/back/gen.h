@@ -11,9 +11,11 @@
 
 /* Codegen state for current function. */
 typedef struct {
+    int return_slot;
     int frame_size;        /* total stack frame, aligned 16 */
     int cur_offset;        /* next free slot for locals */
     int max_call_args;     /* max args passed to any call (for stack save) */
+    int named_gp, named_fp, named_stack;
     int nparams;           /* number of named parameters */
     bool is_variadic;      /* current function has variadic args */
     int va_save_off;       /* fp offset to GP (a0-a7) register save area (variadic only) */
@@ -58,5 +60,8 @@ type_t *parse_type_spec(lexer_t *lx);
 
 /* Helpers shared with parser. */
 bool is_type_start(lexer_t *lx);
+
+int gen_lookup_global(const char *name);
+void mangle_static_name(const char *name, char *out, size_t out_sz);
 
 #endif /* CC_GEN_H */

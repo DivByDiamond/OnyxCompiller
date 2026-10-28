@@ -87,34 +87,34 @@ void rv_addi(int rd, int rs1, int imm) {
     emit32(insn);
 }
 
-/* addi-imm: emit lui+addi if needed for constants outside [-2048, 2047]. */
+/* Materialize every RV64 bit pattern using signed 12-bit chunks. Building
+ * the high part recursively avoids LUI's sign extension and never computes
+ * INT64_MAX + 1 in signed C arithmetic. Only rd is clobbered. */
+static void load_immediate(int rd, int64_t value) {
+    if (value >= -2048 && value <= 2047) {
+        rv_addi(rd, RV_ZERO, (int)value);
+        return;
+    }
+    int64_t low = ((value & 4095) ^ 2048) - 2048;
+    int64_t high = value >> 12;
+    if (low < 0) high++;
+    load_immediate(rd, high);
+    rv_slli(rd, rd, 12);
+    if (low) rv_addi(rd, rd, (int)low);
+}
+
 void rv_addi_imm(int rd, int rs1, int64_t imm) {
     if (imm >= -2048 && imm <= 2047) {
         rv_addi(rd, rs1, (int)imm);
         return;
     }
-    /* Materialize imm into t6, then add.
-     * lo MUST be sign-extended from 12 bits: the addi immediate field is
-     * SIGNED, so `lui 0xD; addi 0xEAD` computed 0xD000-339 = 0xCEAD instead
-     * of 0xDEAD. Split as lo in [-2048, 2047], hi = (imm - lo) & ~0xFFF. */
-    int tmp = RV_T6;
-    int64_t v = imm;
-    int64_t lo = ((v & 0xFFF) ^ 0x800) - 0x800;   /* sign-extend bit 11 */
-    int64_t hi = (v - lo) & ~0xFFFULL;
-    rv_lui(tmp, (uint32_t)((hi >> 12) & 0xFFFFF) & 0xFFFFF);
-    rv_addi(tmp, tmp, (int)lo);
-    if (v >= 0x80000000LL && v <= 0xFFFFFFFFLL) {
-        /* 32-bit unsigned constant (e.g. the Linux-compatible ioctl
-         * numbers like TIOCGPTN 0x80045430): `lui` sign-extends bit 31, so
-         * the value above is 0xFFFFFFFF80045430 instead of 0x80045430.
-         * Clear the upper 32 bits again — a plain lui+addi is only exact
-         * for [-2^31, 2^31-1]. Found live: open("/dev/ptmx") succeeded but
-         * ioctl(TIOCGPTN) reached the kernel as 0xFFFFFFFF80045430 and came
-         * back ENOSYS, so pty_open() failed for every app. */
-        rv_slli(tmp, tmp, 32);
-        rv_srli(tmp, tmp, 32);
+    if (rs1 == RV_ZERO) {
+        load_immediate(rd, imm);
+        return;
     }
-    rv_add(rd, rs1, tmp);
+    int temporary = rs1 == RV_T6 ? RV_T5 : RV_T6;
+    load_immediate(temporary, imm);
+    rv_add(rd, rs1, temporary);
 }
 
 void rv_lui(int rd, int imm20) {
@@ -231,17 +231,9 @@ void rv_srai(int rd, int rs1, int shamt) {
  * way rv_addi_imm already does for oversized ADDI immediates, and the
  * load/store then uses offset 0 from that register. */
 static int materialize_addr(int rs1, int64_t imm) {
-    /* Same decomposition as rv_addi_imm: lo must be sign-extended from
-     * the low 12 bits before subtracting it out of hi, or a negative imm
-     * near a 4096 boundary computes the wrong hi (see that function's
-     * comment for the worked example). */
-    int tmp = RV_T6;
-    int64_t lo = ((imm & 0xFFF) ^ 0x800) - 0x800;
-    int64_t hi = (imm - lo) & ~0xFFFULL;
-    rv_lui(tmp, (uint32_t)((hi >> 12) & 0xFFFFF) & 0xFFFFF);
-    rv_addi(tmp, tmp, (int)lo);
-    rv_add(tmp, rs1, tmp);
-    return tmp;
+    int temporary = rs1 == RV_T6 ? RV_T5 : RV_T6;
+    rv_addi_imm(temporary, rs1, imm);
+    return temporary;
 }
 
 /* Loads: opcode 0x03 */
@@ -378,6 +370,10 @@ void rv_emit_fpu_r(uint32_t funct7, int funct3, int rd, int rs1, int rs2) {
 
 /* Load/store float/double. */
 void rv_flw(int rd, int rs1, int imm) {
+    if (imm < -2048 || imm > 2047) {
+        rs1 = materialize_addr(rs1, imm);
+        imm = 0;
+    }
     uint32_t insn = (uint32_t)(imm & 0xFFF) << 20
                   | (uint32_t)(rs1 & 0x1F) << 15
                   | 0x2 << 12
@@ -387,6 +383,10 @@ void rv_flw(int rd, int rs1, int imm) {
 }
 
 void rv_fld(int rd, int rs1, int imm) {
+    if (imm < -2048 || imm > 2047) {
+        rs1 = materialize_addr(rs1, imm);
+        imm = 0;
+    }
     uint32_t insn = (uint32_t)(imm & 0xFFF) << 20
                   | (uint32_t)(rs1 & 0x1F) << 15
                   | 0x3 << 12
@@ -396,6 +396,10 @@ void rv_fld(int rd, int rs1, int imm) {
 }
 
 void rv_fsw(int rs2, int rs1, int imm) {
+    if (imm < -2048 || imm > 2047) {
+        rs1 = materialize_addr(rs1, imm);
+        imm = 0;
+    }
     uint32_t imm_lo = (uint32_t)(imm & 0x1F);
     uint32_t imm_hi = (uint32_t)((imm >> 5) & 0x7F);
     uint32_t insn = imm_hi << 25
@@ -408,6 +412,10 @@ void rv_fsw(int rs2, int rs1, int imm) {
 }
 
 void rv_fsd(int rs2, int rs1, int imm) {
+    if (imm < -2048 || imm > 2047) {
+        rs1 = materialize_addr(rs1, imm);
+        imm = 0;
+    }
     uint32_t imm_lo = (uint32_t)(imm & 0x1F);
     uint32_t imm_hi = (uint32_t)((imm >> 5) & 0x7F);
     uint32_t insn = imm_hi << 25

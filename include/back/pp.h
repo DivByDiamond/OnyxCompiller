@@ -25,4 +25,6 @@ char *pp_preprocess_file(const char *path,
                          const char *const *define_macros, int n_define_macros,
                          size_t *out_len);
 
+long pp_eval_integer(const char *expression);
+
 #endif /* CC_PP_H */

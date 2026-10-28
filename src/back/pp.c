@@ -1,14 +1,10 @@
 /*
  * pp.c — minimal C preprocessor.
  *
- * Scope: enough for `#include <stdio.h>` from libonyxc + simple
- * `#define NAME value` macros + #ifndef guards. This is not a fully
- * conforming C pp; corner cases (recursive macros, varargs, stringify)
- * are deferred.
- *
- * Implementation: line-oriented, not token-based. Conditional sections
- * are skipped by tracking #if/#else/#endif nesting. Macros are expanded
- * with a single-pass substitution to keep code small.
+ * Supports object/function macros, includes and conditional expressions.
+ * This remains a bounded, line-oriented preprocessor, rather than a fully
+ * conforming token-based implementation. Function invocations gather
+ * physical lines before repeated expansion; directives stay separate.
  */
 #include "core/compat.h"
 #define _POSIX_C_SOURCE 200809L   /* for strdup */
@@ -18,7 +14,7 @@
 #include "back/pp.h"
 
 #define MAX_INCLUDES 16
-#define MAX_MACROS 512
+#define MAX_MACROS 4096
 #define MAX_IF_DEPTH 64
 
 typedef struct {
@@ -34,6 +30,7 @@ typedef struct {
 /* End of the source buffer being macro-expanded (read_macro_args needs
  * it to bound its scan). */
 static const char *g_src_end;
+static int g_expansion_depth;
 
 static macro_t g_macros[MAX_MACROS];
 static int g_n_macros;
@@ -52,6 +49,7 @@ static size_t g_out_len, g_out_cap;
 
 static int g_if_stack[MAX_IF_DEPTH];   /* 1 = currently true, 0 = skipping */
 static int g_if_depth;
+static int g_if_parent[MAX_IF_DEPTH];
 static int g_if_taken[MAX_IF_DEPTH];   /* 1 if any branch was taken */
 
 static const char *g_cur_file;        /* for #line */
@@ -203,13 +201,30 @@ static int read_macro_args(const char **p, const char *end,
             s++;
             continue;
         }
-        if (!isspace((unsigned char)c)) any = true;
-        if (!(c == ' ' || c == '\t') || alen > 0) {
+        if (isspace((unsigned char)c)) c = ' ';
+        else any = true;
+        if (c != ' ' || (alen > 0 && nargs < maxargs && args[nargs][alen - 1] != ' ')) {
             if (nargs < maxargs && alen < 511) args[nargs][alen++] = c;
         }
         s++;
     }
     return -1;   /* unterminated */
+}
+
+static size_t expand_macros(char *line, size_t len, size_t cap);
+
+/* Prescan only ordinary parameter occurrences. # and ## use the spelling
+ * supplied by the caller, not its expanded tokens. Buffers belong to this
+ * invocation so recursive argument expansion cannot overwrite outer args. */
+static const char *prescan_argument(char args[][512], int index,
+                                   char expanded[][512], bool ready[]) {
+    if (!ready[index]) {
+        size_t length = strlen(args[index]);
+        memcpy(expanded[index], args[index], length + 1);
+        expand_macros(expanded[index], length, 512);
+        ready[index] = true;
+    }
+    return expanded[index];
 }
 
 /* Substitute parameters in a macro body with the given arguments,
@@ -225,6 +240,10 @@ static void subst_macro_body(const macro_t *m,
     size_t blen = strlen(b);
     size_t i = 0;
     (void)blen;
+    char expanded[CC_MAX_MACRO_ARGS + 8][512];
+    bool ready[CC_MAX_MACRO_ARGS + 8] = {0};
+    char va_expanded[2048] = {0};
+    bool va_ready = false;
 
     /* Pre-join variadic tail into a single pseudo-arg slot. */
     char va_all[2048] = {0};
@@ -315,26 +334,49 @@ static void subst_macro_body(const macro_t *m,
                 }
                 continue;
             }
+            while (*outlen && isspace((unsigned char)out[*outlen - 1])) (*outlen)--;
             i += 2;
             /* skip whitespace after ## */
             while (i < strlen(b) && (b[i] == ' ' || b[i] == '\t')) i++;
             continue;
         }
-        /* Identifier: parameter or __VA_ARGS__? */
+        /* Identifier: parameters adjacent to ## retain raw spelling. */
         if (is_ident_start(c)) {
+            size_t before = i;
+            while (before && isspace((unsigned char)b[before - 1])) before--;
+            bool pasted = before >= 2 && b[before - 1] == '#' && b[before - 2] == '#';
             size_t nl = 0;
             char name[CC_MAX_IDENT];
             while (i < strlen(b) && is_ident_char(b[i]) && nl < CC_MAX_IDENT - 1) {
                 name[nl++] = b[i++];
             }
             name[nl] = 0;
+            size_t after = i;
+            while (isspace((unsigned char)b[after])) after++;
+            if (b[after] == '#' && b[after + 1] == '#') pasted = true;
             const char *val = NULL;
             if (has_va && strcmp(name, "__VA_ARGS__") == 0) {
-                val = va_all;
+                if (!pasted && !va_ready) {
+                    size_t length = 0;
+                    for (int a = m->nparams; a < nargs; a++) {
+                        const char *argument = prescan_argument(args, a, expanded, ready);
+                        if (a > m->nparams && length + 2 < sizeof(va_expanded)) {
+                            va_expanded[length++] = ',';
+                            va_expanded[length++] = ' ';
+                        }
+                        size_t count = strlen(argument);
+                        if (length + count >= sizeof(va_expanded)) count = sizeof(va_expanded) - 1 - length;
+                        memcpy(va_expanded + length, argument, count);
+                        length += count;
+                    }
+                    va_expanded[length] = 0;
+                    va_ready = true;
+                }
+                val = pasted ? va_all : va_expanded;
             } else {
                 for (int pi = 0; pi < m->nparams; pi++) {
                     if (strcmp(m->params[pi], name) == 0) {
-                        val = (pi < nargs) ? args[pi] : "";
+                        val = pi >= nargs ? "" : pasted ? args[pi] : prescan_argument(args, pi, expanded, ready);
                         break;
                     }
                 }
@@ -391,10 +433,9 @@ static bool expand_one(const char **p, char *out, size_t *outlen, size_t outcap)
         *p = s + nl;
         return true;
     }
-    /* Function-like: require an immediate '(' (no space per C99 — but we
-     * allow whitespace, pragmatically). */
+    /* Invocation whitespace includes physical newlines. */
     const char *q = s + nl;
-    while (q < g_src_end && (*q == ' ' || *q == '\t')) q++;
+    while (q < g_src_end && isspace((unsigned char)*q)) q++;
     if (q >= g_src_end || *q != '(') {
         /* Not an invocation — copy the identifier verbatim. */
         size_t need = nl;
@@ -405,7 +446,7 @@ static bool expand_one(const char **p, char *out, size_t *outlen, size_t outcap)
         return true;
     }
     /* Read the arguments. */
-    static char args[CC_MAX_MACRO_ARGS + 8][512];
+    char args[CC_MAX_MACRO_ARGS + 8][512];
     int nargs = read_macro_args(&q, g_src_end, args, CC_MAX_MACRO_ARGS + 8);
     if (nargs < 0) {
         /* Unterminated — copy identifier, let the parser complain. */
@@ -416,12 +457,22 @@ static bool expand_one(const char **p, char *out, size_t *outlen, size_t outcap)
         *p = s + nl;
         return true;
     }
+    if (nargs > CC_MAX_MACRO_ARGS + 8) {
+        cc_error("pp: too many macro arguments");
+        nargs = CC_MAX_MACRO_ARGS + 8;
+    }
     /* Variadic macros accept any nargs >= nparams; fixed macros: pad. */
     if (!m->is_varargs && nargs < m->nparams) {
         for (int i = nargs; i < m->nparams; i++) args[i][0] = 0;
         nargs = m->nparams;
     }
     subst_macro_body(m, args, nargs, out, outcap, outlen);
+    /* Argument whitespace may be duplicated or discarded by substitution;
+     * retain consumed source newlines exactly once after the replacement. */
+    for (const char *r = s; r < q; r++) {
+        if (*r == '\n' && *outlen + 1 < outcap) out[(*outlen)++] = '\n';
+    }
+    out[*outlen] = 0;
     *p = q;
     return true;
 }
@@ -490,8 +541,14 @@ static size_t expand_macros_one_pass(const char *in, size_t inlen, char *out, si
  *   #define B 1
  * Returns the new length. */
 static size_t expand_macros(char *line, size_t len, size_t cap) {
-    static char tmp1[8192];
-    static char tmp2[8192];
+    if (g_expansion_depth >= 32) {
+        cc_error("pp: macro argument nesting too deep");
+        return len;
+    }
+    g_expansion_depth++;
+    char tmp1[8192];
+    char tmp2[8192];
+    const char *saved_end = g_src_end;
     char *cur = tmp1;
     char *next = tmp2;
     size_t curlen = len;
@@ -510,6 +567,8 @@ static size_t expand_macros(char *line, size_t len, size_t cap) {
     if (curlen >= cap) curlen = cap - 1;
     memcpy(line, cur, curlen);
     line[curlen] = 0;
+    g_src_end = saved_end;
+    g_expansion_depth--;
     return curlen;
 }
 
@@ -714,7 +773,8 @@ static void handle_directive(const char *line, size_t llen, const char *filename
         name[nl] = 0;
         bool taken = (find_macro(name) != NULL);
         if (g_if_depth >= MAX_IF_DEPTH) cc_fatal("#if nesting too deep");
-        g_if_stack[g_if_depth] = skipping() ? 0 : (taken ? 1 : 0);
+        g_if_parent[g_if_depth] = skipping();
+        g_if_stack[g_if_depth] = g_if_parent[g_if_depth] ? 0 : (taken ? 1 : 0);
         g_if_taken[g_if_depth] = taken;
         g_if_depth++;
         return;
@@ -729,7 +789,8 @@ static void handle_directive(const char *line, size_t llen, const char *filename
         name[nl] = 0;
         bool taken = (find_macro(name) == NULL);
         if (g_if_depth >= MAX_IF_DEPTH) cc_fatal("#if nesting too deep");
-        g_if_stack[g_if_depth] = skipping() ? 0 : (taken ? 1 : 0);
+        g_if_parent[g_if_depth] = skipping();
+        g_if_stack[g_if_depth] = g_if_parent[g_if_depth] ? 0 : (taken ? 1 : 0);
         g_if_taken[g_if_depth] = taken;
         g_if_depth++;
         return;
@@ -740,12 +801,11 @@ static void handle_directive(const char *line, size_t llen, const char *filename
         if (restlen >= sizeof(exprbuf)) restlen = sizeof(exprbuf) - 1;
         memcpy(exprbuf, rest, restlen);
         exprbuf[restlen] = 0;
-        size_t el = expand_macros(exprbuf, restlen, sizeof(exprbuf));
-        long v = eval_const_expr(exprbuf);
-        (void)el;
+        long v = skipping() ? 0 : eval_const_expr(exprbuf);
         bool taken = (v != 0);
         if (g_if_depth >= MAX_IF_DEPTH) cc_fatal("#if nesting too deep");
-        g_if_stack[g_if_depth] = skipping() ? 0 : (taken ? 1 : 0);
+        g_if_parent[g_if_depth] = skipping();
+        g_if_stack[g_if_depth] = g_if_parent[g_if_depth] ? 0 : (taken ? 1 : 0);
         g_if_taken[g_if_depth] = taken;
         g_if_depth++;
         return;
@@ -753,7 +813,7 @@ static void handle_directive(const char *line, size_t llen, const char *filename
 
     if (strcmp(d, "elif") == 0) {
         if (g_if_depth <= 0) return;
-        if (g_if_taken[g_if_depth - 1]) {
+        if (g_if_parent[g_if_depth - 1] || g_if_taken[g_if_depth - 1]) {
             /* Already taken a branch. */
             g_if_stack[g_if_depth - 1] = 0;
         } else {
@@ -761,7 +821,6 @@ static void handle_directive(const char *line, size_t llen, const char *filename
             if (restlen >= sizeof(exprbuf)) restlen = sizeof(exprbuf) - 1;
             memcpy(exprbuf, rest, restlen);
             exprbuf[restlen] = 0;
-            expand_macros(exprbuf, restlen, sizeof(exprbuf));
             long v = eval_const_expr(exprbuf);
             if (v != 0) {
                 g_if_stack[g_if_depth - 1] = 1;
@@ -775,7 +834,7 @@ static void handle_directive(const char *line, size_t llen, const char *filename
 
     if (strcmp(d, "else") == 0) {
         if (g_if_depth <= 0) return;
-        if (g_if_taken[g_if_depth - 1]) {
+        if (g_if_parent[g_if_depth - 1] || g_if_taken[g_if_depth - 1]) {
             g_if_stack[g_if_depth - 1] = 0;
         } else {
             g_if_stack[g_if_depth - 1] = 1;
@@ -816,185 +875,59 @@ static void handle_directive(const char *line, size_t llen, const char *filename
     /* Unknown directive: silently ignore (could warn). */
 }
 
-/* Recursive-descent mini-evaluator for #if expressions — file scope. */
-static const char *g_ifs;
-
-static long if_or(void);
-static long if_and(void);
-static long if_eq(void);
-static long if_rel(void);
-static long if_add(void);
-static long if_mul(void);
-static long if_unary(void);
-static long if_primary(void);
-
-#define IF_SKIP_WS() while (*g_ifs == ' ' || *g_ifs == '\t' || *g_ifs == '\n') g_ifs++
-
-static long if_primary(void) {
-    IF_SKIP_WS();
-    if (*g_ifs == '(') {
-        g_ifs++;
-        long v = if_or();
-        IF_SKIP_WS();
-        if (*g_ifs == ')') g_ifs++;
-        return v;
-    }
-    if (isdigit((unsigned char)*g_ifs)) {
-        long v = 0;
-        if (g_ifs[0] == '0' && (g_ifs[1] == 'x' || g_ifs[1] == 'X')) {
-            g_ifs += 2;
-            while (isxdigit((unsigned char)*g_ifs)) {
-                int d = isdigit(*g_ifs) ? *g_ifs - '0' : (tolower(*g_ifs) - 'a' + 10);
-                v = v * 16 + d;
-                g_ifs++;
-            }
-        } else {
-            while (isdigit((unsigned char)*g_ifs)) {
-                v = v * 10 + (*g_ifs - '0');
-                g_ifs++;
-            }
-        }
-        while (*g_ifs == 'u' || *g_ifs == 'U' || *g_ifs == 'l' || *g_ifs == 'L') g_ifs++;
-        return v;
-    }
-    if (is_ident_start(*g_ifs)) {
-        while (is_ident_char(*g_ifs)) g_ifs++;
-        return 0;
-    }
-    return 0;
-}
-
-static long if_unary(void) {
-    IF_SKIP_WS();
-    if (*g_ifs == '!') { g_ifs++; return !if_unary(); }
-    if (*g_ifs == '-') { g_ifs++; return -if_unary(); }
-    if (*g_ifs == '+') { g_ifs++; return if_unary(); }
-    if (*g_ifs == '~') { g_ifs++; return ~if_unary(); }
-    return if_primary();
-}
-
-static long if_mul(void) {
-    long a = if_unary();
-    IF_SKIP_WS();
-    while (*g_ifs == '*' || *g_ifs == '/' || *g_ifs == '%') {
-        char op = *g_ifs++;
-        long b = if_unary();
-        if (op == '*') a = a * b;
-        else if (op == '/') a = b ? a / b : 0;
-        else a = b ? a % b : 0;
-        IF_SKIP_WS();
-    }
-    return a;
-}
-
-static long if_add(void) {
-    long a = if_mul();
-    IF_SKIP_WS();
-    while (*g_ifs == '+' || *g_ifs == '-') {
-        char op = *g_ifs++;
-        long b = if_mul();
-        a = op == '+' ? a + b : a - b;
-        IF_SKIP_WS();
-    }
-    return a;
-}
-
-static long if_rel(void) {
-    long a = if_add();
-    IF_SKIP_WS();
-    while ((*g_ifs == '<' && g_ifs[1] != '<') || (*g_ifs == '>' && g_ifs[1] != '>') ||
-           (*g_ifs == '<' && g_ifs[1] == '=') || (*g_ifs == '>' && g_ifs[1] == '=')) {
-        char op = *g_ifs;
-        int eq = (g_ifs[1] == '=');
-        g_ifs += 1 + eq;
-        long b = if_add();
-        if (op == '<') a = eq ? (a <= b) : (a < b);
-        else           a = eq ? (a >= b) : (a > b);
-        IF_SKIP_WS();
-    }
-    return a;
-}
-
-static long if_eq(void) {
-    long a = if_rel();
-    IF_SKIP_WS();
-    while ((g_ifs[0] == '=' && g_ifs[1] == '=') || (g_ifs[0] == '!' && g_ifs[1] == '=')) {
-        int ne = (g_ifs[0] == '!');
-        g_ifs += 2;
-        long b = if_rel();
-        a = ne ? (a != b) : (a == b);
-        IF_SKIP_WS();
-    }
-    return a;
-}
-
-static long if_and(void) {
-    long a = if_eq();
-    IF_SKIP_WS();
-    while (*g_ifs == '&' && g_ifs[1] != '&') {
-        g_ifs++;
-        long b = if_eq();
-        a = a & b;
-        IF_SKIP_WS();
-    }
-    return a;
-}
-
-static long if_or(void) {
-    long a = if_and();
-    IF_SKIP_WS();
-    while (*g_ifs == '|' && g_ifs[1] != '|') {
-        g_ifs++;
-        long b = if_and();
-        a = a | b;
-        IF_SKIP_WS();
-    }
-    return a;
-}
-
-#undef IF_SKIP_WS
-
 static long eval_const_expr(const char *expr) {
-    /* First, replace defined(NAME) with 1 or 0. */
-    static char buf[2048];
-    size_t bl = 0;
+    /* Resolve defined operands before expansion, preserving identifier/token
+     * boundaries and character literals. Then expand the remaining macros. */
+    char buf[8192];
+    size_t length = 0;
     const char *p = expr;
-    while (*p && bl < sizeof(buf) - 1) {
-        if (strncmp(p, "defined", 7) == 0) {
-            p += 7;
+    while (*p && length + 1 < sizeof(buf)) {
+        if (*p == '\'') {
+            buf[length++] = *p++;
+            while (*p && length + 2 < sizeof(buf)) {
+                char c = *p++;
+                buf[length++] = c;
+                if (c == '\\' && *p) buf[length++] = *p++;
+                else if (c == '\'') break;
+            }
+        } else if (is_ident_start((unsigned char)*p)) {
+            const char *start = p;
+            while (is_ident_char((unsigned char)*p)) p++;
+            size_t size = p - start;
+            if (size != 7 || strncmp(start, "defined", 7) != 0) {
+                if (length + size >= sizeof(buf)) cc_fatal("#if expression too long");
+                memcpy(buf + length, start, size);
+                length += size;
+                continue;
+            }
             while (*p == ' ' || *p == '\t') p++;
-            int paren = 0;
-            if (*p == '(') { paren = 1; p++; }
+            bool paren = *p == '(';
+            if (paren) p++;
+            while (*p == ' ' || *p == '\t') p++;
             char name[CC_MAX_IDENT];
-            size_t nl = 0;
-            while (is_ident_char(*p) && nl < CC_MAX_IDENT - 1) name[nl++] = *p++;
-            name[nl] = 0;
-            if (paren && *p == ')') p++;
-            long v = find_macro(name) ? 1 : 0;
-            bl += snprintf(buf + bl, sizeof(buf) - bl, "%ld", v);
-        } else {
-            buf[bl++] = *p++;
-        }
+            size_t n = 0;
+            if (!is_ident_start((unsigned char)*p)) {
+                cc_error("defined requires an identifier");
+                return 0;
+            }
+            while (is_ident_char((unsigned char)*p)) {
+                if (n + 1 < sizeof(name)) name[n++] = *p;
+                p++;
+            }
+            name[n] = 0;
+            while (*p == ' ' || *p == '\t') p++;
+            if (paren && *p != ')') {
+                cc_error("missing ')' after defined");
+                return 0;
+            }
+            if (paren) p++;
+            buf[length++] = find_macro(name) ? '1' : '0';
+        } else buf[length++] = *p++;
     }
-    buf[bl] = 0;
-
-    g_ifs = buf;
-    while (*g_ifs == ' ' || *g_ifs == '\t' || *g_ifs == '\n') g_ifs++;
-    long a = if_or();
-    while (*g_ifs == ' ' || *g_ifs == '\t' || *g_ifs == '\n') g_ifs++;
-    while (*g_ifs == '&' && g_ifs[1] == '&') {
-        g_ifs += 2;
-        long b = if_or();
-        a = a && b;
-        while (*g_ifs == ' ' || *g_ifs == '\t' || *g_ifs == '\n') g_ifs++;
-    }
-    while (*g_ifs == '|' && g_ifs[1] == '|') {
-        g_ifs += 2;
-        long b = if_or();
-        a = a || b;
-        while (*g_ifs == ' ' || *g_ifs == '\t' || *g_ifs == '\n') g_ifs++;
-    }
-    return a;
+    if (*p) cc_fatal("#if expression too long");
+    buf[length] = 0;
+    expand_macros(buf, length, sizeof(buf));
+    return pp_eval_integer(buf);
 }
 
 /* Strip comments from a logical line, replacing them with a single space.
@@ -1062,6 +995,50 @@ static size_t strip_comments(char *line, size_t len, bool *in_comment) {
     return w;
 }
 
+/* 1: trailing macro name might be followed by '('; 2: open invocation.
+ * Scan tokens rather than counting raw parentheses (strings can contain ')'). */
+static int pending_invocation(const char *text, size_t length) {
+    const char *p = text, *end = text + length;
+    static char args[CC_MAX_MACRO_ARGS + 8][512];
+    while (p < end) {
+        if (*p == '"' || *p == '\'') {
+            char quote = *p++;
+            while (p < end && *p != quote) {
+                if (*p == '\\' && p + 1 < end) p++;
+                p++;
+            }
+            if (p < end) p++;
+        } else if (is_ident_start((unsigned char)*p)) {
+            char name[CC_MAX_IDENT];
+            size_t n = 0;
+            while (p < end && is_ident_char((unsigned char)*p)) {
+                if (n + 1 < sizeof(name)) name[n++] = *p;
+                p++;
+            }
+            name[n] = 0;
+            macro_t *macro = find_macro(name);
+            /* Object aliases can become function-like on the next pass. */
+            for (int depth = 0; macro && !macro->is_function_like && depth < 16; depth++) {
+                const char *body = macro->body;
+                while (isspace((unsigned char)*body)) body++;
+                size_t count = 0;
+                while (is_ident_char((unsigned char)*body) && count + 1 < sizeof(name))
+                    name[count++] = *body++;
+                name[count] = 0;
+                while (isspace((unsigned char)*body)) body++;
+                macro = count && !*body ? find_macro(name) : NULL;
+            }
+            if (!macro || !macro->is_function_like) continue;
+            const char *next = p;
+            while (next < end && isspace((unsigned char)*next)) next++;
+            if (next == end) return 1;
+            if (*next == '(' && read_macro_args(&next, end, args, CC_MAX_MACRO_ARGS + 8) < 0)
+                return 2;
+        } else p++;
+    }
+    return 0;
+}
+
 static void process_source(const char *src, size_t len, const char *filename) {
     const char *p = src;
     const char *end = src + len;
@@ -1109,6 +1086,64 @@ static void process_source(const char *src, size_t len, const char *filename) {
         memcpy(cbuf, linebuf, qlen);
         clen = strip_comments(cbuf, qlen, &in_comment);
         cbuf[clen] = 0;
+
+        /* Gather the token stream of invocations spanning physical lines.
+         * Directives remain separate and are never consumed as arguments. */
+        const char *first = cbuf;
+        while (isspace((unsigned char)*first)) first++;
+        if (*first != '#' && !skipping()) {
+            int pending;
+            while ((pending = pending_invocation(cbuf, clen)) && lend < end) {
+                const char *next = lend + 1;
+                const char *next_end = memchr(next, '\n', end - next);
+                if (!next_end) next_end = end;
+                char continuation[8192];
+                size_t count = next_end - next;
+                if (count >= sizeof(continuation)) {
+                    cc_error_at(filename, lineno, "macro invocation line too long");
+                    break;
+                }
+                memcpy(continuation, next, count);
+                while (count && continuation[count - 1] == '\r') count--;
+                int extra_lines = 0;
+                while (count && continuation[count - 1] == '\\' && next_end < end) {
+                    count--;
+                    const char *more = next_end + 1;
+                    next_end = memchr(more, '\n', end - more);
+                    if (!next_end) next_end = end;
+                    size_t more_count = next_end - more;
+                    while (more_count && more[more_count - 1] == '\r') more_count--;
+                    if (count + more_count >= sizeof(continuation)) {
+                        cc_error_at(filename, lineno, "macro invocation line too long");
+                        more_count = sizeof(continuation) - count - 1;
+                    }
+                    memcpy(continuation + count, more, more_count);
+                    count += more_count;
+                    extra_lines++;
+                }
+                bool next_comment = in_comment;
+                count = strip_comments(continuation, count, &next_comment);
+                continuation[count] = 0;
+                const char *token = continuation;
+                while (isspace((unsigned char)*token)) token++;
+                if (*token == '#') {
+                    if (pending == 2)
+                        cc_error_at(filename, lineno, "directive inside unfinished macro invocation");
+                    break;
+                }
+                if (clen + count + 1 >= sizeof(cbuf)) {
+                    cc_error_at(filename, lineno, "macro invocation too long");
+                    break;
+                }
+                cbuf[clen++] = '\n';
+                memcpy(cbuf + clen, continuation, count);
+                clen += count;
+                cbuf[clen] = 0;
+                in_comment = next_comment;
+                joined_lines += 1 + extra_lines;
+                lend = next_end;
+            }
+        }
 
         /* Directive? */
         const char *q = cbuf;
@@ -1179,7 +1214,7 @@ static void process_source(const char *src, size_t len, const char *filename) {
                         if (wl + 1 >= sizeof(sub)) { overflow = true; break; }
                         sub[wl++] = *r++;
                     }
-                    if (!overflow) {
+                    if (!overflow && wl < sizeof(linebuf)) {
                         sub[wl] = 0;
                         memcpy(linebuf, sub, wl + 1);
                         nl = wl;
@@ -1188,6 +1223,9 @@ static void process_source(const char *src, size_t len, const char *filename) {
                      * will surface a sane diagnostic instead of crashing. */
                 }
                 out_emit(linebuf, nl);
+                int newlines = 0;
+                for (size_t i = 0; i < nl; i++) if (linebuf[i] == '\n') newlines++;
+                while (newlines++ < joined_lines) out_emit("\n", 1);
             } else {
                 out_emit(cbuf, clen);
             }

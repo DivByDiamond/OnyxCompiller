@@ -148,6 +148,14 @@ long _onyx_snapshot_list(void *buf, size_t len);
 long _onyx_write_fd(int fd, const void *buf, size_t n);
 
 /* ── stdio (FILE*-based buffered I/O, v0.5). */
+#define EOF (-1)
+#define BUFSIZ 4096
+#define _IOFBF 0
+#define _IOLBF 1
+#define _IONBF 2
+#define FOPEN_MAX 16
+#define L_tmpnam 32
+
 int   printf(const char *fmt, ...);
 int   fprintf(FILE *fp, const char *fmt, ...);
 int   vfprintf(FILE *fp, const char *fmt, va_list ap);
@@ -168,6 +176,9 @@ int   fflush(FILE *fp);
 
 FILE *fopen(const char *path, const char *mode);
 int   fclose(FILE *fp);
+FILE *freopen(const char *path, const char *mode, FILE *fp);
+int   setvbuf(FILE *fp, char *buf, int mode, size_t size);
+int   ungetc(int ch, FILE *fp);
 size_t fread(void *buf, size_t sz, size_t count, FILE *fp);
 size_t fwrite(const void *buf, size_t sz, size_t count, FILE *fp);
 char *fgets(char *buf, int size, FILE *fp);

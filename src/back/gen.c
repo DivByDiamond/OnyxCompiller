@@ -27,7 +27,9 @@
 #include "front/ast.h"
 #include "back/gen.h"
 #include "arch/riscv64.h"
+#include "arch/context.h"
 #include "front/parser_priv.h"
+#include "front/parse.h"
 #include "front/decl.h"
 
 gen_func_t g_func;
@@ -39,7 +41,7 @@ typedef struct {
     uint32_t patch_addi;
 } rodata_fixup_t;
 
-static rodata_fixup_t g_rodata_fixups[4096];
+static rodata_fixup_t g_rodata_fixups[CC_MAX_REFS];
 static int g_n_rodata_fixups = 0;
 
 /* ---- Value descriptor ------------------------------------------------ */
@@ -70,7 +72,6 @@ static void parse_stmt(lexer_t *lx);
 static void parse_stmt_body(lexer_t *lx);
 static val_t parse_primary(lexer_t *lx);
 static val_t parse_unary(lexer_t *lx);
-static long long gen_const_expr(lexer_t *lx);
 static void patch_jal(uint32_t off, int32_t delta);
 static void patch_sd_imm(uint32_t off, int32_t imm);
 static void parse_asm(lexer_t *lx);
@@ -138,7 +139,18 @@ static void gen_emit_global_init_scalar(lexer_t *lx, type_t *type);
 static uint64_t gen_count_brace_elements(lexer_t *lx, type_t *type);
 
 /* Forward declaration for static name mangling. */
-static void mangle_static_name(const char *name, char *out, size_t out_sz);
+void mangle_static_name(const char *name, char *out, size_t out_sz);
+
+int gen_lookup_global(const char *name) {
+    if (g_opts.n_input_files > 1) {
+        char mangled[CC_MAX_IDENT + 16];
+        mangle_static_name(name, mangled, sizeof(mangled));
+        int index = symtab_lookup_global(mangled);
+        if (index >= 0) return index;
+    }
+    return symtab_lookup_global(name);
+}
+
 
 /* Read one or more adjacent string literals and return a malloc'd buffer
  * containing their concatenation.  The lexer is advanced past the last
@@ -382,8 +394,8 @@ static void materialize_float_const(val_t *v, int freg) {
     uint32_t lui_off = (uint32_t)g_text.size;
     rv_lui(RV_T0, 0);
     uint32_t addi_off = (uint32_t)g_text.size;
-    rv_addi_imm(RV_T0, RV_T0, (int64_t)rodata_off);
-    if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
+    rv_addi(RV_T0, RV_T0, 0);
+    if (g_n_rodata_fixups >= CC_MAX_REFS) cc_fatal("too many rodata refs");
     g_rodata_fixups[g_n_rodata_fixups].rodata_off = rodata_off;
     g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
     g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
@@ -547,7 +559,7 @@ bool is_type_start(lexer_t *lx) {
             return true;
         case T_IDENT: {
             /* Could be a typedef name. */
-            int idx = symtab_lookup_global(lx->cur.text);
+            int idx = gen_lookup_global(lx->cur.text);
             if (idx >= 0 && g_globals[idx].kind == SYM_TYPEDEF) return true;
             return false;
         }
@@ -647,6 +659,7 @@ type_t *parse_type_spec(lexer_t *lx) {
                                 offset = 0;
                             }
                             if (nfields < CC_MAX_STRUCT_FIELDS) {
+                                type_ensure_fields(t);
                                 struct_field_t *f = &t->fields[nfields++];
                                 strncpy(f->name, fname, CC_MAX_IDENT - 1);
                                 f->type = ftyp;
@@ -706,14 +719,7 @@ type_t *parse_type_spec(lexer_t *lx) {
                         ename[CC_MAX_IDENT - 1] = 0;
                         lex_next(lx);
                         if (accept(T_ASSIGN)) {
-                            /* Parse constant expr — MVP: just integer literal. */
-                            if (lx->cur.kind == T_INT || lx->cur.kind == T_LONG) {
-                                val = (int)lx->cur.ival;
-                                lex_next(lx);
-                            } else if (lx->cur.kind == T_MINUS) {
-                                lex_next(lx);
-                                if (lx->cur.kind == T_INT) { val = -(int)lx->cur.ival; lex_next(lx); }
-                            }
+                            val = (int)parse_const_expr();
                         }
                         symtab_install_global(ename, SYM_ENUM_CONST, &ty_int);
                         g_globals[g_n_globals - 1].enum_val = val;
@@ -726,7 +732,7 @@ type_t *parse_type_spec(lexer_t *lx) {
                 break;
             }
             case T_IDENT: {
-                int idx = symtab_lookup_global(lx->cur.text);
+                int idx = gen_lookup_global(lx->cur.text);
                 if (idx >= 0 && g_globals[idx].kind == SYM_TYPEDEF) {
                     base = g_globals[idx].type;
                     lex_next(lx);
@@ -765,7 +771,7 @@ finish_type_spec:
         if (is_short)        base = is_unsigned ? &ty_ushort : &ty_short;
         else if (is_longlong) base = is_unsigned ? &ty_ullong : &ty_llong;
         else if (is_long)    base = is_unsigned ? &ty_ulong  : &ty_long;
-        else                 base = &ty_int;
+        else                 base = is_unsigned ? &ty_uint : &ty_int;
     }
     if (is_const)    base->is_const = true;
     if (is_volatile) base->is_volatile = true;
@@ -812,7 +818,7 @@ typedef struct {
     int64_t extra_off;     /* extra offset to add to symbol address */
 } global_addr_fixup_t;
 
-static global_addr_fixup_t g_fixups[4096];
+static global_addr_fixup_t g_fixups[CC_MAX_REFS];
 static int g_n_fixups = 0;
 
 /* rodata_fixup_t and g_rodata_fixups moved to top of file. */
@@ -823,7 +829,7 @@ typedef struct {
     uint32_t data_off;     /* offset within g_data to patch (8 bytes, LE) */
 } data_rodata_fixup_t;
 
-static data_rodata_fixup_t g_data_rodata_fixups[4096];
+static data_rodata_fixup_t g_data_rodata_fixups[CC_MAX_REFS];
 static int g_n_data_rodata_fixups = 0;
 
 /* Fixups for global data pointing at another SYMBOL (address-of-global
@@ -833,7 +839,7 @@ typedef struct {
     uint32_t data_off;     /* 8-byte slot in g_data to patch */
 } data_sym_fixup_t;
 
-static data_sym_fixup_t g_data_sym_fixups[4096];
+static data_sym_fixup_t g_data_sym_fixups[CC_MAX_REFS];
 static int g_n_data_sym_fixups = 0;
 
 /* Emit a global address load into `reg`. Records a fixup for later.
@@ -844,13 +850,60 @@ static void emit_load_global_addr(int reg, int sym_idx, int64_t add_off) {
     uint32_t lui_off = (uint32_t)g_text.size;
     rv_lui(reg, 0);
     uint32_t addi_off = (uint32_t)g_text.size;
-    rv_addi_imm(reg, reg, (int64_t)add_off);
-    if (g_n_fixups >= 4096) cc_fatal("too many global refs");
+    rv_addi(reg, reg, 0);
+    if (g_n_fixups >= CC_MAX_REFS) cc_fatal("too many global refs");
     g_fixups[g_n_fixups].sym_idx = sym_idx;
     g_fixups[g_n_fixups].patch_lui = lui_off;
     g_fixups[g_n_fixups].patch_addi = addi_off;
     g_fixups[g_n_fixups].extra_off = add_off;
     g_n_fixups++;
+}
+
+/* Apply scalar conversions at calls, assignments and returns. The source
+ * type must be retained until its bits have been loaded. */
+static void convert_scalar(val_t *value, type_t *target) {
+    bool source_float = is_float_type(value->type);
+    bool target_float = is_float_type(target);
+    if (target->kind == TY_VOID) { value->type = target; return; }
+    if (target->kind == TY_STRUCT || target->kind == TY_UNION) return;
+    bool source_double = value->type->kind == TY_DOUBLE || value->type->kind == TY_LDOUBLE;
+    bool target_double = target->kind == TY_DOUBLE || target->kind == TY_LDOUBLE;
+    if (target_float) {
+        if (source_float) {
+            load_float_value(value, RV_FT0);
+            if (source_double && !target_double) rv_fcvt_s_d(RV_FT0, RV_FT0);
+            else if (!source_double && target_double) rv_fcvt_d_s(RV_FT0, RV_FT0);
+        } else {
+            bool uns = type_is_unsigned(value->type);
+            load_value(value, RV_T0);
+            rv_emit_fpu_r(target_double ? 0x69 : 0x68, 0, RV_FT0, RV_T0, uns ? 3 : 2);
+        }
+        value->reg = RV_FT0;
+    } else {
+        if (source_float) {
+            load_float_value(value, RV_FT0);
+            if (target->kind == TY_BOOL) {
+                rv_addi(RV_T0, RV_ZERO, 0);
+                if (source_double) rv_emit_fpu_r(0x79, 0, RV_FT1, RV_T0, 0);
+                else rv_emit_fpu_r(0x78, 0, RV_FT1, RV_T0, 0);
+                if (source_double) rv_feq_d(RV_T0, RV_FT0, RV_FT1);
+                else rv_feq_s(RV_T0, RV_FT0, RV_FT1);
+                rv_seqz(RV_T0, RV_T0);
+            } else rv_emit_fpu_r(source_double ? 0x61 : 0x60, 1, RV_T0, RV_FT0,
+                                 type_is_unsigned(target) ? 3 : 2);
+        } else load_value(value, RV_T0);
+        if (target->kind == TY_BOOL) rv_snez(RV_T0, RV_T0);
+        else if (type_is_integer(target) && type_sizeof(target) < 8) {
+            int shift = 64 - (int)type_sizeof(target) * 8;
+            rv_slli(RV_T0, RV_T0, shift);
+            if (type_is_signed(target)) rv_srai(RV_T0, RV_T0, shift);
+            else rv_srli(RV_T0, RV_T0, shift);
+        }
+        value->reg = RV_T0;
+    }
+    value->kind = VAL_REG;
+    value->type = target;
+    value->offset = 0;
 }
 
 /* ---- Function call codegen ------------------------------------------ */
@@ -863,14 +916,24 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
      * callee-saved registers do not exist in this codegen. */
     parse_expect(T_LPAREN, "expected '('");
 
+    bool aggregate_return = fn_type && (fn_type->ret->kind == TY_STRUCT || fn_type->ret->kind == TY_UNION);
+    int result_slot = 0;
+    if (aggregate_return) {
+        g_func.cur_offset = (g_func.cur_offset + (int)type_sizeof(fn_type->ret) + 15) & ~15;
+        result_slot = -g_func.cur_offset;
+        if (g_func.cur_offset > g_func.frame_size) g_func.frame_size = g_func.cur_offset;
+    }
     int nargs = 0;
-    int64_t arg_slots[8];
-    bool arg_fp[8];
+    int64_t arg_slots[CC_MAX_FUNC_PARAMS];
+    bool arg_fp[CC_MAX_FUNC_PARAMS];
 
     if (lx->cur.kind != T_RPAREN) {
         for (;;) {
             val_t a = parse_assign(lx);
-            if (nargs < 8) {
+            if (fn_type && nargs < fn_type->nparams)
+                convert_scalar(&a, fn_type->params[nargs].type);
+            else if (a.type->kind == TY_FLOAT) convert_scalar(&a, &ty_double);
+            if (nargs < CC_MAX_FUNC_PARAMS) {
                 bool fp = is_float_type(a.type);
                 /* Allocate an 8-byte (16-aligned) spill slot. */
                 g_func.cur_offset += 8;
@@ -888,34 +951,16 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
                      * one contiguous frame block, then pass a POINTER to it
                      * in the argument register (single-register struct ABI). */
                     uint64_t ssz = type_sizeof(a.type);
-                    if (ssz > 32) ssz = 32;
                     g_func.cur_offset += ssz;
                     g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
                     int64_t sslot = -(int64_t)g_func.cur_offset;
                     if (g_func.cur_offset > g_func.frame_size) {
                         g_func.frame_size = g_func.cur_offset;
                     }
-                    /* Struct PARAMS hold a POINTER (by-value ABI) — local
-                     * struct objects are the real thing; deref only params.
-                     * NOTE: must classify BEFORE materialize() (which turns
-                     * VAL_SYM into VAL_LVAL and hides the slot index). */
-                    bool a_is_local = false;
-                    if (a.kind == VAL_SYM && a.sym_idx >= g_n_globals) {
-                        int64_t aoff = g_locals[a.sym_idx - g_n_globals].offset;
-                        for (int vi = 0; vi < g_func.n_struct_locals; vi++) {
-                            if (g_func.struct_local_slots[vi] == aoff) {
-                                a_is_local = true;
-                                break;
-                            }
-                        }
-                    }
-                    materialize(&a, RV_T0);       /* &source (or &param slot) */
-                    if (!a_is_local) {
-                        rv_ld(RV_T0, RV_T0, 0);   /* param slot → object ptr */
-                    }
-                    for (uint64_t k = 0; k < ssz; k += 8) {
-                        rv_ld(RV_T1, RV_T0, (int)k);
-                        rv_sd(RV_T1, RV_FP, (int)sslot + (int)k);
+                    materialize(&a, RV_T0);
+                    for (uint64_t k = 0; k < ssz; k++) {
+                        rv_lbu(RV_T1, RV_T0, (int)k);
+                        rv_sb(RV_T1, RV_FP, (int)sslot + (int)k);
                     }
                     /* Load the block's ADDRESS as the argument value. */
                     rv_addi_imm(RV_T0, RV_FP, (int)sslot);
@@ -927,7 +972,7 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
                 arg_slots[nargs] = slot;
                 arg_fp[nargs] = fp;
                 nargs++;
-            }
+            } else cc_error("too many function arguments");
             if (!accept(T_COMMA)) break;
         }
     }
@@ -936,29 +981,30 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
     /* Track max args for stack reservation. */
     if (nargs > g_func.max_call_args) g_func.max_call_args = nargs;
 
-    /* Load arguments into a0-a7 / fa0-fa7 from their spill slots.
-     * Per the RISC-V calling convention the two register files are indexed
-     * INDEPENDENTLY: the Nth integer arg goes to aN, the Mth FP arg goes to
-     * faM — not to fa<total-arg-index>. (fmt, 2.25) used to put 2.25 in fa1.) */
-    int gp_idx = 0, fp_idx = 0;
-    for (int i = 0; i < nargs && i < 8; i++) {
-        if (i >= 8 && gp_idx >= 8 && fp_idx >= 8) break;
-        if (arg_fp[i]) {
-            if (fp_idx < 8) {
-                rv_fld(RV_FA0 + fp_idx, RV_FP, (int)arg_slots[i]);
-                fp_idx++;
-            }
-        } else {
-            if (gp_idx < 8) {
-                rv_ld(RV_A0 + gp_idx, RV_FP, (int)arg_slots[i]);
-                gp_idx++;
-            }
-        }
+    /* Assign independent register banks; overflow arguments share a
+     * caller-owned, 16-byte-aligned stack area below the active frame. */
+    int locations[CC_MAX_FUNC_PARAMS];
+    int gp_idx = aggregate_return ? 1 : 0, fp_idx = 0, stack_count = 0;
+    for (int i = 0; i < nargs; i++) {
+        if (arg_fp[i] && fp_idx < 8) locations[i] = 32 + fp_idx++;
+        else if (!arg_fp[i] && gp_idx < 8) locations[i] = gp_idx++;
+        else locations[i] = -(++stack_count);
+    }
+    int stack_bytes = (stack_count * 8 + 15) & ~15;
+    if (stack_bytes) rv_addi_imm(RV_SP, RV_SP, -stack_bytes);
+    if (aggregate_return) rv_addi_imm(RV_A0, RV_FP, result_slot);
+    for (int i = 0; i < nargs; i++) {
+        if (locations[i] < 0) {
+            rv_ld(RV_T0, RV_FP, (int)arg_slots[i]);
+            rv_sd(RV_T0, RV_SP, (-locations[i] - 1) * 8);
+        } else if (locations[i] >= 32)
+            rv_fld(RV_FA0 + locations[i] - 32, RV_FP, (int)arg_slots[i]);
+        else rv_ld(RV_A0 + locations[i], RV_FP, (int)arg_slots[i]);
     }
 
     /* Indirect call vs direct call. */
     if (callee && (callee->kind == VAL_REG || callee->kind == VAL_LVAL ||
-                   callee->kind == VAL_SYM || callee->kind == VAL_SPILL)) {
+                   callee->kind == VAL_SYM || callee->kind == VAL_SPILL || callee->kind == VAL_SPILL_I)) {
         /* Indirect call through function pointer. */
         val_t cv = *callee;
         load_value(&cv, RV_T5);
@@ -971,12 +1017,17 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
         cc_error("indirect calls not yet supported");
     }
 
-    /* Return value in a0. */
+    if (stack_bytes) rv_addi_imm(RV_SP, RV_SP, stack_bytes);
+    /* Return value in a0/fa0. */
     val_t result;
     memset(&result, 0, sizeof(result));
     result.kind = VAL_REG;
     result.reg = RV_A0;
     result.type = fn_type ? fn_type->ret : &ty_int;
+    if (aggregate_return) {
+        rv_addi_imm(RV_T0, RV_FP, result_slot);
+        result.reg = RV_T0;
+    }
     return result;
 }
 
@@ -987,7 +1038,6 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
  * (2*i*(2*i+1) degenerated to x*x). */
 static void spill_ireg(val_t *v) {
     if (v->kind != VAL_REG) return;
-    if (v->reg != RV_T0 && v->reg != RV_T1 && v->reg != RV_T2) return;
     if (is_float_type(v->type)) return;
     g_func.cur_offset += 8;
     g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
@@ -1018,7 +1068,6 @@ static void spill_ireg(val_t *v) {
  * RHS is parsed. Returns a VAL_SPILL-ish value loaded back on use. */
 static void spill_freg(val_t *v) {
     if (v->kind != VAL_REG) return;
-    if (v->reg != RV_FT0 && v->reg != RV_FT1) return;
     if (!is_float_type(v->type)) return;
     g_func.cur_offset += 8;
     g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
@@ -1067,6 +1116,7 @@ static val_t parse_postfix(lexer_t *lx, val_t v) {
                      * index expression (fp->buf[fp->buf_end + i] used to
                      * deref through the INDEX value). */
                     spill_lval(&v);
+                    spill_ireg(&v);
                     lex_next(lx);
                     val_t idx = parse_expr(lx);
                     parse_expect(T_RBRACKET, "expected ']'");
@@ -1079,7 +1129,8 @@ static val_t parse_postfix(lexer_t *lx, val_t v) {
                      * - pointer value → the pointer's VALUE (single deref of
                      *   its slot; load_value would deref the POINT EE too,
                      *   breaking `in[put + i]`). */
-                    materialize(&v, RV_T0);
+                    if (v.kind == VAL_SPILL_I) load_value(&v, RV_T0);
+                    else materialize(&v, RV_T0);
                     if (v.kind == VAL_LVAL && v.type->kind != TY_ARRAY &&
                         v.type->kind != TY_FUNC) {
                         rv_ld(RV_T0, RV_T0, (int)v.offset);
@@ -1165,7 +1216,9 @@ static val_t parse_postfix(lexer_t *lx, val_t v) {
                     }
                     /* The callee address must survive argument evaluation. */
                     spill_lval(&v);
-                    return gen_call(lx, -1, ft, &v);
+                    spill_ireg(&v);
+                    v = gen_call(lx, -1, ft, &v);
+                    continue;
                 }
                 if (lx->cur.kind == T_INC || lx->cur.kind == T_DEC) {
                     int op = lx->cur.kind;
@@ -1243,17 +1296,17 @@ static val_t parse_primary(lexer_t *lx) {
             uint32_t lui_off = (uint32_t)g_text.size;
             rv_lui(RV_T0, 0);
             uint32_t addi_off = (uint32_t)g_text.size;
-            rv_addi_imm(RV_T0, RV_T0, off);
+            rv_addi(RV_T0, RV_T0, 0);
             /* Record rodata fixup. */
-            if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
+            if (g_n_rodata_fixups >= CC_MAX_REFS) cc_fatal("too many rodata refs");
             g_rodata_fixups[g_n_rodata_fixups].rodata_off = off;
             g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
             g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
             g_n_rodata_fixups++;
             v.kind = VAL_REG;
             v.reg = RV_T0;
-            v.type = type_make_ptr(&ty_char);
-            return v;
+            v.type = type_make_array(&ty_char, slen + 1);
+            return parse_postfix(lx, v);
         }
         case T_CHAR_LIT: {
             v.kind = VAL_IMM;
@@ -1322,123 +1375,7 @@ static val_t parse_primary(lexer_t *lx) {
                     return v;
                 }
                 val_t e = parse_unary(lx);
-                /* Cast handling: int↔float, float↔double, int truncation */
-                bool src_float = is_float_type(e.type);
-                bool dst_float = is_float_type(t);
-                if (src_float && dst_float) {
-                    /* float↔double: fcvt.s.d or fcvt.d.s */
-                    bool src_d = (e.type->kind == TY_DOUBLE || e.type->kind == TY_LDOUBLE);
-                    bool dst_d = (t->kind == TY_DOUBLE || t->kind == TY_LDOUBLE);
-                    if (src_d && !dst_d) {
-                        /* double → float */
-                        load_float_value(&e, RV_FT0);
-                        rv_fcvt_s_d(RV_FT1, RV_FT0);
-                        e.reg = RV_FT1;
-                    } else if (!src_d && dst_d) {
-                        /* float → double */
-                        load_float_value(&e, RV_FT0);
-                        rv_fcvt_d_s(RV_FT1, RV_FT0);
-                        e.reg = RV_FT1;
-                    } else {
-                        /* same size float: just load */
-                        load_float_value(&e, RV_FT0);
-                        e.reg = RV_FT0;
-                    }
-                    e.type = t;
-                    e.kind = VAL_REG;
-                    return e;
-                }
-                if (src_float && !dst_float) {
-                    /* float/double → int: fcvt.l.s or fcvt.l.d */
-                    bool src_d = (e.type->kind == TY_DOUBLE || e.type->kind == TY_LDOUBLE);
-                    load_float_value(&e, RV_FT0);
-                    if (src_d) {
-                        rv_fcvt_l_d(RV_T0, RV_FT0);
-                    } else {
-                        rv_fcvt_l_s(RV_T0, RV_FT0);
-                    }
-                    /* Truncate to target integer size. */
-                    if (type_is_integer(t) && type_sizeof(t) < 8) {
-                        uint64_t sz = type_sizeof(t);
-                        /* Sign/zero extend handled at store; mask for safety. */
-                        if (sz == 4) {
-                            rv_slli(RV_T0, RV_T0, 32);
-                            rv_srli(RV_T0, RV_T0, 32);
-                        } else if (sz == 2) {
-                            rv_slli(RV_T0, RV_T0, 48);
-                            rv_srli(RV_T0, RV_T0, 48);
-                        } else if (sz == 1) {
-                            rv_slli(RV_T0, RV_T0, 56);
-                            rv_srli(RV_T0, RV_T0, 56);
-                        }
-                    }
-                    e.type = t;
-                    e.kind = VAL_REG;
-                    e.reg = RV_T0;
-                    return e;
-                }
-                if (!src_float && dst_float) {
-                    /* int → float/double: fcvt.s.l or fcvt.d.l */
-                    load_value(&e, RV_T0);
-                    bool dst_d = (t->kind == TY_DOUBLE || t->kind == TY_LDOUBLE);
-                    if (dst_d) {
-                        rv_fcvt_d_l(RV_FT0, RV_T0);
-                    } else {
-                        rv_fcvt_s_l(RV_FT0, RV_T0);
-                    }
-                    e.type = t;
-                    e.kind = VAL_REG;
-                    e.reg = RV_FT0;
-                    return e;
-                }
-                /* int → int cast: truncate / extend.
-                 * For constant source values, preserve as immediate so that
-                 * global initializers like (void*)0 remain constant. */
-                if (e.kind == VAL_IMM && !src_float && !dst_float) {
-                    uint64_t mask = ~0ULL;
-                    uint64_t sz = type_sizeof(t);
-                    if (type_is_integer(t) && sz < 8) {
-                        mask = (1ULL << (sz * 8)) - 1;
-                        if (type_is_signed(t) && (e.imm & (1ULL << (sz * 8 - 1)))) {
-                            e.imm |= ~mask;
-                        } else {
-                            e.imm &= mask;
-                        }
-                    }
-                    e.type = t;
-                    return e;
-                }
-                load_value(&e, RV_T0);
-                if (type_is_integer(t) && type_sizeof(t) < 8) {
-                    uint64_t sz = type_sizeof(t);
-                    if (sz == 4) {
-                        if (type_is_signed(t)) {
-                            rv_slli(RV_T0, RV_T0, 32);
-                            rv_srai(RV_T0, RV_T0, 32);
-                        } else {
-                            rv_slli(RV_T0, RV_T0, 32);
-                            rv_srli(RV_T0, RV_T0, 32);
-                        }
-                    } else if (sz == 2) {
-                        if (type_is_signed(t)) {
-                            rv_slli(RV_T0, RV_T0, 48);
-                            rv_srai(RV_T0, RV_T0, 48);
-                        } else {
-                            rv_slli(RV_T0, RV_T0, 48);
-                            rv_srli(RV_T0, RV_T0, 48);
-                        }
-                    } else if (sz == 1) {
-                        if (type_is_signed(t)) {
-                            rv_slli(RV_T0, RV_T0, 56);
-                            rv_srai(RV_T0, RV_T0, 56);
-                        } else {
-                            rv_slli(RV_T0, RV_T0, 56);
-                            rv_srli(RV_T0, RV_T0, 56);
-                        }
-                    }
-                }
-                e.type = t;
-                e.reg = RV_T0;
+                convert_scalar(&e, t);
                 return e;
             }
             val_t e = parse_expr(lx);
@@ -1448,6 +1385,12 @@ static val_t parse_primary(lexer_t *lx) {
             return parse_postfix(lx, e);
         }
         case T_IDENT: {
+            if (strcmp(lx->cur.text, "__builtin_offsetof") == 0) {
+                v.kind = VAL_IMM;
+                v.imm = parse_builtin_offsetof();
+                v.type = &ty_ulong;
+                return parse_postfix(lx, v);
+            }
             char name[CC_MAX_IDENT];
             strncpy(name, lx->cur.text, CC_MAX_IDENT - 1);
             name[CC_MAX_IDENT - 1] = 0;
@@ -1456,17 +1399,53 @@ static val_t parse_primary(lexer_t *lx) {
 
             /* Function call? */
             if (lx->cur.kind == T_LPAREN) {
-                /* Built-in syscall stubs: __ecall0..6(n[, a[, ...]]) → ecall */
-                if (strncmp(name, "__ecall", 7) == 0 && name[7] >= '0' && name[7] <= '6' && name[8] == 0) {
+                if (strcmp(name, "__builtin_onyx_setjmp") == 0) {
+                    parse_expect(T_LPAREN, "expected '('");
+                    val_t environment = parse_assign(lx);
+                    parse_expect(T_RPAREN, "expected ')' after setjmp");
+                    load_value(&environment, RV_T2);
+                    rv_setjmp(RV_T2);
+                    v.kind = VAL_REG;
+                    v.reg = RV_T0;
+                    v.type = &ty_int;
+                    return v;
+                }
+                if (strcmp(name, "__builtin_onyx_longjmp") == 0) {
+                    parse_expect(T_LPAREN, "expected '('");
+                    val_t environment = parse_assign(lx);
+                    load_value(&environment, RV_T0);
+                    g_func.cur_offset = (g_func.cur_offset + 23) & ~15;
+                    int64_t slot = -(int64_t)g_func.cur_offset;
+                    if (g_func.cur_offset > g_func.frame_size) g_func.frame_size = g_func.cur_offset;
+                    rv_sd(RV_T0, RV_FP, (int)slot);
+                    parse_expect(T_COMMA, "expected ',' before longjmp value");
+                    val_t result = parse_assign(lx);
+                    parse_expect(T_RPAREN, "expected ')' after longjmp");
+                    load_value(&result, RV_A0);
+                    rv_slli(RV_A0, RV_A0, 32);
+                    rv_srai(RV_A0, RV_A0, 32);
+                    rv_ld(RV_T2, RV_FP, (int)slot);
+                    rv_longjmp(RV_T2, RV_A0);
+                    v.kind = VAL_REG;
+                    v.reg = RV_T0;
+                    v.type = &ty_void;
+                    return v;
+                }
+                /* Builtins count all values, including the syscall number. */
+                if (strncmp(name, "__ecall", 7) == 0 && name[7] >= '0' && name[7] <= '7' && name[8] == 0) {
                     int nargs = name[7] - '0';
                     parse_expect(T_LPAREN, "expected '('");
                     int got = 0;
+                    int64_t slots[7];
                     if (lx->cur.kind != T_RPAREN) {
                         for (;;) {
                             val_t a = parse_assign(lx);
                             if (got < 7) {
-                                int regs[7] = {RV_A7, RV_A0, RV_A1, RV_A2, RV_A3, RV_A4, RV_A5};
-                                load_value(&a, regs[got]);
+                                load_value(&a, RV_T0);
+                                g_func.cur_offset = (g_func.cur_offset + 23) & ~15;
+                                slots[got] = -(int64_t)g_func.cur_offset;
+                                if (g_func.cur_offset > g_func.frame_size) g_func.frame_size = g_func.cur_offset;
+                                rv_sd(RV_T0, RV_FP, (int)slots[got]);
                             }
                             got++;
                             if (!accept(T_COMMA)) break;
@@ -1476,6 +1455,9 @@ static val_t parse_primary(lexer_t *lx) {
                     if (got != nargs) {
                         cc_warn("__ecall%d called with %d args", nargs, got);
                     }
+                    if (got > 7) cc_error("too many syscall arguments");
+                    int registers[7] = {RV_A7, RV_A0, RV_A1, RV_A2, RV_A3, RV_A4, RV_A5};
+                    for (int i = 0; i < got && i < 7; i++) rv_ld(registers[i], RV_FP, (int)slots[i]);
                     rv_ecall();
                     val_t r;
                     memset(&r, 0, sizeof(r));
@@ -1498,24 +1480,19 @@ static val_t parse_primary(lexer_t *lx) {
                     if (!g_func.is_variadic) {
                         cc_error("va_start used in non-variadic function");
                     }
-                    /* Allocate the 16-byte cursor pair in the frame and
-                     * store its ADDRESS into ap. */
-                    g_func.cur_offset += 16;
-                    g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
+                    g_func.cur_offset = (g_func.cur_offset + 55) & ~15;
                     int64_t pair = -(int64_t)g_func.cur_offset;
-                    if (g_func.cur_offset > g_func.frame_size) {
-                        g_func.frame_size = g_func.cur_offset;
-                    }
-                    int gp_off = g_func.nparams * 8;
-                    if (gp_off > 64) gp_off = 64;
-                    /* pair[0] = &gp_area[nparams] */
-                    rv_addi_imm(RV_T1, RV_FP, g_func.va_save_off + gp_off);
+                    if (g_func.cur_offset > g_func.frame_size) g_func.frame_size = g_func.cur_offset;
+                    rv_addi_imm(RV_T1, RV_FP, g_func.va_save_off + g_func.named_gp * 8);
                     rv_sd(RV_T1, RV_FP, (int)pair);
-                    /* pair[8] = &fp_area[0] (no named FP tracking). */
-                    if (g_func.va_fsave_off != 0) {
-                        rv_addi_imm(RV_T1, RV_FP, g_func.va_fsave_off);
-                        rv_sd(RV_T1, RV_FP, (int)pair + 8);
-                    }
+                    rv_addi_imm(RV_T1, RV_FP, g_func.va_fsave_off + g_func.named_fp * 8);
+                    rv_sd(RV_T1, RV_FP, (int)pair + 8);
+                    rv_addi_imm(RV_T1, RV_FP, g_func.va_save_off + 64);
+                    rv_sd(RV_T1, RV_FP, (int)pair + 16);
+                    rv_addi_imm(RV_T1, RV_FP, g_func.va_fsave_off + 64);
+                    rv_sd(RV_T1, RV_FP, (int)pair + 24);
+                    rv_addi_imm(RV_T1, RV_FP, g_func.named_stack);
+                    rv_sd(RV_T1, RV_FP, (int)pair + 32);
                     /* ap = &pair. */
                     rv_addi_imm(RV_T1, RV_FP, (int)pair);
                     rv_sd(RV_T1, RV_T0, 0);
@@ -1535,36 +1512,66 @@ static val_t parse_primary(lexer_t *lx) {
                     parse_expect(T_RPAREN, "expected ')'");
                     /* ap is char* → load the pointer value first. */
                     load_value(&ap, RV_T0);
+                    int cursor = is_float_type(arg_type) ? 8 : 0;
+                    rv_ld(RV_T1, RV_T0, cursor);
+                    rv_ld(RV_T2, RV_T0, cursor + 16);
+                    uint32_t register_branch = (uint32_t)g_text.size;
+                    rv_bltu(RV_T1, RV_T2, 0);
+                    rv_ld(RV_T1, RV_T0, 32);
+                    rv_addi(RV_T3, RV_T1, 8);
+                    rv_sd(RV_T3, RV_T0, 32);
+                    uint32_t common_jump = (uint32_t)g_text.size;
+                    rv_jal(RV_ZERO, 0);
+                    patch_branch(register_branch, (int32_t)g_text.size - (int32_t)register_branch);
+                    rv_addi(RV_T3, RV_T1, 8);
+                    rv_sd(RV_T3, RV_T0, cursor);
+                    patch_jal(common_jump, (int32_t)g_text.size - (int32_t)common_jump);
                     if (is_float_type(arg_type)) {
-                        /* FP vararg: cursor lives at pair+8. */
-                        rv_ld(RV_T1, RV_T0, 8);
                         rv_fld(RV_FT0, RV_T1, 0);
-                        rv_addi(RV_T1, RV_T1, 8);
-                        rv_sd(RV_T1, RV_T0, 8);
-                        val_t vr;
-                        memset(&vr, 0, sizeof(vr));
-                        vr.kind = VAL_REG;
-                        vr.reg = RV_FT0;
-                        vr.type = arg_type;
-                        return vr;
+                        val_t result;
+                        memset(&result, 0, sizeof(result));
+                        result.kind = VAL_REG;
+                        result.reg = RV_FT0;
+                        result.type = arg_type;
+                        return result;
                     }
-                    rv_ld(RV_T1, RV_T0, 0);
                     uint64_t sz = type_sizeof(arg_type);
                     bool uns = type_is_unsigned(arg_type);
+                    if (arg_type->kind == TY_STRUCT || arg_type->kind == TY_UNION) sz = 8;
                     switch (sz) {
                         case 1: uns ? rv_lbu(RV_T2, RV_T1, 0) : rv_lb(RV_T2, RV_T1, 0); break;
                         case 2: uns ? rv_lhu(RV_T2, RV_T1, 0) : rv_lh(RV_T2, RV_T1, 0); break;
                         case 4: uns ? rv_lwu(RV_T2, RV_T1, 0) : rv_lw(RV_T2, RV_T1, 0); break;
                         default: rv_ld(RV_T2, RV_T1, 0); break;
                     }
-                    rv_addi(RV_T1, RV_T1, 8);
-                    rv_sd(RV_T1, RV_T0, 0);
                     val_t vr;
                     memset(&vr, 0, sizeof(vr));
                     vr.kind = VAL_REG;
                     vr.reg = RV_T2;
                     vr.type = arg_type;
-                    return vr;
+                    return parse_postfix(lx, vr);
+                }
+                if (strcmp(name, "__builtin_va_copy") == 0 || strcmp(name, "va_copy") == 0) {
+                    parse_expect(T_LPAREN, "expected '('");
+                    val_t destination = parse_assign(lx);
+                    spill_lval(&destination);
+                    parse_expect(T_COMMA, "expected ','");
+                    val_t source = parse_assign(lx);
+                    parse_expect(T_RPAREN, "expected ')'");
+                    load_value(&source, RV_T1);
+                    g_func.cur_offset = (g_func.cur_offset + 55) & ~15;
+                    int64_t copy = -(int64_t)g_func.cur_offset;
+                    if (g_func.cur_offset > g_func.frame_size) g_func.frame_size = g_func.cur_offset;
+                    for (int k = 0; k < 40; k += 8) {
+                        rv_ld(RV_T2, RV_T1, k);
+                        rv_sd(RV_T2, RV_FP, (int)copy + k);
+                    }
+                    materialize(&destination, RV_T0);
+                    rv_addi_imm(RV_T1, RV_FP, copy);
+                    rv_sd(RV_T1, RV_T0, 0);
+                    v.kind = VAL_IMM;
+                    v.type = &ty_void;
+                    return v;
                 }
                 if (strcmp(name, "va_end") == 0 || strcmp(name, "__builtin_va_end") == 0) {
                     parse_expect(T_LPAREN, "expected '('");
@@ -1587,7 +1594,7 @@ static val_t parse_primary(lexer_t *lx) {
                         callee.kind = VAL_SYM;
                         callee.sym_idx = gidx;
                         callee.type = gt;
-                        return gen_call(lx, -1, gt->base, &callee);
+                        return parse_postfix(lx, gen_call(lx, -1, gt->base, &callee));
                     }
                     lidx = -1;
                 }
@@ -1600,16 +1607,16 @@ static val_t parse_primary(lexer_t *lx) {
                     callee.kind = VAL_SYM;
                     callee.sym_idx = g_n_globals + lidx;
                     callee.type = g_locals[lidx].type;
-                    return gen_call(lx, -1, ft, &callee);
+                    return parse_postfix(lx, gen_call(lx, -1, ft, &callee));
                 }
 
-                int idx = symtab_lookup_global(name);
+                int idx = gen_lookup_global(name);
                 /* For multi-file compilation, also look up under the mangled
                  * name (static symbols from this file). */
                 if (idx < 0 && g_opts.n_input_files > 1) {
                     char mangled[CC_MAX_IDENT + 16];
                     mangle_static_name(name, mangled, sizeof(mangled));
-                    idx = symtab_lookup_global(mangled);
+                    idx = gen_lookup_global(mangled);
                 }
                 if (idx >= 0 && g_globals[idx].kind == SYM_GLOBAL_VAR &&
                     g_globals[idx].type->kind == TY_PTR &&
@@ -1621,21 +1628,17 @@ static val_t parse_primary(lexer_t *lx) {
                     callee.kind = VAL_SYM;
                     callee.sym_idx = idx;
                     callee.type = g_globals[idx].type;
-                    return gen_call(lx, -1, ft, &callee);
+                    return parse_postfix(lx, gen_call(lx, -1, ft, &callee));
                 }
 
                 if (idx < 0) {
                     /* Implicit declaration of function — assume int(). */
-                    type_t *ft = (type_t *)cc_arena_alloc(&g_type_arena, sizeof(type_t), 8);
-                    memset(ft, 0, sizeof(*ft));
-                    ft->kind = TY_FUNC;
-                    ft->ret = &ty_int;
-                    ft->size = 8; ft->align = 8; ft->is_complete = true;
+                    type_t *ft = type_make_function(&ty_int);
                     idx = symtab_install_global(name, SYM_FUNCTION, ft);
                     g_globals[idx].is_defined = false;
                 }
                 type_t *ft = g_globals[idx].type;
-                return gen_call(lx, idx, ft, NULL);
+                return parse_postfix(lx, gen_call(lx, idx, ft, NULL));
             }
 
             /* __func__ — the enclosing function's name as a string. */
@@ -1646,8 +1649,8 @@ static val_t parse_primary(lexer_t *lx) {
                 uint32_t lui_off = (uint32_t)g_text.size;
                 rv_lui(RV_T0, 0);
                 uint32_t addi_off = (uint32_t)g_text.size;
-                rv_addi_imm(RV_T0, RV_T0, off);
-                if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
+                rv_addi(RV_T0, RV_T0, 0);
+                if (g_n_rodata_fixups >= CC_MAX_REFS) cc_fatal("too many rodata refs");
                 g_rodata_fixups[g_n_rodata_fixups].rodata_off = off;
                 g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
                 g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
@@ -1672,12 +1675,12 @@ static val_t parse_primary(lexer_t *lx) {
                 v.offset = 0;
                 v.type = g_locals[lidx].type;
             } else {
-                int gidx = symtab_lookup_global(name);
+                int gidx = gen_lookup_global(name);
                 /* Try mangled name for static symbols from this file. */
                 if (gidx < 0 && g_opts.n_input_files > 1) {
                     char mangled[CC_MAX_IDENT + 16];
                     mangle_static_name(name, mangled, sizeof(mangled));
-                    gidx = symtab_lookup_global(mangled);
+                    gidx = gen_lookup_global(mangled);
                 }
                 if (gidx >= 0) {
                     if (g_globals[gidx].kind == SYM_ENUM_CONST) {
@@ -1743,20 +1746,25 @@ static val_t parse_unary(lexer_t *lx) {
                 is_d ? rv_fneg_d(RV_FT0, RV_FT0) : rv_fneg_s(RV_FT0, RV_FT0);
                 e.reg = RV_FT0;
             } else {
-                load_value(&e, RV_T0);
+                type_t *promoted = type_promote(e.type);
+                convert_scalar(&e, promoted);
                 rv_neg(RV_T0, RV_T0);
-                e.reg = RV_T0;
+                /* Unary arithmetic wraps at the promoted target width
+                 * before a later conversion can widen the result. */
+                convert_scalar(&e, promoted);
             }
             return e;
         }
         case T_PLUS: {
             lex_next(lx);
-            return parse_unary(lx);
+            val_t e = parse_unary(lx);
+            if (!is_float_type(e.type)) convert_scalar(&e, type_promote(e.type));
+            return e;
         }
         case T_NOT: {
             lex_next(lx);
             val_t e = parse_unary(lx);
-            load_value(&e, RV_T0);
+            convert_scalar(&e, &ty_bool);
             rv_seqz(RV_T0, RV_T0);
             e.reg = RV_T0;
             e.type = &ty_int;
@@ -1765,9 +1773,10 @@ static val_t parse_unary(lexer_t *lx) {
         case T_TILDE: {
             lex_next(lx);
             val_t e = parse_unary(lx);
-            load_value(&e, RV_T0);
+            type_t *promoted = type_promote(e.type);
+            convert_scalar(&e, promoted);
             rv_not(RV_T0, RV_T0);
-            e.reg = RV_T0;
+            convert_scalar(&e, promoted);
             return e;
         }
         case T_STAR: {
@@ -1864,9 +1873,29 @@ static void gen_store(val_t *lhs, val_t *rhs, int op) {
         return;
     }
 
+    if (op == T_ASSIGN && (lhs->type->kind == TY_STRUCT || lhs->type->kind == TY_UNION)) {
+        materialize(rhs, RV_T0);
+        if (lhs->kind == VAL_SYM || lhs->kind == VAL_SPILL) materialize(lhs, RV_T2);
+        else rv_addi_imm(RV_T2, lhs->reg, lhs->offset);
+        uint64_t size = type_sizeof(lhs->type);
+        uint64_t offset = 0;
+        if (type_alignof(lhs->type) >= 8) {
+            for (; offset + 8 <= size; offset += 8) {
+                rv_ld(RV_T1, RV_T0, (int)offset);
+                rv_sd(RV_T1, RV_T2, (int)offset);
+            }
+        }
+        for (; offset < size; offset++) {
+            rv_lbu(RV_T1, RV_T0, (int)offset);
+            rv_sb(RV_T1, RV_T2, (int)offset);
+        }
+        return;
+    }
+    if (op == T_ASSIGN) convert_scalar(rhs, lhs->type);
     bool fp_lhs = is_float_type(lhs->type);
 
     if (fp_lhs) {
+        if (op != T_ASSIGN) convert_scalar(rhs, lhs->type);
         /* Float/double store path.
          * Load the CURRENT lhs value FIRST: the rhs evaluation leaves its
          * result in FT0, so loading rhs-then-cur clobbers rhs with the cur
@@ -1913,6 +1942,12 @@ static void gen_store(val_t *lhs, val_t *rhs, int op) {
         load_value(&cur, old);
     }
 
+    /* Compound pointer arithmetic scales the integer offset just like
+     * binary +/-. Lua's inverted Value array relies on pointer += n. */
+    if (type_is_pointer(lhs->type) && (op == T_PLUS_ASSIGN || op == T_MINUS_ASSIGN)) {
+        rv_addi_imm(RV_T2, RV_ZERO, (int64_t)type_sizeof(lhs->type->base));
+        rv_mul(RV_T0, RV_T0, RV_T2);
+    }
     /* Compute new value. */
     switch (op) {
         case T_ASSIGN: break;
@@ -1974,6 +2009,11 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
         int prec = op_prec(lx->cur.kind);
         if (prec < min_prec || prec == 0) break;
         token_kind_t op = lx->cur.kind;
+        if (lhs.type->kind == TY_ARRAY || lhs.type->kind == TY_FUNC) {
+            type_t *decayed = type_decay(lhs.type);
+            load_value(&lhs, RV_T0);
+            lhs.type = decayed;
+        }
         lex_next(lx);
 
         /* Short-circuit for && and ||.
@@ -2159,6 +2199,11 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
             rhs.offset = slot;
         }
 
+        if (rhs.type->kind == TY_ARRAY || rhs.type->kind == TY_FUNC) {
+            type_t *decayed = type_decay(rhs.type);
+            load_value(&rhs, RV_T0);
+            rhs.type = decayed;
+        }
         /* Type promotion for arithmetic. */
         type_t *common = type_common(lhs.type, rhs.type);
         bool fp_arith = is_float_type(common);
@@ -2167,8 +2212,9 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
             /* Float/double arithmetic — use FPU registers.
              * RHS first (results live in FT0 — same clobber rule as ints). */
             bool is_d = (common->kind == TY_DOUBLE || common->kind == TY_LDOUBLE);
-            load_float_value(&rhs, RV_FT1);
-            load_float_value(&lhs, RV_FT0);
+            convert_scalar(&rhs, common);
+            rv_emit_fpu_r(is_d ? 0x11 : 0x10, 0, RV_FT1, RV_FT0, RV_FT0);
+            convert_scalar(&lhs, common);
             switch (op) {
                 case T_PLUS:
                     is_d ? rv_fadd_d(RV_FT0, RV_FT0, RV_FT1) : rv_fadd_s(RV_FT0, RV_FT0, RV_FT1);
@@ -2224,7 +2270,7 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
         load_value(&rhs, RV_T1);
         load_value(&lhs, RV_T0);
 
-        if (type_is_pointer(lhs.type) && type_is_integer(rhs.type)) {
+        if (type_is_pointer(lhs.type) && type_is_integer(rhs.type) && (op == T_PLUS || op == T_MINUS)) {
             /* pointer + int → pointer arithmetic, scale by sizeof(*lhs). */
             uint64_t sz = type_sizeof(lhs.type->base);
             if (sz != 1) {
@@ -2232,6 +2278,10 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
                 rv_mul(RV_T1, RV_T1, RV_T2);
             }
             common = lhs.type;
+        } else if (type_is_integer(lhs.type) && type_is_pointer(rhs.type) && op == T_PLUS) {
+            rv_addi_imm(RV_T2, RV_ZERO, (int64_t)type_sizeof(rhs.type->base));
+            rv_mul(RV_T0, RV_T0, RV_T2);
+            common = rhs.type;
         }
 
         switch (op) {
@@ -2243,7 +2293,7 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
                     uint64_t sz = type_sizeof(lhs.type->base);
                     if (sz != 1) {
                         rv_addi_imm(RV_T1, RV_ZERO, sz);
-                        rv_divu(RV_T0, RV_T0, RV_T1);
+                        rv_div(RV_T0, RV_T0, RV_T1);
                     }
                     common = &ty_long;
                 } else {
@@ -2267,6 +2317,15 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
             default: break;
         }
 
+        if (op == T_EQ || op == T_NE || op == T_LT || op == T_LE || op == T_GT || op == T_GE)
+            common = &ty_int;
+        else if (op == T_SHL || op == T_SHR) common = type_promote(lhs.type);
+        if (type_is_integer(common) && type_sizeof(common) < 8) {
+            int shift = 64 - (int)type_sizeof(common) * 8;
+            rv_slli(RV_T0, RV_T0, shift);
+            if (type_is_signed(common)) rv_srai(RV_T0, RV_T0, shift);
+            else rv_srli(RV_T0, RV_T0, shift);
+        }
         lhs.kind = VAL_REG;
         lhs.reg = RV_T0;
         lhs.type = common;
@@ -2283,57 +2342,59 @@ static inline void rv_xori_(int rd, int rs) {
 }
 #endif
 
-/* Ternary. */
+/* Both arms are parsed before their common type is known. Preserve the
+ * true value, then emit its conversion after the false arm's conversion. */
 static val_t parse_ternary(lexer_t *lx) {
     val_t cond = parse_binop(lx);
-    if (accept(T_QUESTION)) {
-        load_value(&cond, RV_T0);
-        uint32_t else_label = 0;
-        uint32_t end_label = 0;
-        /* beq t0, zero, else */
-        rv_beq(RV_T0, RV_ZERO, 0);
-        uint32_t br1_off = (uint32_t)g_text.size - 4;
-        val_t then_v = parse_expr(lx);
-        if (is_float_type(then_v.type)) {
-            load_float_value(&then_v, RV_FT0);
-        } else {
-            load_value(&then_v, RV_T0);
-        }
-        /* jal end */
-        rv_jal(RV_ZERO, 0);
-        uint32_t jmp_off = (uint32_t)g_text.size - 4;
-        /* else: */
-        else_label = (uint32_t)g_text.size;
-        parse_expect(T_COLON, "expected ':' in ternary");
-        val_t else_v = parse_ternary(lx);
-        if (is_float_type(else_v.type)) {
-            load_float_value(&else_v, RV_FT0);
-        } else {
-            load_value(&else_v, RV_T0);
-        }
-        end_label = (uint32_t)g_text.size;
-
-        /* Patch branches. */
-        int32_t d1 = (int32_t)else_label - (int32_t)br1_off;
-        uint8_t *p1 = g_text.data + br1_off;
-        uint32_t i1 = (uint32_t)p1[0] | ((uint32_t)p1[1] << 8) | ((uint32_t)p1[2] << 16) | ((uint32_t)p1[3] << 24);
-        i1 |= ((uint32_t)(d1 & 0x1000) << 19) | ((uint32_t)(d1 & 0x7E0) << 20) |
-              ((uint32_t)(d1 & 0x1E) << 7) | ((uint32_t)(d1 & 0x800) >> 4);
-        p1[0] = i1 & 0xff; p1[1] = (i1 >> 8) & 0xff; p1[2] = (i1 >> 16) & 0xff; p1[3] = (i1 >> 24) & 0xff;
-
-        int32_t d2 = (int32_t)end_label - (int32_t)jmp_off;
-        uint8_t *p2 = g_text.data + jmp_off;
-        uint32_t i2 = (uint32_t)p2[0] | ((uint32_t)p2[1] << 8) | ((uint32_t)p2[2] << 16) | ((uint32_t)p2[3] << 24);
-        i2 &= ~0xFFFFF000;
-        i2 |= ((uint32_t)(d2 & 0x100000) << 11) | ((uint32_t)(d2 & 0x7FE) << 20) |
-              ((uint32_t)(d2 & 0x800) << 9) | ((uint32_t)(d2 & 0xFF000));
-        p2[0] = i2 & 0xff; p2[1] = (i2 >> 8) & 0xff; p2[2] = (i2 >> 16) & 0xff; p2[3] = (i2 >> 24) & 0xff;
-
+    if (!accept(T_QUESTION)) return cond;
+    convert_scalar(&cond, &ty_bool);
+    rv_bne(RV_T0, RV_ZERO, 8);
+    rv_jal(RV_ZERO, 0);
+    uint32_t false_jump = (uint32_t)g_text.size - 4;
+    val_t then_v = parse_expr(lx);
+    bool aggregate = then_v.type->kind == TY_STRUCT || then_v.type->kind == TY_UNION;
+    if (is_float_type(then_v.type)) {
+        load_float_value(&then_v, RV_FT0);
+        spill_freg(&then_v);
+    } else {
+        if (aggregate) materialize(&then_v, RV_T0);
+        else load_value(&then_v, RV_T0);
         then_v.kind = VAL_REG;
-        then_v.reg = is_float_type(then_v.type) ? RV_FT0 : RV_T0;
-        return then_v;
+        then_v.reg = RV_T0;
+        if (aggregate) {
+            /* An aggregate expression carries an address, even if its size
+             * is one byte. Spill the entire address. */
+            type_t *saved_type = then_v.type;
+            then_v.type = type_make_ptr(saved_type);
+            spill_ireg(&then_v);
+            then_v.type = saved_type;
+        } else spill_ireg(&then_v);
     }
-    return cond;
+    rv_jal(RV_ZERO, 0);
+    uint32_t true_jump = (uint32_t)g_text.size - 4;
+    patch_jal(false_jump, (int32_t)g_text.size - (int32_t)false_jump);
+    parse_expect(T_COLON, "expected ':' in ternary");
+    val_t else_v = parse_ternary(lx);
+    type_t *common;
+    if (aggregate || then_v.type->kind == TY_VOID) common = then_v.type;
+    else if (then_v.type->kind == TY_ARRAY) common = type_make_ptr(then_v.type->base);
+    else if (else_v.type->kind == TY_ARRAY) common = type_make_ptr(else_v.type->base);
+    else if (type_is_pointer(then_v.type)) common = then_v.type;
+    else if (type_is_pointer(else_v.type)) common = else_v.type;
+    else common = type_common(then_v.type, else_v.type);
+    if (aggregate) materialize(&else_v, RV_T0);
+    else convert_scalar(&else_v, common);
+    rv_jal(RV_ZERO, 0);
+    uint32_t end_jump = (uint32_t)g_text.size - 4;
+    patch_jal(true_jump, (int32_t)g_text.size - (int32_t)true_jump);
+    if (aggregate) rv_ld(RV_T0, RV_FP, (int)then_v.offset);
+    else convert_scalar(&then_v, common);
+    patch_jal(end_jump, (int32_t)g_text.size - (int32_t)end_jump);
+    then_v.kind = VAL_REG;
+    then_v.type = common;
+    then_v.reg = is_float_type(common) ? RV_FT0 : RV_T0;
+    then_v.offset = 0;
+    return then_v;
 }
 
 static val_t parse_assign(lexer_t *lx) {
@@ -2602,7 +2663,6 @@ static void parse_stmt_body(lexer_t *lx) {
 
             if (is_typedef) {
                 /* typedef inside a function body — install globally. */
-                t->is_typedef = true;
                 symtab_install_global(name, SYM_TYPEDEF, t);
                 if (accept(T_COMMA)) continue;
                 break;
@@ -2610,8 +2670,7 @@ static void parse_stmt_body(lexer_t *lx) {
             if (is_extern) {
                 /* extern declaration inside a function — reference to a
                  * global defined elsewhere. */
-                t->is_extern = true;
-                int gidx = symtab_lookup_global(name);
+                int gidx = gen_lookup_global(name);
                 if (gidx < 0) {
                     gidx = symtab_install_global(name, SYM_GLOBAL_VAR, t);
                     g_globals[gidx].is_defined = false;
@@ -2630,7 +2689,7 @@ static void parse_stmt_body(lexer_t *lx) {
                 char gname[CC_MAX_IDENT * 2];
                 snprintf(gname, sizeof(gname), "__sl_%s_%s",
                          g_cur_func_name[0] ? g_cur_func_name : "_", name);
-                int gidx = symtab_lookup_global(gname);
+                int gidx = gen_lookup_global(gname);
                 if (gidx < 0) {
                     gidx = symtab_install_global(gname, SYM_GLOBAL_VAR, t);
                 }
@@ -2705,8 +2764,8 @@ static void parse_stmt_body(lexer_t *lx) {
                     uint32_t lui_off = (uint32_t)g_text.size;
                     rv_lui(RV_T1, 0);
                     uint32_t addi_off = (uint32_t)g_text.size;
-                    rv_addi_imm(RV_T1, RV_T1, (int64_t)ro_off);
-                    if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
+                    rv_addi(RV_T1, RV_T1, 0);
+                    if (g_n_rodata_fixups >= CC_MAX_REFS) cc_fatal("too many rodata refs");
                     g_rodata_fixups[g_n_rodata_fixups].rodata_off = ro_off;
                     g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
                     g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
@@ -2774,8 +2833,8 @@ static void parse_stmt_body(lexer_t *lx) {
                     uint32_t lui_off = (uint32_t)g_text.size;
                     rv_lui(RV_T1, 0);
                     uint32_t addi_off = (uint32_t)g_text.size;
-                    rv_addi_imm(RV_T1, RV_T1, (int64_t)ro_off);
-                    if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
+                    rv_addi(RV_T1, RV_T1, 0);
+                    if (g_n_rodata_fixups >= CC_MAX_REFS) cc_fatal("too many rodata refs");
                     g_rodata_fixups[g_n_rodata_fixups].rodata_off = ro_off;
                     g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
                     g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
@@ -2928,7 +2987,16 @@ static void parse_stmt_body(lexer_t *lx) {
             lex_next(lx);
             if (lx->cur.kind != T_SEMI) {
                 val_t v = parse_expr(lx);
-                if (is_float_type(v.type)) {
+                if (g_cur_func_ret) convert_scalar(&v, g_cur_func_ret);
+                if (g_func.return_slot) {
+                    materialize(&v, RV_T0);
+                    rv_ld(RV_T2, RV_FP, g_func.return_slot);
+                    for (uint64_t i = 0; i < type_sizeof(g_cur_func_ret); i++) {
+                        rv_lbu(RV_T1, RV_T0, (int)i);
+                        rv_sb(RV_T1, RV_T2, (int)i);
+                    }
+                    rv_mv(RV_A0, RV_T2);
+                } else if (is_float_type(v.type)) {
                     /* Return float/double in FA0 (float ABI convention). */
                     load_float_value(&v, RV_FA0);
                 } else if (g_cur_func_ret && is_float_type(g_cur_func_ret)) {
@@ -3104,70 +3172,69 @@ static void parse_stmt_body(lexer_t *lx) {
         case T_KW_SWITCH: {
             lex_next(lx);
             parse_expect(T_LPAREN, "expected '(' after switch");
-            val_t sv = parse_expr(lx);
-            parse_expect(T_RPAREN, "expected ')'");
-            load_value(&sv, RV_T0);
-            rv_mv(RV_T1, RV_T0);
-            parse_expect(T_LBRACE, "expected '{'");
+            val_t value = parse_expr(lx);
+            parse_expect(T_RPAREN, "expected ')' after switch");
+            load_value(&value, RV_T0);
+            g_func.cur_offset = (g_func.cur_offset + 23) & ~15;
+            int64_t slot = -(int64_t)g_func.cur_offset;
+            if (g_func.cur_offset > g_func.frame_size) g_func.frame_size = g_func.cur_offset;
+            rv_sd(RV_T0, RV_FP, (int)slot);
+            rv_jal(RV_ZERO, 0);
+            uint32_t dispatch_jump = (uint32_t)g_text.size - 4;
+            parse_expect(T_LBRACE, "expected '{' after switch");
             uint32_t saved_break = g_func.break_label;
-            int saved_n_break = g_func.n_break_fixups;
+            int saved_count = g_func.n_break_fixups;
             g_func.break_label = 0;
             g_func.switch_depth++;
-            uint32_t prev_branch = 0;
-            /* Label-to-handler jumps: every `case V:` compare that MATCHES
-             * must jump past the remaining labels of its group into the
-             * handler. The old code relied on fall-through, so for
-             * `case 'd': case 'i': handler` a 'd' match fell into the 'i'
-             * compare, mismatched, and escaped to the NEXT case — args were
-             * consumed by the wrong handlers (printf %d/%u/%x shifted). */
-            uint32_t label_jumps[128];
-            int n_label_jumps = 0;
+            symtab_push_scope();
+            long long cases[256];
+            uint32_t labels[256];
+            int count = 0;
+            uint32_t default_label = 0;
             while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF) {
-                if (lx->cur.kind == T_KW_CASE) {
-                    if (prev_branch)
-                        patch_branch(prev_branch, (int32_t)g_text.size - (int32_t)prev_branch);
-                    lex_next(lx);
-                    val_t cv = parse_expr(lx);
-                    load_value(&cv, RV_T0);
-                    parse_expect(T_COLON, "expected ':' after case value");
-                    rv_bne(RV_T1, RV_T0, 0);
-                    prev_branch = (uint32_t)g_text.size - 4;
-                    /* match → jump to handler (patched below). */
-                    rv_jal(RV_ZERO, 0);
-                    if (n_label_jumps < 128)
-                        label_jumps[n_label_jumps++] = (uint32_t)g_text.size - 4;
-                } else if (lx->cur.kind == T_KW_DEFAULT) {
-                    if (prev_branch)
-                        patch_branch(prev_branch, (int32_t)g_text.size - (int32_t)prev_branch);
-                    prev_branch = 0;
-                    lex_next(lx);
-                    parse_expect(T_COLON, "expected ':' after default");
-                    /* default: the handler starts right here. */
-                    for (int i = 0; i < n_label_jumps; i++)
-                        patch_jal(label_jumps[i], (int32_t)g_text.size - (int32_t)label_jumps[i]);
-                    n_label_jumps = 0;
-                } else {
-                    /* First statement of this label group = handler start. */
-                    if (n_label_jumps > 0) {
-                        for (int i = 0; i < n_label_jumps; i++)
-                            patch_jal(label_jumps[i], (int32_t)g_text.size - (int32_t)label_jumps[i]);
-                        n_label_jumps = 0;
+                if (accept(T_KW_CASE)) {
+                    long long key = parse_const_expr();
+                    type_t *control = type_promote(value.type);
+                    if (type_sizeof(control) < 8) {
+                        int shift = 64 - (int)type_sizeof(control) * 8;
+                        unsigned long long bits = (unsigned long long)key << shift;
+                        key = type_is_signed(control) ? (long long)bits >> shift : (long long)(bits >> shift);
                     }
-                    parse_stmt(lx);
-                }
+                    parse_expect(T_COLON, "expected ':' after case");
+                    if (count >= 256) cc_fatal("too many switch cases");
+                    for (int i = 0; i < count; i++)
+                        if (cases[i] == key) cc_error("duplicate case value");
+                    cases[count] = key;
+                    labels[count++] = (uint32_t)g_text.size;
+                } else if (accept(T_KW_DEFAULT)) {
+                    parse_expect(T_COLON, "expected ':' after default");
+                    if (default_label) cc_error("duplicate default label");
+                    default_label = (uint32_t)g_text.size;
+                } else parse_stmt(lx);
             }
-            /* Empty trailing group: handler = switch end. */
-            for (int i = 0; i < n_label_jumps; i++)
-                patch_jal(label_jumps[i], (int32_t)g_text.size - (int32_t)label_jumps[i]);
-            if (prev_branch)
-                patch_branch(prev_branch, (int32_t)g_text.size - (int32_t)prev_branch);
+            symtab_pop_scope();
+            parse_expect(T_RBRACE, "expected '}' after switch");
+            rv_jal(RV_ZERO, 0); /* Fallthrough leaves the switch, not dispatch. */
+            uint32_t body_end = (uint32_t)g_text.size - 4;
+            patch_jal(dispatch_jump, (int32_t)g_text.size - (int32_t)dispatch_jump);
+            rv_ld(RV_T1, RV_FP, (int)slot);
+            for (int i = 0; i < count; i++) {
+                rv_addi_imm(RV_T0, RV_ZERO, cases[i]);
+                rv_bne(RV_T1, RV_T0, 8);
+                uint32_t jump = (uint32_t)g_text.size;
+                rv_jal(RV_ZERO, (int32_t)labels[i] - (int32_t)jump);
+            }
+            if (default_label) {
+                uint32_t jump = (uint32_t)g_text.size;
+                rv_jal(RV_ZERO, (int32_t)default_label - (int32_t)jump);
+            }
             uint32_t end = (uint32_t)g_text.size;
-            for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
+            patch_jal(body_end, (int32_t)end - (int32_t)body_end);
+            for (int i = saved_count; i < g_func.n_break_fixups; i++)
                 patch_jal(g_func.break_fixups[i], (int32_t)end - (int32_t)g_func.break_fixups[i]);
-            g_func.n_break_fixups = saved_n_break;
+            g_func.n_break_fixups = saved_count;
             g_func.break_label = saved_break;
             g_func.switch_depth--;
-            parse_expect(T_RBRACE, "expected '}' after switch");
             return;
         }
         default: {
@@ -3195,92 +3262,6 @@ static void parse_compound(lexer_t *lx) {
     }
     symtab_pop_scope();
     parse_expect(T_RBRACE, "expected '}'");
-}
-
-/* ---- Constant expression parser (for array sizes, etc.) ------------ */
-
-static int const_op_prec(token_kind_t k) {
-    switch (k) {
-        case T_OR: return 1;
-        case T_AND: return 2;
-        case T_PIPE: return 3;
-        case T_CARET: return 4;
-        case T_AMP: return 5;
-        case T_EQ: case T_NE: return 6;
-        case T_LT: case T_GT: case T_LE: case T_GE: return 7;
-        case T_SHL: case T_SHR: return 8;
-        case T_PLUS: case T_MINUS: return 9;
-        case T_STAR: case T_SLASH: case T_PERCENT: return 10;
-        default: return 0;
-    }
-}
-
-static long long const_expr_prim(lexer_t *lx);
-static long long const_expr_binop(lexer_t *lx, int min_prec);
-
-static long long const_expr_unary(lexer_t *lx) {
-    if (lx->cur.kind == T_PLUS) { lex_next(lx); return const_expr_unary(lx); }
-    if (lx->cur.kind == T_MINUS) { lex_next(lx); return -const_expr_unary(lx); }
-    if (lx->cur.kind == T_NOT) { lex_next(lx); return !const_expr_unary(lx); }
-    if (lx->cur.kind == T_TILDE) { lex_next(lx); return ~const_expr_unary(lx); }
-    if (lx->cur.kind == T_LPAREN) {
-        lex_next(lx);
-        long long v = const_expr_binop(lx, 0);
-        if (lx->cur.kind == T_RPAREN) lex_next(lx);
-        return v;
-    }
-    if (lx->cur.kind == T_INT || lx->cur.kind == T_LONG ||
-        lx->cur.kind == T_UINT || lx->cur.kind == T_ULONG) {
-        long long v = (long long)lx->cur.ival;
-        lex_next(lx);
-        return v;
-    }
-    if (lx->cur.kind == T_IDENT) {
-        int idx = symtab_lookup_global(lx->cur.text);
-        lex_next(lx);
-        if (idx >= 0 && g_globals[idx].kind == SYM_ENUM_CONST)
-            return (long long)g_globals[idx].enum_val;
-        return 0;
-    }
-    cc_error("expected constant expression");
-    return 0;
-}
-
-static long long const_expr_binop(lexer_t *lx, int min_prec) {
-    long long lhs = const_expr_unary(lx);
-    for (;;) {
-        int prec = const_op_prec(lx->cur.kind);
-        if (prec < min_prec || prec == 0) break;
-        token_kind_t op = lx->cur.kind;
-        lex_next(lx);
-        long long rhs = const_expr_binop(lx, prec + 1);
-        switch (op) {
-            case T_PLUS: lhs = lhs + rhs; break;
-            case T_MINUS: lhs = lhs - rhs; break;
-            case T_STAR: lhs = lhs * rhs; break;
-            case T_SLASH: lhs = rhs ? lhs / rhs : 0; break;
-            case T_PERCENT: lhs = rhs ? lhs % rhs : 0; break;
-            case T_SHL: lhs = lhs << rhs; break;
-            case T_SHR: lhs = lhs >> rhs; break;
-            case T_AMP: lhs = lhs & rhs; break;
-            case T_PIPE: lhs = lhs | rhs; break;
-            case T_CARET: lhs = lhs ^ rhs; break;
-            case T_AND: lhs = lhs && rhs; break;
-            case T_OR: lhs = lhs || rhs; break;
-            case T_EQ: lhs = (lhs == rhs); break;
-            case T_NE: lhs = (lhs != rhs); break;
-            case T_LT: lhs = (lhs < rhs); break;
-            case T_GT: lhs = (lhs > rhs); break;
-            case T_LE: lhs = (lhs <= rhs); break;
-            case T_GE: lhs = (lhs >= rhs); break;
-            default: break;
-        }
-    }
-    return lhs;
-}
-
-static long long gen_const_expr(lexer_t *lx) {
-    return const_expr_binop(lx, 0);
 }
 
 /* ---- Global init parser (constant only) ---------------------------- */
@@ -3330,11 +3311,11 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
             lexer_t save = *lx;
             lex_next(lx);
             if (lx->cur.kind == T_IDENT) {
-                int idx = symtab_lookup_global(lx->cur.text);
+                int idx = gen_lookup_global(lx->cur.text);
                 if (idx < 0 && g_opts.n_input_files > 1) {
                     char mangled[CC_MAX_IDENT + 16];
                     mangle_static_name(lx->cur.text, mangled, sizeof(mangled));
-                    idx = symtab_lookup_global(mangled);
+                    idx = gen_lookup_global(mangled);
                 }
                 if (idx >= 0 && (g_globals[idx].kind == SYM_GLOBAL_VAR ||
                                  g_globals[idx].kind == SYM_FUNCTION)) {
@@ -3354,12 +3335,12 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
             strncpy(nm, lx->cur.text, CC_MAX_IDENT - 1);
             nm[CC_MAX_IDENT - 1] = 0;
             lex_next(lx);
-            if (lx->cur.kind == T_COMMA || lx->cur.kind == T_SEMI) {
-                int idx = symtab_lookup_global(nm);
+            if (lx->cur.kind == T_COMMA || lx->cur.kind == T_SEMI || lx->cur.kind == T_RBRACE) {
+                int idx = gen_lookup_global(nm);
                 if (idx < 0 && g_opts.n_input_files > 1) {
                     char mangled[CC_MAX_IDENT + 16];
                     mangle_static_name(nm, mangled, sizeof(mangled));
-                    idx = symtab_lookup_global(mangled);
+                    idx = gen_lookup_global(mangled);
                 }
                 if (idx >= 0 && g_globals[idx].kind == SYM_GLOBAL_VAR &&
                     (g_globals[idx].type->kind == TY_ARRAY)) {
@@ -3381,7 +3362,13 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
         }
     }
 
-    /* For non-string: support only integer/pointer constants. */
+    /* Integer constant expressions must be evaluated without emitting
+     * runtime instructions into the text segment. */
+    if (type_is_integer(type) || type->kind == TY_PTR) {
+        expr_t *constant = ast_new_expr(EX_NUM, lx->cur.pos);
+        constant->ival = parse_const_expr();
+        return constant;
+    }
     val_t v = parse_assign(lx);
     expr_t *e = ast_new_expr(EX_NUM, lx->cur.pos);
     if (v.kind == VAL_IMM) {
@@ -3501,6 +3488,19 @@ static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type) {
 
     if (type->kind == TY_ARRAY) {
         type_t *elem = type->base;
+        if (lx->cur.kind == T_STRING && (elem->kind == TY_CHAR || elem->kind == TY_SCHAR || elem->kind == TY_UCHAR)) {
+            gen_emit_global_init_scalar(lx, type);
+            accept(T_COMMA);
+            parse_expect(T_RBRACE, "expected '}' after string initializer");
+            uint64_t written = g_data.size - start_off;
+            if (type->is_incomplete || !type->length) {
+                type->length = written;
+                type->size = written;
+                type->is_incomplete = false;
+                type->is_complete = true;
+            }
+            return written;
+        }
         uint64_t elem_sz = type_sizeof(elem);
         uint64_t max = type->length > 0 ? type->length : UINT64_MAX;
 
@@ -3649,7 +3649,7 @@ static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
         rv_lui(RV_T0, 0);
         uint32_t addi_off = (uint32_t)g_text.size;
         rv_addi(RV_T0, RV_T0, 0);
-        if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata fixups");
+        if (g_n_rodata_fixups >= CC_MAX_REFS) cc_fatal("too many rodata fixups");
         g_rodata_fixups[g_n_rodata_fixups].rodata_off = rodata_off;
         g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
         g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
@@ -3662,12 +3662,19 @@ static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
 
     /* Scalar: evaluate expression and store to stack slot. */
     val_t v = parse_assign(lx);
+    convert_scalar(&v, type);
     int addr_reg = RV_T2;
-    load_value(&v, RV_T0);
+    if (is_float_type(type)) load_float_value(&v, RV_FT0);
+    else load_value(&v, RV_T0);
     uint64_t sz = type_sizeof(type);
     /* Compute address: fp + fp_off + field_off. */
     int total_off = (int)(fp_off + field_off);
     rv_addi_imm(addr_reg, RV_FP, total_off);
+    if (is_float_type(type)) {
+        if (type->kind == TY_FLOAT) rv_fsw(RV_FT0, addr_reg, 0);
+        else rv_fsd(RV_FT0, addr_reg, 0);
+        return;
+    }
     switch (sz) {
         case 1: rv_sb(RV_T0, addr_reg, 0); break;
         case 2: rv_sh(RV_T0, addr_reg, 0); break;
@@ -3681,6 +3688,18 @@ static void gen_emit_local_init_recurse(lexer_t *lx, type_t *type,
                                         int64_t fp_off, int64_t field_off) {
     if (type->kind == TY_ARRAY) {
         type_t *elem = type->base;
+        if (lx->cur.kind == T_STRING && (elem->kind == TY_CHAR || elem->kind == TY_SCHAR || elem->kind == TY_UCHAR)) {
+            size_t length;
+            char *text = parse_concat_string(lx, &length);
+            uint64_t size = type_sizeof(type);
+            if (length > size) cc_error("initializer string too long");
+            for (uint64_t i = 0; i < size; i++) {
+                rv_addi(RV_T0, RV_ZERO, i < length ? (unsigned char)text[i] : 0);
+                rv_sb(RV_T0, RV_FP, (int)(fp_off + field_off + i));
+            }
+            free(text);
+            return;
+        }
         uint64_t elem_sz = type_sizeof(elem);
         uint64_t max = type->length > 0 ? type->length : UINT64_MAX;
         uint64_t count = 0;
@@ -3743,6 +3762,25 @@ static void gen_emit_local_init_recurse(lexer_t *lx, type_t *type,
 static void gen_emit_local_braced_init(lexer_t *lx, type_t *type,
                                        int64_t fp_off, int sym_idx) {
     (void)sym_idx;
+    /* C initializes every omitted aggregate member to zero. Clear the
+     * complete object before explicit initializers; reused stack slots
+     * otherwise retain flags/pointers from earlier calls. Byte prefixes
+     * keep word stores aligned even for char arrays after byte locals. */
+    uint64_t remaining = type_sizeof(type);
+    rv_addi_imm(RV_T2, RV_FP, fp_off);
+    uint64_t prefix = (0ULL - (uint64_t)fp_off) & 7;
+    if (prefix > remaining) prefix = remaining;
+    for (uint64_t i = 0; i < prefix; i++) rv_sb(RV_ZERO, RV_T2, (int)i);
+    if (prefix) rv_addi(RV_T2, RV_T2, (int)prefix);
+    remaining -= prefix;
+    if (remaining >= 8) {
+        rv_addi_imm(RV_T0, RV_ZERO, (int64_t)(remaining / 8));
+        rv_sd(RV_ZERO, RV_T2, 0);
+        rv_addi(RV_T2, RV_T2, 8);
+        rv_addi(RV_T0, RV_T0, -1);
+        rv_bne(RV_T0, RV_ZERO, -12);
+    }
+    for (uint64_t i = 0; i < remaining % 8; i++) rv_sb(RV_ZERO, RV_T2, (int)i);
     lex_next(lx); /* consume '{' */
     gen_emit_local_init_recurse(lx, type, fp_off, 0);
     if (lx->cur.kind == T_COMMA) lex_next(lx); /* optional trailing comma */
@@ -3763,7 +3801,7 @@ static void gen_emit_global_init_scalar(lexer_t *lx, type_t *type) {
             /* char *field = "str" — write placeholder pointer, record fixup. */
             uint32_t data_off = (uint32_t)g_data.size;
             cc_buf_push64(&g_data, 0);
-            if (g_n_data_rodata_fixups >= 4096)
+            if (g_n_data_rodata_fixups >= CC_MAX_REFS)
                 cc_fatal("too many data-rodata fixups");
             g_data_rodata_fixups[g_n_data_rodata_fixups].rodata_off = rodata_off;
             g_data_rodata_fixups[g_n_data_rodata_fixups].data_off = data_off;
@@ -3784,18 +3822,21 @@ static void gen_emit_global_init_scalar(lexer_t *lx, type_t *type) {
         return;
     }
 
-    /* Scalar integer/pointer value. */
-    val_t v = parse_assign(lx);
-    uint64_t sz = type_sizeof(type);
-    uint64_t val = 0;
-    if (v.kind == VAL_IMM) {
-        val = v.imm;
-    } else {
-        cc_error("non-constant initializer element");
+    expr_t *constant = gen_parse_global_init(lx, type);
+    uint64_t size = type_sizeof(type);
+    if (constant->kind == EX_ADDR) {
+        if (size != 8) { cc_error("address initializer requires pointer-sized object"); return; }
+        if (g_n_data_sym_fixups >= CC_MAX_REFS) cc_fatal("too many data-symbol fixups");
+        g_data_sym_fixups[g_n_data_sym_fixups].sym_idx = (int)constant->ival;
+        g_data_sym_fixups[g_n_data_sym_fixups].data_off = (uint32_t)g_data.size;
+        g_n_data_sym_fixups++;
+        cc_buf_push64(&g_data, 0);
+        return;
     }
-    for (uint64_t i = 0; i < sz; i++) {
-        cc_buf_push8(&g_data, (uint8_t)(val >> (8 * i)));
-    }
+    uint64_t value = constant->ival;
+    for (uint64_t i = 0; i < size; i++)
+        cc_buf_push8(&g_data, (uint8_t)(value >> (8 * i)));
+
 }
 
 /* ---- Function body codegen ----------------------------------------- */
@@ -3813,6 +3854,11 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
      * (fp-frame+8, fp-frame+0), patched in once the size is known. */
     g_func.frame_size = 16;
     g_func.cur_offset = 16;
+    g_func.return_slot = 0;
+    if (ftype->ret->kind == TY_STRUCT || ftype->ret->kind == TY_UNION) {
+        g_func.cur_offset += 16;
+        g_func.return_slot = -g_func.cur_offset;
+    }
     g_func.max_call_args = 0;
     g_func.loop_depth = 0;
     g_func.n_break_fixups = 0;
@@ -3873,50 +3919,39 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
      * Locals live at fp-N, INSIDE the frame. */
     rv_add(RV_FP, RV_SP, RV_T1);
 
-    /* Store parameters from a0-a7 / fa0-fa7 to their slots.
-     * Integer params arrive in the a-regs; float/double params arrive in
-     * the fa-regs (independent register files — matching gen_call).
-     * The old code stored EVERY param from the a-regs, so any function
-     * taking a double read garbage (sqrt(4.0) computed from junk). */
+    /* Incoming stack arguments start at FP, which is the caller's SP. */
     {
-        int gp_i = 0, fp_i = 0;
+        if (g_func.return_slot) rv_sd(RV_A0, RV_FP, g_func.return_slot);
+        int gp = g_func.return_slot ? 1 : 0, fp = 0, stack = 0;
         for (int i = 0; i < ftype->nparams; i++) {
             int off = param_slots[i];
-            type_t *ptyp = ftype->params[i].type;
-            bool is_fp = is_float_type(ptyp);
-            bool is_struct = (ptyp->kind == TY_STRUCT || ptyp->kind == TY_UNION);
-            if (is_fp) {
-                if (fp_i < 8) {
-                    rv_fsd(RV_FA0 + fp_i, RV_FP, off);
-                    fp_i++;
-                }
-            } else if (is_struct) {
-                /* Struct passed BY VALUE: the register holds a POINTER to
-                 * the caller's copy — dereference into the local slot so
-                 * p.field accesses read the struct's bytes directly. */
-                if (gp_i < 8) {
-                    uint64_t sz = type_sizeof(ptyp);
-                    if (sz > 32) sz = 32;
-                    rv_addi_imm(RV_T0, RV_FP, off);       /* &local slot */
-                    for (uint64_t k = 0; k < sz; k += 8) {
-                        rv_ld(RV_T1, arg_regs[gp_i], (int)k);
-                        rv_sd(RV_T1, RV_T0, (int)k);
-                    }
-                    gp_i++;
-                }
+            type_t *type = ftype->params[i].type;
+            if (is_float_type(type)) {
+                int source;
+                if (fp < 8) source = RV_FA0 + fp++;
+                else { source = RV_FT0; rv_fld(source, RV_FP, stack); stack += 8; }
+                if (type->kind == TY_FLOAT) rv_fsw(source, RV_FP, off);
+                else rv_fsd(source, RV_FP, off);
             } else {
-                if (gp_i < 8) {
-                    uint64_t sz = type_sizeof(ptyp);
-                    switch (sz) {
-                        case 1: rv_sb(arg_regs[gp_i], RV_FP, off); break;
-                        case 2: rv_sh(arg_regs[gp_i], RV_FP, off); break;
-                        case 4: rv_sw(arg_regs[gp_i], RV_FP, off); break;
-                        default: rv_sd(arg_regs[gp_i], RV_FP, off); break;
+                int source;
+                if (gp < 8) source = RV_A0 + gp++;
+                else { source = RV_T3; rv_ld(source, RV_FP, stack); stack += 8; }
+                uint64_t size = type_sizeof(type);
+                if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
+                    rv_addi_imm(RV_T0, RV_FP, off);
+                    for (uint64_t k = 0; k < size; k++) {
+                        rv_lbu(RV_T1, source, (int)k);
+                        rv_sb(RV_T1, RV_T0, (int)k);
                     }
-                    gp_i++;
-                }
+                } else if (size == 1) rv_sb(source, RV_FP, off);
+                else if (size == 2) rv_sh(source, RV_FP, off);
+                else if (size == 4) rv_sw(source, RV_FP, off);
+                else rv_sd(source, RV_FP, off);
             }
         }
+        g_func.named_gp = gp;
+        g_func.named_fp = fp;
+        g_func.named_stack = stack;
     }
 
     /* For variadic functions: save all a0-a7 to the register save area.
@@ -4036,7 +4071,7 @@ void gen_reset_for_file(void) {
 }
 
 /* Helper: mangle a static symbol name with per-file prefix. */
-static void mangle_static_name(const char *name, char *out, size_t out_sz) {
+void mangle_static_name(const char *name, char *out, size_t out_sz) {
     int n = snprintf(out, out_sz, "__f%d_", g_opts.current_file_idx);
     size_t pos = (n < 0 || (size_t)n >= out_sz) ? 0 : (size_t)n;
     size_t name_len = strlen(name);
@@ -4052,7 +4087,7 @@ void gen_decl(decl_t *d) {
 
     /* Mangle static symbol names with per-file prefix to avoid collisions
      * when compiling multiple files into one binary. */
-    if (d->type->is_static && g_opts.n_input_files > 1) {
+    if (d->is_static && g_opts.n_input_files > 1) {
         char mangled[CC_MAX_IDENT + 16];
         mangle_static_name(name, mangled, sizeof(mangled));
         strncpy(name, mangled, CC_MAX_IDENT - 1);
@@ -4064,8 +4099,7 @@ void gen_decl(decl_t *d) {
             return;
         }
         case D_FUNC_DECL: {
-            int idx = symtab_install_global(name, SYM_FUNCTION, d->type);
-            g_globals[idx].is_defined = false;
+            symtab_install_global(name, SYM_FUNCTION, d->type);
             return;
         }
         case D_FUNC_DEF: {
@@ -4092,7 +4126,7 @@ void gen_decl(decl_t *d) {
             int idx = symtab_install_global(name, SYM_GLOBAL_VAR, d->type);
             /* Extern declarations without initializer are pure references —
              * don't allocate space; a definition elsewhere provides it. */
-            if (d->type->is_extern && !d->init) {
+            if (d->is_extern && !d->init) {
                 return;
             }
             if (d->init) {
@@ -4109,7 +4143,7 @@ void gen_decl(decl_t *d) {
                     g_globals[idx].text_off = (uint32_t)g_data.size;
                     uint32_t data_off = (uint32_t)g_data.size;
                     cc_buf_push64(&g_data, 0);
-                    if (g_n_data_sym_fixups >= 4096)
+                    if (g_n_data_sym_fixups >= CC_MAX_REFS)
                         cc_fatal("too many data-symbol fixups");
                     g_data_sym_fixups[g_n_data_sym_fixups].sym_idx = (int)d->init->ival;
                     g_data_sym_fixups[g_n_data_sym_fixups].data_off = data_off;
@@ -4134,7 +4168,7 @@ void gen_decl(decl_t *d) {
                         uint32_t data_off = (uint32_t)g_data.size;
                         cc_buf_push64(&g_data, 0);
                         /* Record fixup so gen_finalize can patch the address. */
-                        if (g_n_data_rodata_fixups >= 4096)
+                        if (g_n_data_rodata_fixups >= CC_MAX_REFS)
                             cc_fatal("too many data-rodata fixups");
                         g_data_rodata_fixups[g_n_data_rodata_fixups].rodata_off = rodata_off;
                         g_data_rodata_fixups[g_n_data_rodata_fixups].data_off = data_off;
@@ -4197,6 +4231,30 @@ void gen_finalize(const char *entry_sym) {
             } else {
                 s->vaddr = bss_vaddr + s->text_off;
             }
+        }
+    }
+
+    /* Executable references to undefined functions must not resolve to
+     * text offset zero. Translation-unit-only checks without an entry
+     * still permit external functions for later linking. */
+    int entry_index = gen_lookup_global(entry_sym);
+    if (entry_index >= 0 && g_globals[entry_index].is_defined) {
+        bool reported[CC_MAX_GLOBALS] = {0};
+        for (int i = 0; i < g_n_fixups + g_n_data_sym_fixups; i++) {
+            int index = i < g_n_fixups ? g_fixups[i].sym_idx : g_data_sym_fixups[i - g_n_fixups].sym_idx;
+            if (index >= 0 && index < g_n_globals && !reported[index] &&
+                g_globals[index].kind == SYM_FUNCTION && !g_globals[index].is_defined) {
+                cc_error("undefined function: %s", g_globals[index].name);
+                reported[index] = true;
+            }
+        }
+    }
+
+    if (g_opts.verbose) {
+        for (int i = 0; i < g_n_globals; i++) {
+            if (g_globals[i].kind == SYM_FUNCTION && g_globals[i].is_defined)
+                fprintf(stderr, "map %s 0x%llx\n", g_globals[i].name,
+                        (unsigned long long)g_globals[i].vaddr);
         }
     }
 
@@ -4263,7 +4321,7 @@ void gen_finalize(const char *entry_sym) {
 
     /* Determine entry point. */
     if (g_entry == 0) {
-        int idx = symtab_lookup_global(entry_sym ? entry_sym : "_start");
+        int idx = gen_lookup_global(entry_sym ? entry_sym : "_start");
         if (idx >= 0 && g_globals[idx].kind == SYM_FUNCTION) {
             g_entry = g_globals[idx].vaddr;
         } else {

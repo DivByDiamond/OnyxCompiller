@@ -31,79 +31,121 @@
 #define SEEK_END 2
 
 static long _write(int fd, const void *buf, unsigned long n) {
-    return __ecall3(SYS_write, fd, (long)buf, n);
+    return __ecall4(SYS_write, fd, (long)buf, n);
 }
 
 static long _read(int fd, void *buf, unsigned long n) {
-    return __ecall3(SYS_read, fd, (long)buf, n);
+    return __ecall4(SYS_read, fd, (long)buf, n);
 }
 
 static void _exit(int code) {
-    __ecall1(SYS_exit, code);
+    __ecall2(SYS_exit, code);
     for (;;) { }
 }
 
 static long _open(const char *path, int flags) {
-    /* OnyxOS SYS_open(path, flags, mode) — we use flags=0 (read). */
-    (void)flags;
-    return __ecall3(SYS_open, (long)path, 0, 0);
+    return __ecall4(SYS_open, (long)path, flags, 0666);
 }
 
 static long _close(int fd) {
-    return __ecall1(SYS_close, fd);
+    return __ecall2(SYS_close, fd);
 }
 
 static long _lseek(int fd, long off, int whence) {
-    return __ecall3(SYS_lseek, fd, off, whence);
+    return __ecall4(SYS_lseek, fd, off, whence);
 }
 
-/* ---- Heap (sbrk-based) ---- */
-static char *_heap = NULL;
-static char *_heap_end = NULL;
+/* ---- Reusable single-threaded heap (16-byte payload alignment) ---- */
+typedef struct heap_block heap_block_t;
+struct heap_block {
+    unsigned long size;
+    heap_block_t *next;
+    heap_block_t *previous;
+    long available;
+};
+static heap_block_t *heap_first;
+static heap_block_t *heap_last;
 
-static void _heap_init(void) {
-    if (!_heap) {
-        long base = __ecall1(SYS_sbrk, 0);
-        _heap = (char *)base;
-        _heap_end = _heap;
-    }
+static void heap_merge(heap_block_t *b) {
+    heap_block_t *next = b->next;
+    if (!next || !next->available || (char *)(b + 1) + b->size != (char *)next) return;
+    b->size += sizeof(heap_block_t) + next->size;
+    b->next = next->next;
+    if (b->next) b->next->previous = b;
+    else heap_last = b;
+}
+
+static void heap_split(heap_block_t *b, unsigned long n) {
+    if (b->size - n < sizeof(heap_block_t) + 16) return;
+    heap_block_t *rest = (heap_block_t *)((char *)(b + 1) + n);
+    rest->size = b->size - n - sizeof(heap_block_t);
+    rest->next = b->next;
+    rest->previous = b;
+    rest->available = 1;
+    if (rest->next) rest->next->previous = rest;
+    else heap_last = rest;
+    b->next = rest;
+    b->size = n;
+    heap_merge(rest);
 }
 
 void *malloc(unsigned long n) {
-    _heap_init();
+    if (n > 9223372036854775807UL - sizeof(heap_block_t) - 65551) return NULL;
+    if (!n) n = 1;
     n = (n + 15) & ~15UL;
-    if (_heap + n > _heap_end) {
-        long inc = (long)(n - (_heap_end - _heap));
-        inc = (inc + 0xFFFF) & ~0xFFFFL;
-        long r = __ecall1(SYS_sbrk, inc);
-        if ((long)r < 0) return NULL;
-        _heap_end += inc;
+    heap_block_t *b = heap_first;
+    while (b && (!b->available || b->size < n)) b = b->next;
+    if (!b) {
+        /* Arena chunks are 64 KiB plus a small header. Rounding every
+         * such request to 128 KiB leaves a remainder too small for the
+         * next arena chunk and nearly doubles compiler memory use. */
+        unsigned long extent = (n + sizeof(heap_block_t) + 4095) & ~4095UL;
+        if (extent < 65536) extent = 65536;
+        long memory = __ecall2(SYS_sbrk, extent + 15);
+        if (memory <= 0) return NULL;
+        b = (heap_block_t *)(((unsigned long)memory + 15) & ~15UL);
+        b->size = extent - sizeof(heap_block_t);
+        b->next = NULL;
+        b->previous = heap_last;
+        b->available = 1;
+        if (heap_last) heap_last->next = b;
+        else heap_first = b;
+        heap_last = b;
     }
-    void *p = _heap;
-    _heap += n;
-    return p;
+    heap_split(b, n);
+    b->available = 0;
+    return b + 1;
 }
 
-void free(void *p) { (void)p; }
+void free(void *p) {
+    if (!p) return;
+    heap_block_t *b = (heap_block_t *)p - 1;
+    b->available = 1;
+    heap_merge(b);
+    if (b->previous && b->previous->available) heap_merge(b->previous);
+}
 
 void *calloc(unsigned long n, unsigned long sz) {
+    if (sz && n > (unsigned long)-1 / sz) return NULL;
     unsigned long total = n * sz;
-    void *p = malloc(total);
-    if (p) {
-        char *q = (char *)p;
-        for (unsigned long i = 0; i < total; i++) q[i] = 0;
-    }
+    char *p = (char *)malloc(total);
+    if (p) for (unsigned long i = 0; i < total; i++) p[i] = 0;
     return p;
 }
 
 void *realloc(void *p, unsigned long n) {
-    void *q = malloc(n);
-    if (q && p) {
-        /* We don't track old size; copy n bytes (over-read is OK for our use). */
-        char *d = (char *)q;
-        char *s = (char *)p;
-        for (unsigned long i = 0; i < n; i++) d[i] = s[i];
-    }
+    if (!p) return malloc(n);
+    if (!n) { free(p); return NULL; }
+    if (n > 9223372036854775807UL - sizeof(heap_block_t) - 65551) return NULL;
+    heap_block_t *b = (heap_block_t *)p - 1;
+    unsigned long old_size = b->size;
+    unsigned long rounded = (n + 15) & ~15UL;
+    heap_merge(b);
+    if (b->size >= rounded) { heap_split(b, rounded); return p; }
+    char *q = (char *)malloc(n);
+    if (!q) return NULL;
+    for (unsigned long i = 0; i < old_size; i++) q[i] = ((char *)p)[i];
+    free(p);
     return q;
 }
 
@@ -117,8 +159,11 @@ unsigned long strlen(const char *s) {
 }
 
 int strcmp(const char *a, const char *b) {
-    while (*a && *a == *b) { a++; b++; }
-    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+    for (;;) {
+        unsigned char x = (unsigned char)*a++;
+        unsigned char y = (unsigned char)*b++;
+        if (x != y || !x) return (int)x - (int)y;
+    }
 }
 
 int strncmp(const char *a, const char *b, unsigned long n) {
@@ -180,16 +225,46 @@ char *strdup(const char *s) {
     return p;
 }
 
+/* may_alias keeps word operations valid on object representations when
+ * building this freestanding shim with GCC/Clang as well as OnyxCC. */
+typedef unsigned long shim_word_t __attribute__((__may_alias__));
+
 void *memcpy(void *d, const void *s, unsigned long n) {
     char *dp = (char *)d;
     const char *sp = (const char *)s;
-    for (unsigned long i = 0; i < n; i++) dp[i] = sp[i];
+    while (n && ((unsigned long)dp & 7)) { *dp++ = *sp++; n--; }
+    if (!n) return d;
+    if (!((unsigned long)sp & 7)) {
+        shim_word_t *dw = (shim_word_t *)dp;
+        const shim_word_t *sw = (const shim_word_t *)sp;
+        while (n >= 32) {
+            dw[0] = sw[0]; dw[1] = sw[1]; dw[2] = sw[2]; dw[3] = sw[3];
+            dw += 4; sw += 4; n -= 32;
+        }
+        while (n >= 8) { *dw++ = *sw++; n -= 8; }
+        dp = (char *)dw;
+        sp = (const char *)sw;
+    }
+    while (n) { *dp++ = *sp++; n--; }
     return d;
 }
 
 void *memset(void *d, int c, unsigned long n) {
     char *dp = (char *)d;
-    for (unsigned long i = 0; i < n; i++) dp[i] = (char)c;
+    while (n && ((unsigned long)dp & 7)) { *dp++ = (char)c; n--; }
+    if (!n) return d;
+    shim_word_t word = (unsigned char)c;
+    word |= word << 8;
+    word |= word << 16;
+    word |= word << 32;
+    shim_word_t *dw = (shim_word_t *)dp;
+    while (n >= 32) {
+        dw[0] = word; dw[1] = word; dw[2] = word; dw[3] = word;
+        dw += 4; n -= 32;
+    }
+    while (n >= 8) { *dw++ = word; n -= 8; }
+    dp = (char *)dw;
+    while (n) { *dp++ = (char)c; n--; }
     return d;
 }
 
@@ -279,7 +354,14 @@ static FILE _stdout_obj = { 1 };
 FILE *stdout;
 
 FILE *fopen(const char *path, const char *mode) {
-    int fd = (int)_open(path, 0);
+    if (!path || !mode || !mode[0]) return NULL;
+    int flags;
+    if (mode[0] == 'r') flags = 0;
+    else if (mode[0] == 'w') flags = 1 | 64 | 512;
+    else if (mode[0] == 'a') flags = 1 | 64 | 1024;
+    else return NULL;
+    if (strchr(mode, '+')) flags = (flags & ~3) | 2;
+    int fd = (int)_open(path, flags);
     if (fd < 0) return NULL;
     FILE *f = (FILE *)malloc(sizeof(FILE));
     if (!f) { _close(fd); return NULL; }
@@ -296,19 +378,29 @@ int fclose(FILE *f) {
 }
 
 unsigned long fread(void *buf, unsigned long sz, unsigned long n, FILE *f) {
-    long r = _read(f->fd, buf, sz * n);
-    if (r < 0) return 0;
-    return (unsigned long)r / sz;
+    if (!sz || !n || n > (unsigned long)-1 / sz) return 0;
+    unsigned long total = sz * n, done = 0;
+    while (done < total) {
+        long r = _read(f->fd, (char *)buf + done, total - done);
+        if (r <= 0) break;
+        done += (unsigned long)r;
+    }
+    return done / sz;
 }
 
 unsigned long fwrite(const void *buf, unsigned long sz, unsigned long n, FILE *f) {
-    long r = _write(f->fd, buf, sz * n);
-    if (r < 0) return 0;
-    return (unsigned long)r / sz;
+    if (!sz || !n || n > (unsigned long)-1 / sz) return 0;
+    unsigned long total = sz * n, done = 0;
+    while (done < total) {
+        long r = _write(f->fd, (const char *)buf + done, total - done);
+        if (r <= 0) break;
+        done += (unsigned long)r;
+    }
+    return done / sz;
 }
 
 int fseek(FILE *f, long off, int whence) {
-    return (int)_lseek(f->fd, off, whence);
+    return _lseek(f->fd, off, whence) < 0 ? -1 : 0;
 }
 
 long ftell(FILE *f) {
@@ -517,21 +609,31 @@ int getopt_long(int argc, char *const argv[], const char *optstring,
         return '?';
     }
 
-    /* Short option. */
+    /* Consume a whole short option before advancing optind. */
     char c = arg[_optpos++];
-    if (arg[_optpos] == 0) { optind++; _optpos = 1; }
     const char *p = strchr(optstring, c);
-    if (!p) return '?';
+    if (!p || c == ':') {
+        optopt = c;
+        if (!arg[_optpos]) { optind++; _optpos = 1; }
+        return '?';
+    }
     if (p[1] == ':') {
-        if (arg[_optpos] != 0) {
+        if (arg[_optpos]) {
             optarg = arg + _optpos;
             optind++;
-            _optpos = 1;
         } else if (optind + 1 < argc) {
-            optarg = argv[++optind];
+            optarg = argv[optind + 1];
+            optind += 2;
+        } else {
             optind++;
             _optpos = 1;
-        } else return '?';
+            optopt = c;
+            return '?';
+        }
+        _optpos = 1;
+    } else if (!arg[_optpos]) {
+        optind++;
+        _optpos = 1;
     }
     return c;
 }

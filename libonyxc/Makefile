@@ -20,7 +20,7 @@ CC      ?= gcc
 CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-stringop-truncation -Wno-nonnull-compare -fno-builtin-vscanf -fno-builtin-vprintf -fno-builtin-vfprintf -O2 -g
 
 # Files that use inline asm (RISC-V only) — excluded from host-check.
-PORTABLE_SRCS = src/io/stdio.c src/io/stdlib.c src/io/string.c src/ctype/ctype.c src/io/time.c src/io/strerror.c
+PORTABLE_SRCS = src/convert/strtod.c src/format/float.c src/process/runtime.c src/math/ieee.c src/locale/locale.c src/memory/alloc.c src/io/stdio.c src/io/stdlib.c src/io/string.c src/ctype/ctype.c src/io/time.c src/io/strerror.c
 
 .PHONY: all clean
 
@@ -31,4 +31,4 @@ all: $(PORTABLE_SRCS:.c=.o)
 	$(CC) $(CFLAGS) -Iinclude/core -Iinclude/io -Iinclude/ctype -c -o $@ $<
 
 clean:
-	rm -f *.o src/core/*.o src/io/*.o src/ctype/*.o
+	rm -f *.o src/core/*.o src/io/*.o src/ctype/*.o src/memory/*.o src/math/*.o src/locale/*.o src/process/*.o src/format/*.o src/convert/*.o

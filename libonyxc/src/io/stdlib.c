@@ -4,61 +4,16 @@
  * Adds: strtoul, strtoll, strtoull, strtod, qsort, bsearch, labs, llabs,
  * itoa, atexit, environ_get.
  *
- * malloc is still a simple bump allocator on top of sbrk(); free is a no-op
- * (memory is reclaimed only on process exit). Suitable for short-lived CLI
- * tools; for long-running processes a real allocator should be added later.
+ * Heap allocation lives in ../memory/alloc.c.
  */
 #include "onyxc.h"
 
 extern char **environ;
 
-static void *g_heap_ptr = NULL;
-static void *g_heap_end = NULL;
-
-static void heap_init(void) {
-    if (!g_heap_ptr) {
-        g_heap_ptr = _onyx_sbrk(0);
-        g_heap_end = g_heap_ptr;
-    }
-}
-
-void *malloc(size_t n) {
-    heap_init();
-    n = (n + 15) & ~15UL;
-    if ((char *)g_heap_ptr + n > (char *)g_heap_end) {
-        long inc = (long)(n - ((char *)g_heap_end - (char *)g_heap_ptr));
-        inc = (inc + 0xFFFF) & ~0xFFFFL;
-        void *new_end = _onyx_sbrk(inc);
-        if (new_end == (void *)-1 || new_end == NULL) return NULL;
-        g_heap_end = (char *)new_end + inc;
-    }
-    void *p = g_heap_ptr;
-    g_heap_ptr = (char *)g_heap_ptr + n;
-    return p;
-}
-
-void free(void *p) { (void)p; }
-
-void *calloc(size_t n, size_t sz) {
-    size_t total = n * sz;
-    void *p = malloc(total);
-    if (p) memset(p, 0, total);
-    return p;
-}
-
-void *realloc(void *p, size_t n) {
-    void *q = malloc(n);
-    if (q && p) {
-        memcpy(q, p, n);
-    }
-    return q;
-}
-
 void exit(int code) {
     /* Flush stdio buffers before terminating — without this every
      * buffered printf() output was silently lost. */
-    fflush(stdout);
-    fflush(stderr);
+    fflush(NULL);
     /* Run atexit handlers in reverse order. */
     extern int atexit_run_handlers(void);
     atexit_run_handlers();
@@ -167,42 +122,6 @@ unsigned long long strtoull(const char *s, char **endp, int base) {
     return v;
 }
 
-double strtod(const char *s, char **endp) {
-    double v = 0.0;
-    double sign = 1.0;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { sign = -1.0; s++; }
-    else if (*s == '+') s++;
-    while (*s >= '0' && *s <= '9') {
-        v = v * 10.0 + (double)(*s - '0');
-        s++;
-    }
-    if (*s == '.') {
-        s++;
-        double scale = 0.1;
-        while (*s >= '0' && *s <= '9') {
-            v += (double)(*s - '0') * scale;
-            scale *= 0.1;
-            s++;
-        }
-    }
-    if (*s == 'e' || *s == 'E') {
-        s++;
-        int esign = 1;
-        if (*s == '-') { esign = -1; s++; }
-        else if (*s == '+') s++;
-        int e = 0;
-        while (*s >= '0' && *s <= '9') {
-            e = e * 10 + (*s - '0');
-            s++;
-        }
-        double mult = 1.0;
-        for (int i = 0; i < e; i++) mult *= 10.0;
-        if (esign < 0) v /= mult; else v *= mult;
-    }
-    if (endp) *endp = (char *)s;
-    return v * sign;
-}
 
 /* ── Environment ──────────────────────────────────────────────────────── */
 
@@ -221,7 +140,10 @@ char *getenv(const char *name) {
 }
 
 int setenv(const char *name, const char *value, int overwrite) {
-    if (!name || !value) return -1;
+    if (!name || !*name || strchr(name, '=') || !value) {
+        errno = EINVAL;
+        return -1;
+    }
     if (!overwrite && getenv(name)) return 0;
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
@@ -233,10 +155,16 @@ int setenv(const char *name, const char *value, int overwrite) {
     buf[name_len + 1 + value_len] = 0;
     int count = 0;
     if (environ) {
-        while (environ[count]) count++;
+        while (environ[count]) {
+            if (strncmp(environ[count], name, name_len) == 0 && environ[count][name_len] == '=') {
+                environ[count] = buf;
+                return 0;
+            }
+            count++;
+        }
     }
     char **new_env = malloc((size_t)(count + 2) * sizeof(char *));
-    if (!new_env) return -1;
+    if (!new_env) { free(buf); return -1; }
     for (int i = 0; i < count; i++) new_env[i] = environ[i];
     new_env[count] = buf;
     new_env[count + 1] = NULL;
@@ -245,7 +173,8 @@ int setenv(const char *name, const char *value, int overwrite) {
 }
 
 int unsetenv(const char *name) {
-    if (!environ || !name) return -1;
+    if (!name || !*name || strchr(name, '=')) { errno = EINVAL; return -1; }
+    if (!environ) return 0;
     size_t name_len = strlen(name);
     char **dst = environ;
     for (char **src = environ; *src; src++) {
