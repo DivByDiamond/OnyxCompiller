@@ -28,7 +28,7 @@ static void rejected(int which) {
     if (!child) {
         cc_arena_t arena;
         cc_arena_init(&arena, 1024);
-        (void)freopen("/dev/null", "w", stderr);
+        if (!freopen("/dev/null", "w", stderr)) _exit(100);
         if (which == 0) cc_arena_alloc(&arena, 1, 3);
         if (which == 1) cc_arena_alloc(&arena, (size_t)-1, 2);
         if (which == 2) cc_arena_alloc(&arena, 1025, 1);
