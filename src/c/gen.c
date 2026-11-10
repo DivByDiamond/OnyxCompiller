@@ -26,6 +26,8 @@
 #include "core/types.h"
 #include "front/ast.h"
 #include "back/gen.h"
+#include "back/val.h"
+#include "cpp/cpp.h"
 #include "arch/riscv64.h"
 #include "arch/context.h"
 #include "front/parser_priv.h"
@@ -44,35 +46,18 @@ typedef struct {
 static rodata_fixup_t g_rodata_fixups[CC_MAX_REFS];
 static int g_n_rodata_fixups = 0;
 
-/* ---- Value descriptor ------------------------------------------------ */
-typedef enum {
-    VAL_REG,    /* value in .reg */
-    VAL_IMM,    /* constant in .imm */
-    VAL_SYM,    /* symbol: .sym_idx + .offset */
-    VAL_LVAL,   /* address in .reg + .offset */
-    VAL_SPILL,  /* address stored at [fp + .offset] (assignment-lhs spill) */
-    VAL_SPILL_F, /* FLOAT VALUE stored at [fp + .offset] (binop lhs spill) */
-    VAL_SPILL_I, /* INT VALUE stored at [fp + .offset] (binop lhs spill) */
-} val_kind_t;
-
-typedef struct {
-    val_kind_t kind;
-    type_t *type;
-    int reg;
-    int64_t imm;
-    double fval;     /* for float/double constants */
-    int sym_idx;     /* for VAL_SYM */
-    int64_t offset;  /* for VAL_SYM/VAL_LVAL */
-} val_t;
+/* Value descriptor (val_kind_t / val_t) lives in back/val.h — shared
+ * with the C++ front-end module (Phase A move). */
 
 /* Forward declarations. */
 static val_t parse_assign(lexer_t *lx);
-static val_t parse_expr(lexer_t *lx);
-static void parse_stmt(lexer_t *lx);
+val_t parse_expr(lexer_t *lx);
+void parse_stmt(lexer_t *lx);
 static void parse_stmt_body(lexer_t *lx);
 static val_t parse_primary(lexer_t *lx);
 static val_t parse_unary(lexer_t *lx);
 static void patch_jal(uint32_t off, int32_t delta);
+static void patch_branch(uint32_t off, int32_t delta);
 static void patch_sd_imm(uint32_t off, int32_t imm);
 static void parse_asm(lexer_t *lx);
 /* Current function name — for static-local mangling. */
@@ -236,6 +221,20 @@ static void label_check_unresolved(void) {
     }
 }
 
+/* ---- Exported label/branch helpers (C++ statement lowering) --------- */
+void gen_label_here(const char *name) { label_define(name); }
+void gen_jump_to(const char *name) { label_emit_jump(name); }
+
+uint32_t gen_emit_bne(int rs1, int rs2) {
+    uint32_t off = (uint32_t)g_text.size;
+    rv_bne(rs1, rs2, 0);
+    return off;
+}
+
+void gen_patch_here(uint32_t off) {
+    patch_branch(off, (int32_t)((int32_t)g_text.size - (int32_t)off));
+}
+
 /* ---- Helpers --------------------------------------------------------- */
 static int alloc_int_reg(void) {
     /* We use t0/t1/t2 for intermediates, a0 for return values, t3-t6 for
@@ -247,7 +246,7 @@ static int alloc_int_reg(void) {
 /* Forward decl. */
 static void emit_load_global_addr(int reg, int sym_idx, int64_t add_off);
 
-static void materialize(val_t *v, int reg) {
+void materialize(val_t *v, int reg) {
     /* Force v into reg. */
     switch (v->kind) {
         case VAL_IMM:
@@ -308,7 +307,7 @@ static void materialize(val_t *v, int reg) {
     }
 }
 
-static void load_value(val_t *v, int reg) {
+void load_value(val_t *v, int reg) {
     if (v->kind == VAL_SPILL_I) {
         /* Reload the spilled int value. */
         if (v->type && (v->type->kind == TY_ARRAY || v->type->kind == TY_FUNC)) {
@@ -558,9 +557,10 @@ bool is_type_start(lexer_t *lx) {
         case T_KW_BOOL:
             return true;
         case T_IDENT: {
-            /* Could be a typedef name. */
+            /* Could be a typedef name (or a class tag in a .cpp file). */
             int idx = gen_lookup_global(lx->cur.text);
             if (idx >= 0 && g_globals[idx].kind == SYM_TYPEDEF) return true;
+            if (g_cpp_mode && cpp_type_by_name(lx->cur.text)) return true;
             return false;
         }
         default:
@@ -738,6 +738,15 @@ type_t *parse_type_spec(lexer_t *lx) {
                     lex_next(lx);
                     break;
                 }
+                /* C++ class tag used as a bare type name (`Foo v;`). */
+                if (g_cpp_mode) {
+                    type_t *ct = cpp_type_by_name(lx->cur.text);
+                    if (ct) {
+                        base = ct;
+                        lex_next(lx);
+                        break;
+                    }
+                }
                 /* Not a typedef — stop here; apply any long/short/etc. */
                 goto finish_type_spec;
             }
@@ -907,7 +916,55 @@ static void convert_scalar(val_t *value, type_t *target) {
 }
 
 /* ---- Function call codegen ------------------------------------------ */
-static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *callee) {
+void gen_call0(int fn_sym_idx, val_t *hidden_this) {
+    if (hidden_this) load_value(hidden_this, RV_A0);
+    emit_load_global_addr(RV_T0, fn_sym_idx, 0);
+    rv_jalr(RV_RA, RV_T0, 0);
+}
+
+val_t gen_call1(int fn_sym_idx, type_t *fn_type, val_t *arg0) {
+    load_value(arg0, RV_A0);
+    emit_load_global_addr(RV_T0, fn_sym_idx, 0);
+    rv_jalr(RV_RA, RV_T0, 0);
+    val_t r;
+    memset(&r, 0, sizeof(r));
+    r.kind = VAL_REG;
+    r.reg = RV_A0;
+    r.type = fn_type ? fn_type->ret : &ty_int;
+    return r;
+}
+
+void gen_load_symbol_addr(int reg, int sym_idx) {
+    emit_load_global_addr(reg, sym_idx, 0);
+}
+
+int gen_reserve_data_symbol(const char *name) {
+    type_t *t = type_make_ptr(&ty_void);
+    int idx = symtab_install_global(name, SYM_GLOBAL_VAR, t);
+    g_globals[idx].is_defined = true;
+    g_globals[idx].text_off = 0;
+    return idx;
+}
+
+void gen_fill_vtable(int sym_idx, const int *fn_syms, int n) {
+    if (n <= 0) n = 1;
+    uint32_t base_off = (uint32_t)g_data.size;
+    for (int i = 0; i < n; i++) {
+        uint32_t off = (uint32_t)g_data.size;
+        cc_buf_push64(&g_data, 0);
+        if (fn_syms && fn_syms[i] >= 0) {
+            if (g_n_data_sym_fixups >= CC_MAX_REFS)
+                cc_fatal("too many data-symbol fixups");
+            g_data_sym_fixups[g_n_data_sym_fixups].sym_idx = fn_syms[i];
+            g_data_sym_fixups[g_n_data_sym_fixups].data_off = off;
+            g_n_data_sym_fixups++;
+        }
+    }
+    g_globals[sym_idx].text_off = base_off;
+}
+
+val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *callee,
+               val_t *hidden_this) {
     /* Parse args. Each argument is evaluated and immediately SPILLED to a
      * stack slot; the a0-a7 registers are loaded from those slots only
      * after every argument has been parsed. Without this, an argument
@@ -927,14 +984,39 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
     int64_t arg_slots[CC_MAX_FUNC_PARAMS];
     bool arg_fp[CC_MAX_FUNC_PARAMS];
 
+    /* C++ hidden `this` (method call): pre-stage it as argument 0 so it
+     * occupies a0 and the visible arguments shift to params[1..]. Always
+     * a GP pointer. */
+    if (hidden_this) {
+        load_value(hidden_this, RV_T0);
+        g_func.cur_offset += 8;
+        g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
+        int64_t slot = -(int64_t)g_func.cur_offset;
+        if (g_func.cur_offset > g_func.frame_size)
+            g_func.frame_size = g_func.cur_offset;
+        rv_sd(RV_T0, RV_FP, (int)slot);
+        arg_slots[0] = slot;
+        arg_fp[0] = false;
+        nargs = 1;
+    }
+
     if (lx->cur.kind != T_RPAREN) {
         for (;;) {
             val_t a = parse_assign(lx);
-            if (fn_type && nargs < fn_type->nparams)
+            /* C++ reference parameter: pass the lvalue's ADDRESS instead
+             * of its loaded value (params carry is_ref on their pointer
+             * type). Detected before convert_scalar, which would load. */
+            type_t *ptype = (fn_type && nargs < fn_type->nparams)
+                            ? fn_type->params[nargs].type : NULL;
+            bool pass_ref = (ptype && ptype->is_ref &&
+                             (a.kind == VAL_LVAL || a.kind == VAL_SYM));
+            if (pass_ref) {
+                /* keep the lvalue as-is; staged below */
+            } else if (fn_type && nargs < fn_type->nparams)
                 convert_scalar(&a, fn_type->params[nargs].type);
             else if (a.type->kind == TY_FLOAT) convert_scalar(&a, &ty_double);
             if (nargs < CC_MAX_FUNC_PARAMS) {
-                bool fp = is_float_type(a.type);
+                bool fp = !pass_ref && is_float_type(a.type);
                 /* Allocate an 8-byte (16-aligned) spill slot. */
                 g_func.cur_offset += 8;
                 g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
@@ -942,8 +1024,12 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
                 if (g_func.cur_offset > g_func.frame_size) {
                     g_func.frame_size = g_func.cur_offset;
                 }
-                bool is_struct = (a.type->kind == TY_STRUCT || a.type->kind == TY_UNION);
-                if (fp) {
+                bool is_struct = !pass_ref &&
+                                 (a.type->kind == TY_STRUCT || a.type->kind == TY_UNION);
+                if (pass_ref) {
+                    materialize(&a, RV_T0);   /* address (VAL_LVAL) */
+                    rv_sd(RV_T0, RV_FP, (int)slot);
+                } else if (fp) {
                     load_float_value(&a, RV_FT0);
                     rv_fsd(RV_FT0, RV_FP, (int)slot);
                 } else if (is_struct) {
@@ -1036,7 +1122,7 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *calle
  * slot — the mirror of spill_freg for the integer side. Without it, an int
  * lhs already materialized in T0 was destroyed by RHS sub-evaluation
  * (2*i*(2*i+1) degenerated to x*x). */
-static void spill_ireg(val_t *v) {
+void spill_ireg(val_t *v) {
     if (v->kind != VAL_REG) return;
     if (is_float_type(v->type)) return;
     g_func.cur_offset += 8;
@@ -1088,7 +1174,7 @@ static void spill_freg(val_t *v) {
 /* Spill an LVAL's address register to a stack slot, converting it to
  * VAL_SPILL. Protects the value across subsequent expression evaluation
  * (no register allocator). No-op for non-scratch LVALs. */
-static void spill_lval(val_t *v) {
+void spill_lval(val_t *v) {
     if (v->kind != VAL_LVAL || v->reg == RV_FP) return;
     g_func.cur_offset += 8;
     g_func.cur_offset = (g_func.cur_offset + 15) & ~15;
@@ -1182,15 +1268,33 @@ static val_t parse_postfix(lexer_t *lx, val_t v) {
                         if (strcmp(st->fields[i].name, mname) == 0) { fi = i; break; }
                     }
                     if (fi < 0) {
+                        /* C++ seam: method-group lookup (marker val, Phase B)
+                         * — continue the postfix loop on success, else the
+                         * normal C error below fires unchanged. */
+                        if (g_cpp_mode && cpp_try_member(lx, &v, is_arrow, mname, st)) {
+                            continue;
+                        }
                         cc_error("no member '%s' in struct", mname);
                         break;
                     }
+                    /* C++ seam: private/protected member reached from a
+                     * context that may not touch it (Phase B). */
+                    if (g_cpp_mode) cpp_check_field_access(lx, mname, st);
                     if (is_arrow) {
-                        /* v is pointer; load address into T0. */
-                        load_value(&v, RV_T0);
-                        v.kind = VAL_LVAL;
-                        v.reg = RV_T0;
-                        v.offset = (int64_t)st->fields[fi].offset;
+                        /* C++: an object reached through a reference (or any
+                         * struct-typed lvalue) already holds its ADDRESS in
+                         * the register — do not dereference it again. */
+                        if (g_cpp_mode && v.kind == VAL_LVAL &&
+                            (v.type->kind == TY_STRUCT || v.type->kind == TY_UNION)) {
+                            v.kind = VAL_LVAL;
+                        } else {
+                            /* v is pointer; load address into T0. */
+                            load_value(&v, RV_T0);
+                            v.kind = VAL_LVAL;
+                            v.reg = RV_T0;
+                            v.offset = 0;
+                        }
+                        v.offset += (int64_t)st->fields[fi].offset;
                     } else {
                         /* v is the struct value (must be LVAL/SYM). */
                         if (v.kind == VAL_SYM) {
@@ -1203,6 +1307,12 @@ static val_t parse_postfix(lexer_t *lx, val_t v) {
                     continue;
                 }
                 if (lx->cur.kind == T_LPAREN) {
+                    /* C++ seam: method/overload resolution on a method-group
+                     * marker (Phase B) — false for plain calls, which fall
+                     * through to the normal C handling below. */
+                    if (g_cpp_mode && cpp_try_call(lx, &v)) {
+                        continue;
+                    }
                     /* Postfix call on a value: e.g. func_ptr(args), arr[i](args). */
                     type_t *ft = NULL;
                     if (v.type->kind == TY_PTR && v.type->base && v.type->base->kind == TY_FUNC) {
@@ -1217,7 +1327,7 @@ static val_t parse_postfix(lexer_t *lx, val_t v) {
                     /* The callee address must survive argument evaluation. */
                     spill_lval(&v);
                     spill_ireg(&v);
-                    v = gen_call(lx, -1, ft, &v);
+                    v = gen_call(lx, -1, ft, &v, NULL);
                     continue;
                 }
                 if (lx->cur.kind == T_INC || lx->cur.kind == T_DEC) {
@@ -1268,6 +1378,11 @@ static val_t parse_primary(lexer_t *lx) {
     val_t v;
     memset(&v, 0, sizeof(v));
     v.type = &ty_int;
+
+    /* C++ seam: nullptr/this/new/casts/functional-cast and bare-member
+     * fallback (see cpp/cpp.h — returns false in Phase A and for any
+     * token the C path handles). */
+    if (g_cpp_mode && cpp_try_primary(lx, &v)) return parse_postfix(lx, v);
 
     switch (lx->cur.kind) {
         case T_INT: case T_LONG: case T_UINT: case T_ULONG: {
@@ -1594,7 +1709,7 @@ static val_t parse_primary(lexer_t *lx) {
                         callee.kind = VAL_SYM;
                         callee.sym_idx = gidx;
                         callee.type = gt;
-                        return parse_postfix(lx, gen_call(lx, -1, gt->base, &callee));
+                        return parse_postfix(lx, gen_call(lx, -1, gt->base, &callee, NULL));
                     }
                     lidx = -1;
                 }
@@ -1607,7 +1722,7 @@ static val_t parse_primary(lexer_t *lx) {
                     callee.kind = VAL_SYM;
                     callee.sym_idx = g_n_globals + lidx;
                     callee.type = g_locals[lidx].type;
-                    return parse_postfix(lx, gen_call(lx, -1, ft, &callee));
+                    return parse_postfix(lx, gen_call(lx, -1, ft, &callee, NULL));
                 }
 
                 int idx = gen_lookup_global(name);
@@ -1628,7 +1743,7 @@ static val_t parse_primary(lexer_t *lx) {
                     callee.kind = VAL_SYM;
                     callee.sym_idx = idx;
                     callee.type = g_globals[idx].type;
-                    return parse_postfix(lx, gen_call(lx, -1, ft, &callee));
+                    return parse_postfix(lx, gen_call(lx, -1, ft, &callee, NULL));
                 }
 
                 if (idx < 0) {
@@ -1638,7 +1753,7 @@ static val_t parse_primary(lexer_t *lx) {
                     g_globals[idx].is_defined = false;
                 }
                 type_t *ft = g_globals[idx].type;
-                return parse_postfix(lx, gen_call(lx, idx, ft, NULL));
+                return parse_postfix(lx, gen_call(lx, idx, ft, NULL, NULL));
             }
 
             /* __func__ — the enclosing function's name as a string. */
@@ -2439,7 +2554,7 @@ static val_t parse_assign(lexer_t *lx) {
     return lhs;
 }
 
-static val_t parse_expr(lexer_t *lx) {
+val_t parse_expr(lexer_t *lx) {
     lexer_t *saved_g_lx = g_lx;
     g_lx = lx;
     val_t v = parse_assign(lx);
@@ -2625,6 +2740,9 @@ static void parse_asm(lexer_t *lx) {
 }
 
 static void parse_stmt_body(lexer_t *lx) {
+    /* C++ seam: try/catch/throw statements (Phase E); false -> C path. */
+    if (g_cpp_mode && cpp_try_stmt(lx)) return;
+
     cc_pos_t pos = lx->cur.pos;
 
     /* Label: identifier : */
@@ -2656,6 +2774,21 @@ static void parse_stmt_body(lexer_t *lx) {
             return;
         }
         for (;;) {
+            /* C++ ctor seam (spec item 4): `Foo x(1,2);` would let
+             * parse_declarator swallow "(...)" as function params. Peek
+             * '(' after the declarator name BEFORE parse_declarator runs;
+             * stubs return false -> the normal C declarator path (and
+             * qualified/typedef decls) is untouched. */
+            if (g_cpp_mode && !is_typedef && !is_extern && !is_static &&
+                lx->cur.kind == T_IDENT) {
+                lex_peek(lx);
+                if (lx->next.kind == T_LPAREN &&
+                    cpp_is_ctor_call_site(lx, base) &&
+                    cpp_local_ctor_decl(lx, base)) {
+                    parse_expect(T_SEMI, "expected ';'");
+                    return;
+                }
+            }
             char name[CC_MAX_IDENT] = {0};
             /* Full declarator — supports function pointers, e.g.
              * `int (*cmp)(const void *, const void *) = my_cmp;`. */
@@ -2747,6 +2880,7 @@ static void parse_stmt_body(lexer_t *lx) {
             }
 
             /* Optional initializer. */
+            bool had_init = (lx->cur.kind == T_ASSIGN);
             if (accept(T_ASSIGN)) {
                 if (t->kind == TY_ARRAY && !deferred && lx->cur.kind == T_STRING &&
                     (t->base->kind == TY_CHAR || t->base->kind == TY_SCHAR ||
@@ -2854,6 +2988,13 @@ static void parse_stmt_body(lexer_t *lx) {
                     gen_store(&lhs, &init, T_ASSIGN);
                 }
             }
+
+            /* C++ seam: ctor/dtor registration after symbol install + init
+             * (Phase C). Not reached for typedef/extern/static declarators
+             * or for `Foo x(1,2);` (handled by cpp_local_ctor_decl above).
+             * sym_idx can be 0 when stack alloc was deferred (incomplete
+             * array) — hooks must check `t` first (see cpp/cpp.h). */
+            if (g_cpp_mode) cpp_local_decl(lx, t, idx, had_init);
 
             if (accept(T_COMMA)) continue;
             break;
@@ -3009,6 +3150,11 @@ static void parse_stmt_body(lexer_t *lx) {
                 }
             }
             parse_expect(T_SEMI, "expected ';'");
+            /* C++ seam: scope dtors before the epilogue (Phase C) —
+             * covers both `return;` and `return expr;` (shared path).
+             * Return value is already in a0/fa0/return-slot; the hook
+             * must preserve it across dtor calls (see cpp/cpp.h). */
+            if (g_cpp_mode) cpp_return_unwind(lx);
             /* Epilogue: restore fp, ra; dealloc stack; ret.
              * Return value already in a0/fa0 — keep it. */
             {
@@ -3247,7 +3393,7 @@ static void parse_stmt_body(lexer_t *lx) {
     }
 }
 
-static void parse_stmt(lexer_t *lx) {
+void parse_stmt(lexer_t *lx) {
     lexer_t *saved_g_lx = g_lx;
     g_lx = lx;
     parse_stmt_body(lx);
@@ -3260,6 +3406,9 @@ static void parse_compound(lexer_t *lx) {
     while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF) {
         parse_stmt(lx);
     }
+    /* C++ seam: emit dtors for objects leaving this scope while the
+     * scope is still active (Phase C) — before symtab_pop_scope(). */
+    if (g_cpp_mode) cpp_scope_exit(lx);
     symtab_pop_scope();
     parse_expect(T_RBRACE, "expected '}'");
 }
@@ -3845,6 +3994,9 @@ static char g_cur_func_name[CC_MAX_IDENT] = "";
 static void gen_func_body(lexer_t *lx, decl_t *d) {
     type_t *ftype = d->type;
     symtab_enter_function(ftype);
+    /* C++ seam: reset per-function ctor/dtor registry + `this` state
+     * (Phase C). */
+    if (g_cpp_mode) cpp_func_begin();
     strncpy(g_cur_func_name, d->name, CC_MAX_IDENT - 1);
     g_cur_func_name[CC_MAX_IDENT - 1] = 0;
     g_cur_func_ret = ftype->ret;
@@ -3953,6 +4105,10 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
         g_func.named_fp = fp;
         g_func.named_stack = stack;
     }
+
+    /* C++ seam: a constructor stores its class vtable pointer into
+     * `this->__vptr` once the parameters (incl. `this`) are in the frame. */
+    if (g_cpp_mode) cpp_method_prologue(lx);
 
     /* For variadic functions: save all a0-a7 to the register save area.
      * The 64-byte area MUST be allocated inside the frame (below every

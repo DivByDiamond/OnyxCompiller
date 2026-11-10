@@ -20,7 +20,7 @@
 /* ---- Limits ------------------------------------------------------------ */
 #define CC_MAX_INPUT_FILES 256
 #define CC_MAX_REFS 65536
-#define CC_LIB_SOURCE_COUNT 16
+#define CC_LIB_SOURCE_COUNT 17
 
 #define CC_MAX_TOKEN_LEN   256
 #define CC_MAX_IDENT        64

@@ -18,25 +18,46 @@
 # Cross toolchain: clang-19 + lld (auto-detected).
 
 CC      ?= gcc
+CXX     ?= g++
 CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-stringop-truncation -O2 -g
+CXXFLAGS ?= -std=c++17 -Wall -Wno-unused-function -Wno-unused-variable -Wno-attributes -O2 -g -Iinclude -Iinclude/cpp -Iinclude/core -Iinclude/front -Iinclude/back -Iinclude/arch -Iinclude/sys
 LDFLAGS ?=
 
 ONYXCC_SRCS = \
-	src/core/main.c \
-	src/core/util.c \
-	src/front/lexer.c \
-	src/back/pp.c \
-	src/back/pp_expr.c \
-	src/core/types.c \
-	src/front/ast.c \
-	src/front/parse.c \
-	src/front/constant/eval.c \
-	src/front/constant/operations.c \
-	src/front/decl.c \
-	src/back/gen.c \
+	src/c/main.c \
+	src/c/util.c \
+	src/c/lexer.c \
+	src/c/pp.c \
+	src/c/pp_expr.c \
+	src/c/types.c \
+	src/c/ast.c \
+	src/c/parse.c \
+	src/c/constant/eval.c \
+	src/c/constant/operations.c \
+	src/c/decl.c \
+	src/c/gen.c \
 	src/arch/riscv64.c \
 	src/arch/context.c \
-	src/back/emit.c
+	src/c/emit.c \
+	src/cpp/front/hooks.c \
+	src/cpp/front/expr/primary.c \
+	src/cpp/front/expr/member.c \
+	src/cpp/front/expr/alloc.c \
+	src/cpp/front/expr/ctor.c \
+	src/cpp/front/decl/ns.c \
+	src/cpp/front/decl/method.c \
+	src/cpp/front/decl/outofline.c \
+	src/cpp/front/decl/class/layout.c \
+	src/cpp/front/decl/class/class.c \
+	src/cpp/front/decl/class/top.c \
+	src/cpp/front/decl/tmpl/template.c \
+	src/cpp/front/decl/tmpl/instantiate.c \
+	src/cpp/front/stmt/eh_rt.c \
+	src/cpp/front/stmt/throw.c \
+	src/cpp/front/stmt/try.c \
+	src/cpp/tables/mangle.c \
+	src/cpp/tables/method_table.c \
+	src/cpp/tables/class_table.c
 
 ONYXCC_OBJS = $(ONYXCC_SRCS:.c=.o)
 
@@ -55,7 +76,7 @@ RISCV_FLAGS  = --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d -mcmodel=m
 
 SELFHOST_FLAGS = -DCC_FREESTANDING -N -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
 
-.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld check check-native
+.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld check check-native rust-scaffold
 
 all: $(ONYXCC) $(ONYXLD)
 
@@ -64,7 +85,7 @@ all: $(ONYXCC) $(ONYXLD)
 # Compiled natively on Linux/x86_64 for use as a host-side tool.
 ONYXLD_SRCS = src/tools/onyx-ld.c
 
-$(ONYXLD): $(ONYXLD_SRCS) include/sys/onyxo.h
+$(ONYXLD): $(ONYXLD_SRCS) include/sys/onyxo.h src/tools/onyx-ld.h
 	$(CC) $(CFLAGS) -Iinclude -Iinclude/sys -o $@ $(ONYXLD_SRCS) $(LDFLAGS)
 	@ls -la $@
 	@echo "--- onyx-ld ready"
@@ -73,7 +94,7 @@ $(ONYXCC): $(ONYXCC_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Header deps (manual — keeps the build honest without -MMD complexity).
-CCHEADERS = $(wildcard include/*.h include/*/*.h src/front/constant/*.h)
+CCHEADERS = $(wildcard include/*.h include/*/*.h src/front/constant/*.h include/cpp/*.h)
 
 %.o: %.c $(CCHEADERS)
 	$(CC) $(CFLAGS) -Iinclude -Iinclude/core -Iinclude/front -Iinclude/back -Iinclude/arch -Iinclude/sys -c -o $@ $<
@@ -82,10 +103,10 @@ CCHEADERS = $(wildcard include/*.h include/*/*.h src/front/constant/*.h)
 # Uses clang-19 + lld with a freestanding libc shim (src/shim.c).
 onyxcc-riscv: onyxcc.riscv.elf
 
-onyxcc.riscv.elf: $(ONYXCC_SRCS) src/core/shim.c linker_onyx.ld
+onyxcc.riscv.elf: $(ONYXCC_SRCS) src/c/shim.c linker_onyx.ld
 	$(CLANG) $(RISCV_FLAGS) \
 	-Wl,-T,linker_onyx.ld -Wl,--gc-sections -Wl,--strip-all -Wl,-n \
-	$(ONYXCC_SRCS) src/core/shim.c -o $@
+	$(ONYXCC_SRCS) src/c/shim.c -o $@
 	@ls -la $@
 	@echo "--- onyxcc.riscv.elf ready. Convert to .onx with: make onyxcc-onx"
 
@@ -131,7 +152,7 @@ selfhost-test: $(ONYXCC)
 
 # Full self-hosting build (stage-1): produces an .onx binary.
 selfhost: $(ONYXCC)
-	./$(ONYXCC) $(SELFHOST_FLAGS) --ring1 -o onyxcc_self.onx -e _start $(ONYXCC_SRCS) src/core/shim.c
+	./$(ONYXCC) $(SELFHOST_FLAGS) --ring1 -o onyxcc_self.onx -e _start $(ONYXCC_SRCS) src/c/shim.c
 	@echo "--- onyxcc_self.onx ready ---"
 	@ls -la onyxcc_self.onx
 
@@ -147,11 +168,21 @@ check: all tools/onx-run
 	bash scripts/test_runner.sh
 	bash scripts/integration-runner.sh
 	python3 tests/driver/run.py
+	bash scripts/cpp_runner.sh
 
 # These harnesses use host ASan/UBSan and do not execute target code.
 check-native:
 	@set -e; for suite in $(wildcard tests/*-native/run.sh); do bash "$$suite"; done
 
 clean:
-	rm -f $(ONYXCC) $(ONYXCC_OBJS) src/core/*.o src/front/*.o src/back/*.o src/arch/*.o tests/*.onx onyxcc.riscv.elf onyxcc.onx onyxcc_self.onx
+	rm -f $(ONYXCC) $(ONYXCC_OBJS) src/c/*.o src/c/constant/*.o src/arch/*.o src/cpp/front/*.o src/cpp/tables/*.o src/tools/onyx-ld.o tests/*.onx tests/cpp/*.onx onyxcc.riscv.elf onyxcc.onx onyxcc_self.onx
 	rm -rf cc/
+
+clean-rust:
+	@echo "src/rust/ holds the Rust target scaffold (target.json, startup, panic,"
+	@echo "ffi). It is not built yet: no Cargo.toml / verified .onx output."
+
+rust-scaffold:
+	@test -f src/rust/target.json && echo "=== Rust target scaffold present (not built) ==="
+
+.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld check check-native rust-scaffold

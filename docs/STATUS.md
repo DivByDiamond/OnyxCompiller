@@ -83,18 +83,73 @@ between them is not sufficient evidence of ISA or ABI correctness. Compare
 against independent compilers and run appropriate QEMU/OC2R integration
 checks before claiming target-system support for a new behavior.
 
+## C++ frontend (subset)
+
+A C++ frontend now lives under `src/cpp/` and is compiled into `onyxcc`
+itself (C99 sources; no separate binary). `.cpp`, `.cc` and `.cxx` inputs
+switch the parser into C++ mode per translation unit (`g_cpp_mode`); C
+files keep the plain C path unchanged. End-to-end fixtures live in
+`tests/cpp/` and run through `scripts/cpp_runner.sh` as part of
+`make check`.
+
+Supported today:
+
+- `class` / `struct` with access specifiers, data members, inline and
+  out-of-line member functions, constructors (incl. `Counter::Counter`)
+  and destructors; method overloading resolved by argument count;
+  Itanium-lite name mangling (`_ZN3Foo3barEi`).
+- Single non-virtual inheritance with flattened base fields and base
+  pointer upcast; virtual functions with a vtable in `.data`, vptr store
+  in every constructor, and indirect dispatch through base pointers.
+- RAII for locals: automatic constructor call, destructors at scope exit
+  and before `return` (the return value is preserved across dtor calls).
+- `new` / `delete` (single objects; array forms rejected), `this`,
+  `nullptr`, functional casts `T(args)`, `T&` references (auto-deref at
+  use sites, pointer-passed arguments).
+- Flattened namespaces (`namespace N { ... }`, `using namespace N;`,
+  `N::name`, `A::B::name`).
+- Exceptions via a setjmp/longjmp handler chain in
+  `libonyxc/src/eh/eh.c`: `throw`, `try`/`catch (T& e)`,
+  `catch (int)`, `catch (...)`, rethrow; uncaught exceptions terminate
+  with exit code 134.
+- Function templates with explicit type arguments
+  (`maxv<int>(a, b)`), instantiated by textual substitution and compiled
+  at top level after the current declaration.
+
 ## Next stages
 
 1. Finish and test the C separate-compilation pipeline: relocatable object
    emission, symbol visibility, archive selection, relocations and an
    explicit ABI. Expand C conformance/negative tests and libc behavior.
-2. Implement a C++ frontend and its runtime deliberately: parsing and
-   semantics, mangling/ABI, constructors/destructors, templates, exceptions
-   and standard-library integration. C compatibility fixes are foundation
-   work, not completed C++ support.
+2. Extend the C++ frontend beyond the subset above: multiple and virtual
+   inheritance with pointer adjustment, RTTI/`dynamic_cast`, class
+   templates and deduction, virtual destructors, exception unwinding that
+   runs destructors of skipped scopes, lambdas, `constexpr`, operator
+   overloading and standard-library integration. C compatibility fixes are
+   foundation work, not completed C++ support.
 3. Treat Rust as a separate target/runtime effort using the existing
    `rustc` toolchain: target description, startup, allocation, panic and
    linking support. Extending OnyxCC's C parser does not implement Rust.
+
+## C++ material limitations (explicit)
+
+- No multiple inheritance (only one base, non-virtual) and no virtual
+  inheritance; RTTI, `dynamic_cast` and `typeid` are not implemented.
+- No class templates; function templates require explicit type arguments,
+  simple type spellings and a definition before use; nested
+  `A<B<C>>` type arguments are unsupported.
+- Constructor initializer lists, default member initializers, bitfields
+  in classes and nested classes are rejected with diagnostics.
+- Destructors are not run when a longjmp unwinds scopes; throwing from a
+  destructor during return unwinding is unsupported.
+- Namespaces are flattened: two namespaces cannot declare the same member
+  name, and `using N::x;` aliases are not tracked.
+- References are represented as flagged pointers (`type_t::is_ref`);
+  reference return types and references to temporaries are not supported.
+- Temporary objects from functional casts are not destroyed automatically.
+- The C++ frontend shares the single-pass C backend: no optimizing IR, no
+  separate-compilation objects, and diagnostics follow the C parser's
+  error-recovery model.
 
 ## Source organization
 
@@ -105,3 +160,17 @@ four source files per folder. Existing large parser/backend files still
 need incremental extraction; do not claim the repository already meets
 those limits everywhere. Vendored upstream archives preserve their source
 layout and license rather than mechanically rewriting external projects.
+
+C++ frontend layout:
+
+- `src/cpp/front/` — `parse_class.c` (class bodies, layout, vtables),
+  `parse_method.c` (member declarations/definitions, mangling calls),
+  `parse_call.c` (method markers, hidden `this`, `new`/`delete`, refs),
+  `parse_ns.c` (flattened namespaces), `parse_stmt.c` (exceptions),
+  `parse_tmpl.c` (function templates), `hooks.c` (RAII registry, ctor
+  prologue, remaining hooks).
+- `src/cpp/tables/` — `mangle.c`, `method_table.c`, `class_table.c`
+  (records, access control).
+- `include/cpp/` — `cpp.h` (gen.c/parse.c seam), `cpp_front.h`
+  (internal API), `mangle.h`.
+- `libonyxc/src/eh/eh.c` — exception runtime (auto-linked).

@@ -5,13 +5,11 @@
 OnyxCC is a compiler written in C for a growing C99-oriented subset,
 producing RISC-V64 `.onx` executables for OnyxOS. It automatically links
 libonyxc and supports multiple C translation units in one invocation.
-
-The compiler now builds the standard Lua 5.5.1 interpreter and luac port,
-with emulator smoke checks covering CLI execution, math, pure Lua modules,
-errors, garbage collection and bytecode roundtrips. This is a substantial
-C compatibility milestone, not full C or C++ support. There is no C++
-frontend yet. See [the status and remaining work](docs/STATUS.md) for
-language, ABI, runtime and self-hosting limitations.
+A C++ subset frontend is built in (classes, methods, RAII, virtual
+functions, namespaces, references, new/delete, exceptions and function
+templates); see [the status and remaining work](docs/STATUS.md) for the
+exact boundary — this is not full C++ conformance. There is no Rust
+frontend; Rust remains a separate `rustc`-based target effort.
 
 ## Build and use
 
@@ -82,6 +80,28 @@ The cross-build needs the configured Clang/LLD tools and OnyxKernel's
 being emitted does not establish that it runs correctly or can bootstrap
 another working compiler. Those are separate unfinished validation goals.
 
+## C++ support
+
+`.cpp` / `.cc` / `.cxx` inputs are parsed in C++ mode; `.c` inputs keep the
+plain C path. The frontend is part of `onyxcc` itself (no separate binary)
+and is covered by `make check` through `scripts/cpp_runner.sh`, which
+compiles each `tests/cpp/*.cpp`, runs it in `tools/onx-run` and compares
+stdout (negative fixtures must be rejected).
+
+```sh
+./onyxcc -I libonyxc/include/core -I libonyxc/include/io \
+         -o app.onx app.cpp
+```
+
+Supported subset: classes/structs with access control, member functions,
+constructors/destructors, method overloading by arity, single inheritance,
+virtual functions with vtables, RAII for locals, `new`/`delete`, `this`,
+`nullptr`, `T&` references, flattened namespaces, exceptions
+(`throw`/`try`/`catch`, `catch(...)`, rethrow) and function templates with
+explicit type arguments. Multiple/virtual inheritance, RTTI, class
+templates, lambdas and unwinding destructors are not implemented; see
+[docs/STATUS.md](docs/STATUS.md) for the full list.
+
 ## Layout
 
 - `src/core`: driver, buffers, types and the freestanding shim.
@@ -89,9 +109,12 @@ another working compiler. Those are separate unfinished validation goals.
   constant operands from arithmetic and conditional evaluation.
 - `src/back`: preprocessing, immediate code generation and `.onx` emission.
 - `src/arch`: RV64 instruction encoding and context support.
-- `libonyxc`: headers and runtime modules grouped by responsibility.
-- `tests`: frontend fixtures, executed programs, driver tests and native
-  sanitizer harnesses.
+- `src/cpp/`: C++ subset frontend (`front/` parsers, `tables/` mangling,
+  method and class records) — built into `onyxcc` as C99 sources.
+- `libonyxc`: headers and runtime modules grouped by responsibility;
+  `src/eh/eh.c` is the C++ exception runtime.
+- `tests`: frontend fixtures, executed programs, driver tests, C++
+  fixtures (`tests/cpp/`) and native sanitizer harnesses.
 
 The current backend emits instructions during parsing. There is no
 optimizing intermediate representation. Keep new modules focused and

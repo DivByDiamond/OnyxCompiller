@@ -1,0 +1,19 @@
+{
+  "arch": "riscv64gc",
+  "abi": "lp64d",
+  "dataLayout": {
+    "littleEndian": true,
+    "pointerWidth": "64",
+    "abiAlign": "d"
+  },
+  "llvm": { "stackAlign": 16 },
+  "os": "none",
+  "env": "none",
+  "vendor": "unknown",
+  "targetFeatures": { "+m": "rv64gc" },
+  "linkerFlavor": "ld.lld",
+  "linker": "ld.lld-19",
+  "panicStrategy": "abort",
+  "entry": "_start",
+  "sysroot": "/home/z/my-project/onyx/OnyxOS/sysroot"
+}

@@ -27,13 +27,16 @@ static const kw_entry_t kws[] = {
     {"class",      T_KW_CLASS},
     {"const",      T_KW_CONST},
     {"const_cast", T_KW_CONST_CAST},
+    {"constexpr",  T_KW_CONSTEXPR},
     {"continue",   T_KW_CONTINUE},
     {"default",    T_KW_DEFAULT},
     {"delete",     T_KW_DELETE},
     {"do",         T_KW_DO},
     {"double",     T_KW_DOUBLE},
+    {"dynamic_cast", T_KW_DYNAMIC_CAST},
     {"else",       T_KW_ELSE},
     {"enum",       T_KW_ENUM},
+    {"explicit",   T_KW_EXPLICIT},
     {"extern",     T_KW_EXTERN},
     {"float",      T_KW_FLOAT},
     {"for",        T_KW_FOR},
@@ -45,6 +48,7 @@ static const kw_entry_t kws[] = {
     {"long",       T_KW_LONG},
     {"namespace",  T_KW_NAMESPACE},
     {"new",        T_KW_NEW},
+    {"nullptr",    T_KW_NULLPTR},
     {"operator",   T_KW_OPERATOR},
     {"override",   T_KW_OVERRIDE},
     {"private",    T_KW_PRIVATE},
@@ -439,7 +443,12 @@ static void lex_one(lexer_t *lx, token_t *t) {
         case ',': t->kind = T_COMMA; return;
         case '~': t->kind = T_TILDE; return;
         case '?': t->kind = T_QUESTION; return;
-        case ':': t->kind = T_COLON; return;
+        case ':':
+            /* "::" is a single T_SCOPE token (C++ scope); a lone ':' stays
+             * T_COLON (labels, bitfields, ternary, case). */
+            if (cur_ch(lx) == ':') { advance(lx); t->kind = T_SCOPE; return; }
+            t->kind = T_COLON;
+            return;
         case '.': {
             if (cur_ch(lx) == '.' && peek_ch(lx, 1) == '.') {
                 advance(lx); advance(lx);
@@ -539,6 +548,11 @@ const char *tok_kind_str(token_kind_t k) {
         case T_DOT: return ".";
         case T_ARROW: return "->";
         case T_COLON: return ":";
+        case T_SCOPE: return "::";
+        case T_KW_NULLPTR: return "nullptr";
+        case T_KW_CONSTEXPR: return "constexpr";
+        case T_KW_EXPLICIT: return "explicit";
+        case T_KW_DYNAMIC_CAST: return "dynamic_cast";
         case T_QUESTION: return "?";
         case T_ELLIPSIS: return "...";
         case T_ASSIGN: return "=";

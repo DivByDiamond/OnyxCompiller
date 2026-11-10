@@ -56,6 +56,9 @@ struct type {
     bool is_const;
     bool is_volatile;
     bool is_restrict;
+    /* C++ reference (`T&`) — stored as a TY_PTR with is_ref set. Use
+     * sites auto-dereference; call sites pass the pointee address. */
+    bool is_ref;
     bool is_static;
     bool is_extern;
     bool is_inline;
