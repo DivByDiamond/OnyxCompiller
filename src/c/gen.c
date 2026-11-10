@@ -851,6 +851,52 @@ typedef struct {
 static data_sym_fixup_t g_data_sym_fixups[CC_MAX_REFS];
 static int g_n_data_sym_fixups = 0;
 
+/* ---- Read-only views of the fixup tables ---------------------------- */
+/* `onyxcc -c` rewrites every deferred address patch as an ONYO relocation.
+ * The tables stay private so the emitter can only read them; each getter
+ * returns 0 on success and -1 when `i` is out of range. */
+
+int gen_addr_fixup_count(void) { return g_n_fixups; }
+
+int gen_addr_fixup_get(int i, int *sym_idx, uint32_t *patch_lui,
+                       uint32_t *patch_addi, int64_t *extra_off) {
+    if (i < 0 || i >= g_n_fixups) return -1;
+    if (sym_idx)   *sym_idx   = g_fixups[i].sym_idx;
+    if (patch_lui) *patch_lui = g_fixups[i].patch_lui;
+    if (patch_addi) *patch_addi = g_fixups[i].patch_addi;
+    if (extra_off) *extra_off = g_fixups[i].extra_off;
+    return 0;
+}
+
+int gen_rodata_fixup_count(void) { return g_n_rodata_fixups; }
+
+int gen_rodata_fixup_get(int i, uint32_t *rodata_off, uint32_t *patch_lui,
+                         uint32_t *patch_addi) {
+    if (i < 0 || i >= g_n_rodata_fixups) return -1;
+    if (rodata_off) *rodata_off = g_rodata_fixups[i].rodata_off;
+    if (patch_lui)  *patch_lui  = g_rodata_fixups[i].patch_lui;
+    if (patch_addi) *patch_addi = g_rodata_fixups[i].patch_addi;
+    return 0;
+}
+
+int gen_data_rodata_fixup_count(void) { return g_n_data_rodata_fixups; }
+
+int gen_data_rodata_fixup_get(int i, uint32_t *rodata_off, uint32_t *data_off) {
+    if (i < 0 || i >= g_n_data_rodata_fixups) return -1;
+    if (rodata_off) *rodata_off = g_data_rodata_fixups[i].rodata_off;
+    if (data_off)   *data_off   = g_data_rodata_fixups[i].data_off;
+    return 0;
+}
+
+int gen_data_sym_fixup_count(void) { return g_n_data_sym_fixups; }
+
+int gen_data_sym_fixup_get(int i, int *sym_idx, uint32_t *data_off) {
+    if (i < 0 || i >= g_n_data_sym_fixups) return -1;
+    if (sym_idx)  *sym_idx  = g_data_sym_fixups[i].sym_idx;
+    if (data_off) *data_off = g_data_sym_fixups[i].data_off;
+    return 0;
+}
+
 /* Emit a global address load into `reg`. Records a fixup for later.
  * ALWAYS emits the lui+addi pair — the fixup resolver splits the final
  * address into hi20/lo12 across both instructions; a lone lui would
@@ -961,6 +1007,9 @@ void gen_fill_vtable(int sym_idx, const int *fn_syms, int n) {
         }
     }
     g_globals[sym_idx].text_off = base_off;
+    /* The vtable now really occupies .data (gen_reserve_data_symbol() only
+     * registered the name), so object emission must export it as DEFINED. */
+    g_globals[sym_idx].allocated = true;
 }
 
 val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *callee,
@@ -2839,6 +2888,10 @@ static void parse_stmt_body(lexer_t *lx) {
                     /* Redundant re-declaration — consume and ignore init. */
                     gen_parse_global_init(lx, t);
                 }
+                /* The backing symbol has internal linkage by construction,
+                 * even though gen_decl() saw a non-static decl (per-file
+                 * mangling is already unnecessary for `__sl_*` names). */
+                g_globals[gidx].is_static = true;
                 /* Local alias so plain `name` resolves to the global. */
                 int lidx = symtab_lookup_local(name);
                 if (lidx < 0) {
@@ -4255,11 +4308,16 @@ void gen_decl(decl_t *d) {
             return;
         }
         case D_FUNC_DECL: {
-            symtab_install_global(name, SYM_FUNCTION, d->type);
+            int idx = symtab_install_global(name, SYM_FUNCTION, d->type);
+            /* Internal linkage is a property of the symbol, not of the
+             * particular declaration: keep it once any declaration said
+             * `static` (a later definition may omit the keyword). */
+            if (d->is_static) g_globals[idx].is_static = true;
             return;
         }
         case D_FUNC_DEF: {
             int idx = symtab_install_global(name, SYM_FUNCTION, d->type);
+            if (d->is_static) g_globals[idx].is_static = true;
             const char *entry_name = g_opts.entry_sym ? g_opts.entry_sym : "_start";
             bool is_entry = (strcmp(name, entry_name) == 0);
             /* First definition of the entry symbol wins. Without this,
@@ -4280,12 +4338,16 @@ void gen_decl(decl_t *d) {
         }
         case D_VAR: {
             int idx = symtab_install_global(name, SYM_GLOBAL_VAR, d->type);
+            if (d->is_static) g_globals[idx].is_static = true;
             /* Extern declarations without initializer are pure references —
              * don't allocate space; a definition elsewhere provides it. */
             if (d->is_extern && !d->init) {
                 return;
             }
             if (d->init) {
+                /* Every initializer branch below reserves .data storage
+                 * (the braced-list branch already appended to it). */
+                g_globals[idx].allocated = true;
                 if (d->init->kind == EX_INIT_LIST) {
                     /* Brace initializer list — already written to g_data by
                      * gen_handle_braced_init_global().  Just record the offset. */
@@ -4353,7 +4415,8 @@ void gen_decl(decl_t *d) {
                     }
                 }
             } else {
-                /* Uninitialized global → .bss. */
+                /* Uninitialized global → .bss (this object owns the space). */
+                g_globals[idx].allocated = true;
                 g_globals[idx].text_off = (uint32_t)g_bss_size;
                 g_bss_size += type_sizeof(d->type);
                 g_bss_size = (g_bss_size + 7) & ~7;

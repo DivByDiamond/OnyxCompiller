@@ -6,6 +6,9 @@
 > The Rust task (3) remains a separate `rustc` target effort with its
 > scaffold under `src/rust/` (target.json, startup/panic/ffi).**
 >
+> Separate compilation (`onyxcc -c` → ONYO objects → `onyx-ld` → `.onx`)
+> is tracked in `docs/plan-separate-compilation.md`.
+>
 > **For implementers:** work task-by-task, one task per commit, and check off the boxes as they land.
 
 **Goal:** Create a compiler (`onyxcc`) that supports C, C++, and Rust as input languages, producing `.onx` executables for OnyxOS.

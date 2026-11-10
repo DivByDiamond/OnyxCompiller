@@ -116,11 +116,43 @@ Supported today:
   (`maxv<int>(a, b)`), instantiated by textual substitution and compiled
   at top level after the current declaration.
 
+## Separate compilation (`-c` → ONYO → `onyx-ld`)
+
+`onyxcc -c file.c -o file.o` emits a relocatable ONYO object;
+`onyx-ld -o prog.onx -e _start a.o b.o [lib.a]` links any number of them
+into a `.onx`. The contract and mapping tables are in
+`docs/plan-separate-compilation.md`. End-to-end coverage lives in
+`tests/separate/` and runs as part of `make check` via
+`scripts/sepcomp-runner.sh`: it compiles **all 17 libonyxc sources** and
+the app fixtures into separate objects, links them, runs the result and
+also asserts that duplicate globals and undefined symbols are rejected.
+
+Implemented:
+
+- `-c/--compile` (exactly one translation unit; no libonyxc auto-link;
+  default output `a.o`; `gen_finalize()` is not called);
+- `src/back/obj.c` + `obj_reloc.c`: four sections, section symbols,
+  `static`/local linkage (`LOCAL`), `.bss` vs `.data` distinction,
+  HI20/LO12_I pairs and `R_ONYO_64` data relocations;
+- linker split into `src/tools/onyx-ld.c` (CLI) and `src/tools/ld/`
+  (parse/link/emit); relocations against LOCAL and section symbols are
+  resolved by index, undefined globals by name;
+- object-level tests for duplicate definitions and undefined symbols.
+
+Remaining limitations (also in the plan): one input per `-c`; linear
+archive extraction with no `__.SYMDEF` index; no weak/COMDAT symbols,
+symbol versioning, relaxation or section GC; `-e` accepts only GLOBAL
+symbols; PCREL reloc types are not emitted by the compiler yet; hard caps
+of 64 objects and 4 sections per object. The driver was split to satisfy
+the file-size rule: `src/c/main.c` is 231 lines, with CLI parsing,
+libonyxc discovery and `-c` compilation in `src/c/driver/`
+(`opts.c`, `compile.c`, `libpath.c`).
+
 ## Next stages
 
-1. Finish and test the C separate-compilation pipeline: relocatable object
-   emission, symbol visibility, archive selection, relocations and an
-   explicit ABI. Expand C conformance/negative tests and libc behavior.
+1. Extend the object pipeline: archive index (`__.SYMDEF`), lazy archive
+   member selection, weak symbols, and a documented object ABI/version.
+   Expand C conformance/negative tests and libc behavior.
 2. Extend the C++ frontend beyond the subset above: multiple and virtual
    inheritance with pointer adjustment, RTTI/`dynamic_cast`, class
    templates and deduction, virtual destructors, exception unwinding that

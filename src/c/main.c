@@ -1,5 +1,5 @@
 /*
- * main.c — OnyxCC driver.
+ * main.c — OnyxCC driver: pipeline order and per-file loop.
  *
  * Usage:
  *   onyxcc [options] input1.c [input2.c ...] [-o output.onx]
@@ -7,27 +7,17 @@
  * Supports multi-file compilation: all input files are compiled into a
  * single .onx binary. Global symbol table and segment buffers accumulate
  * across files. Static symbols get per-file mangling to avoid collisions.
+ * With -c exactly one file becomes a relocatable ONYO object instead.
  *
  * Pipeline:
  *   1. Preprocess (pp.c) → expanded source buffer (per file)
  *   2. Lex (lexer.c) → token stream (per file)
  *   3. Parse + codegen (parse.c + gen.c) → g_text, g_rodata, g_data, g_bss
- *   4. Emit .onx (emit.c) — once after all files
+ *   4. Emit .onx (emit.c) — once after all files, or ONYO with -c
  *
- * Options:
- *   -I <path>     add include path
- *   -D <macro>    define macro (NAME or NAME=value)
- *   -o <file>     output file (default: a.onx)
- *   -e <symbol>   entry symbol (default: _start)
- *   --ring1       emit ONX_FLAGS_RING1 (binary runs in root space)
- *   -v            verbose
- *   --dump-tokens print tokens after lex (debug)
- *   -h, --help    show usage
+ * CLI parsing, libonyxc discovery and -c live in src/c/driver/.
  */
 #include "core/compat.h"
-#ifndef CC_FREESTANDING
-#include <unistd.h>   /* readlink */
-#endif
 
 #include "core/cc.h"
 #include "back/pp.h"
@@ -38,60 +28,7 @@
 #include "back/gen.h"
 #include "back/emit.h"
 #include "front/parser_priv.h"
-
-/* Per-file C++ mode detection: multi-file builds mix C and C++, so the
- * flag is recomputed for every input. Recognized extensions: .cpp, .cc,
- * .cxx (case-sensitive — plain ".C" is deliberately NOT recognized, per
- * spec §1 choice). libonyxc .c files and any other input stay C mode. */
-static bool is_cpp_source(const char *path) {
-    size_t n = strlen(path);
-    if (n >= 4 && strcmp(path + n - 4, ".cpp") == 0) return true;
-    if (n >= 3 && strcmp(path + n - 3, ".cc") == 0) return true;
-    if (n >= 4 && strcmp(path + n - 4, ".cxx") == 0) return true;
-    return false;
-}
-
-static void usage(void) {
-    fprintf(stderr,
-        "OnyxCC — OnyxOS C/C++ → RISC-V64 → .onx compiler\n"
-        "\n"
-        "Usage: onyxcc [options] <input.c>... [-o output.onx]\n"
-        "\n"
-        "Options:\n"
-        "  -I, --include <path>  Add include search path\n"
-        "  -D, --define  <name>  Predefine macro (NAME or NAME=value)\n"
-        "  -o, --output  <file>  Output file (default: a.onx)\n"
-        "  -e, --entry   <sym>   Entry symbol (default: _start)\n"
-        "      --ring1            Emit RING1 flag (binary runs in root space)\n"
-        "      --nostdlib         Do not auto-link libonyxc (freestanding)\n"
-        "      -fsyntax-only      Check translation units without linking/output\n"
-        "  -v, --verbose         Verbose diagnostics\n"
-        "      --dump-tokens      Print token stream after lex\n"
-        "  -h, --help            Show this help\n"
-        "\n"
-        "Examples:\n"
-        "  onyxcc -o prog.onx main.c helper.c         # multi-file\n"
-        "  onyxcc -o prog.onx main.c                  # single file\n"
-        "\n"
-        "Environment:\n"
-        "  ONYXCC_INCLUDE  Default include path (e.g. /usr/onyxc/lib/include/core)\n"
-        "\n");
-}
-
-static struct option long_opts[] = {
-    {"include",    required_argument, 0, 'I'},
-    {"define",     required_argument, 0, 'D'},
-    {"output",     required_argument, 0, 'o'},
-    {"entry",      required_argument, 0, 'e'},
-    {"ring1",      no_argument,       0, 'R'},
-    {"nostdlib",   no_argument,       0, 'N'},
-    {"verbose",    no_argument,       0, 'v'},
-    {"dump-tokens",no_argument,       0, 'T'},
-    {"preprocess", no_argument,       0, 'E'},
-    {"syntax-only", no_argument,      0, 'S'},
-    {"help",       no_argument,       0, 'h'},
-    {0, 0, 0, 0},
-};
+#include "front/driver.h"
 
 int main(int argc, char **argv) {
     memset(&g_opts, 0, sizeof(g_opts));
@@ -106,7 +43,9 @@ int main(int argc, char **argv) {
 
     int c;
     int opt_idx = 0;
-    while ((c = getopt_long(argc, argv, "I:D:o:e:f:vhENS", long_opts, &opt_idx)) != -1) {
+    bool output_given = false;   /* -o seen: -c defaults to a.o otherwise */
+    while ((c = getopt_long(argc, argv, driver_optstring(),
+                            driver_long_options(), &opt_idx)) != -1) {
         switch (c) {
             case 'I':
                 if (g_opts.n_include_paths < 16)
@@ -117,6 +56,7 @@ int main(int argc, char **argv) {
                     g_opts.define_macros[g_opts.n_define_macros++] = optarg;
                 break;
             case 'S': g_opts.syntax_only = true; break;
+            case 'c': g_opts.compile_only = true; break;
             case 'f':
                 if (strcmp(optarg, "syntax-only") != 0) {
                     fprintf(stderr, "onyxcc: unsupported -f option: %s\n", optarg);
@@ -124,23 +64,21 @@ int main(int argc, char **argv) {
                 }
                 g_opts.syntax_only = true;
                 break;
-            case 'o': g_opts.output = optarg; break;
+            case 'o': g_opts.output = optarg; output_given = true; break;
             case 'e': g_opts.entry_sym = optarg; break;
             case 'R': g_opts.ring1 = true; break;
             case 'N': g_opts.nostdlib = true; break;
             case 'v': g_opts.verbose = true; break;
             case 'T': g_opts.dump_tokens = true; break;
-            case 'E':
-                g_opts.preprocess_only = true;
-                break;
-            case 'h': usage(); return 0;
-            default: usage(); return 1;
+            case 'E': g_opts.preprocess_only = true; break;
+            case 'h': driver_usage(); return 0;
+            default: driver_usage(); return 1;
         }
     }
 
     if (optind >= argc) {
         fprintf(stderr, "onyxcc: no input file\n");
-        usage();
+        driver_usage();
         return 1;
     }
 
@@ -159,118 +97,31 @@ int main(int argc, char **argv) {
         return (cc_get_errors() > 0) ? 1 : 0;
     }
 
+    /* -c: exactly one translation unit per object, no libonyxc auto-link.
+     * The default output differs from a linked build, so only an explicit
+     * -o selects the object path. */
+    if (g_opts.compile_only) {
+        if (argc - optind != 1) {
+            fprintf(stderr, "onyxcc: -c requires exactly one input file\n");
+            return 1;
+        }
+        if (!output_given) g_opts.output = "a.o";
+    }
+
     /* Collect all input files. */
+    int lib_slots = (g_opts.nostdlib || g_opts.compile_only) ? 0 : CC_LIB_SOURCE_COUNT;
     g_opts.n_input_files = 0;
-    if (argc - optind > CC_MAX_INPUT_FILES - (g_opts.nostdlib ? 0 : CC_LIB_SOURCE_COUNT)) {
+    if (argc - optind > CC_MAX_INPUT_FILES - lib_slots) {
         fprintf(stderr, "onyxcc: too many input files (maximum %d)\n",
-                CC_MAX_INPUT_FILES - (g_opts.nostdlib ? 0 : CC_LIB_SOURCE_COUNT));
+                CC_MAX_INPUT_FILES - lib_slots);
         return 1;
     }
     for (int i = optind; i < argc; i++) {
         g_opts.input_files[g_opts.n_input_files++] = argv[i];
     }
 
-    /* Auto-link libonyxc: unless -nostdlib, the compiler appends the
-     * standard library sources (start_cc + core libc) to the translation
-     * unit list and registers the default include path. This makes
-     *   onyxcc -o prog.onx prog.c
-     * work out of the box — no manual -I / extra .c files needed.
-     * ONYXCC_LIB overrides the library directory (default: <bindir>/../libonyxc
-     * when running from the repo, or /usr/onyxc/lib). */
-    if (!g_opts.nostdlib) {
-        static char libdir[CC_MAX_PATH * 2];
-        const char *env_lib = getenv("ONYXCC_LIB");
-        if (env_lib) {
-            snprintf(libdir, sizeof(libdir), "%s", env_lib);
-        } else {
-            /* Locate libonyxc relative to the executable:
-             *   <exe-dir>/libonyxc          (repo layout: OnyxCompiller/)
-             *   <exe-dir>/../libonyxc       (installed alongside)
-             *   /usr/onyxc/lib     (system install) */
-            char exepath[CC_MAX_PATH * 2] = {0};
-            ssize_t n = -1;
-#ifndef CC_FREESTANDING
-            n = readlink("/proc/self/exe", exepath, sizeof(exepath) - 1);
-#endif
-            libdir[0] = 0;
-            if (n > 0) {
-                exepath[n] = 0;
-                char *slash = strrchr(exepath, '/');
-                if (slash) *slash = 0;
-                static const char *cands[] = {
-                    "/libonyxc",
-                    "/../libonyxc",
-                    "/../lib/libonyxc",
-                };
-                for (int i = 0; i < 3 && libdir[0] == 0; i++) {
-                    char probe_dir[CC_MAX_PATH * 3];
-                    snprintf(probe_dir, sizeof(probe_dir), "%s%s/src/core/start_cc.c", exepath, cands[i]);
-                    FILE *f = fopen(probe_dir, "rb");
-                    if (f) {
-                        fclose(f);
-                        snprintf(libdir, sizeof(libdir), "%s%s", exepath, cands[i]);
-                    }
-                }
-            }
-            if (libdir[0] == 0) {
-                snprintf(libdir, sizeof(libdir), "/usr/onyxc/lib");
-            }
-        }
-        /* Sanity: start_cc.c must exist there. */
-        char probe[CC_MAX_PATH * 3];
-        snprintf(probe, sizeof(probe), "%s/src/core/start_cc.c", libdir);
-        FILE *f = fopen(probe, "rb");
-        if (!f) {
-            if (g_opts.verbose) {
-                fprintf(stderr, "onyxcc: libonyxc not found at %s "
-                        "(set ONYXCC_LIB); skipping auto-link\n", libdir);
-            }
-        } else {
-            fclose(f);
-            static const char *libsrcs[] = {
-                "/src/core/start_cc.c",
-                "/src/core/syscalls.c",
-                "/src/io/stdio.c",
-                "/src/io/stdlib.c",
-                "/src/memory/alloc.c",
-                "/src/io/string.c",
-                "/src/io/strerror.c",
-                "/src/ctype/ctype.c",
-                "/src/io/time.c",
-                "/src/io/termios.c",
-                "/src/io/math.c",
-                "/src/math/ieee.c",
-                "/src/locale/locale.c",
-                "/src/process/runtime.c",
-                "/src/format/float.c",
-                "/src/convert/strtod.c",
-                "/src/eh/eh.c",
-            };
-            static char libpaths[CC_LIB_SOURCE_COUNT][CC_MAX_PATH * 2];
-            for (int i = 0; i < CC_LIB_SOURCE_COUNT; i++) {
-                snprintf(libpaths[i], sizeof(libpaths[i]), "%s%s", libdir, libsrcs[i]);
-                g_opts.input_files[g_opts.n_input_files++] = libpaths[i];
-            }
-            /* Default include paths for the library headers. */
-            static char inc1[CC_MAX_PATH * 2], inc2[CC_MAX_PATH * 2], inc3[CC_MAX_PATH * 2];
-            snprintf(inc1, sizeof(inc1), "%s/include/core", libdir);
-            snprintf(inc2, sizeof(inc2), "%s/include/io", libdir);
-            snprintf(inc3, sizeof(inc3), "%s/include/ctype", libdir);
-            const char *defaults[3] = { inc1, inc2, inc3 };
-            for (int i = 0; i < 3; i++) {
-                bool dup = false;
-                for (int j = 0; j < g_opts.n_include_paths; j++) {
-                    if (strcmp(g_opts.include_paths[j], defaults[i]) == 0) { dup = true; break; }
-                }
-                if (!dup && g_opts.n_include_paths < 16) {
-                    g_opts.include_paths[g_opts.n_include_paths++] = defaults[i];
-                }
-            }
-            if (g_opts.verbose) {
-                fprintf(stderr, "onyxcc: auto-linking libonyxc from %s\n", libdir);
-            }
-        }
-    }
+    /* Auto-link libonyxc (no-op for -nostdlib and -c). */
+    driver_autolink_libonyxc();
     g_opts.input = g_opts.input_files[0];
 
     if (g_opts.verbose) {
@@ -283,15 +134,21 @@ int main(int argc, char **argv) {
     }
 
     /* Init arenas, types, symbol table (shared across all files). */
-    cc_arena_init(&g_ast_arena, 256 * 1024 * 1024);  /* 256 MiB for AST (auto-linked libc, multi-file apps) */
-    cc_arena_init(&g_type_arena, 1024UL * 1024 * 1024); /* 256 MiB for types */
+    cc_arena_init(&g_ast_arena, 256 * 1024 * 1024);
+    cc_arena_init(&g_type_arena, 1024UL * 1024 * 1024);
     types_init(&g_type_arena);
     tags_init();
     symtab_init();
     gen_init();
 
-    /* Process each input file. */
     int rc = 0;
+    /* -c: single translation unit, object output, no address resolution. */
+    if (g_opts.compile_only) {
+        rc = driver_compile_object(g_opts.input_files[0], g_opts.output);
+        goto cleanup;
+    }
+
+    /* Process each input file. */
     for (g_opts.current_file_idx = 0;
          g_opts.current_file_idx < g_opts.n_input_files;
          g_opts.current_file_idx++) {
@@ -299,7 +156,7 @@ int main(int argc, char **argv) {
         const char *input = g_opts.input_files[g_opts.current_file_idx];
 
         /* Mode must be correct per file BEFORE preprocess/lex/parse. */
-        g_cpp_mode = is_cpp_source(input);
+        g_cpp_mode = driver_is_cpp_source(input);
 
         if (g_opts.verbose) {
             fprintf(stderr, "onyxcc: processing [%d/%d] %s\n",
