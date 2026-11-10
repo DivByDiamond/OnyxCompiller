@@ -47,6 +47,10 @@ typedef enum {
     /* Preprocessor passthrough */
     T_HASH, T_HASHHASH,
     T_KW_ASM,    /* asm / __asm__ */
+    /* C++ additions (Phase A). Appended at the end so existing token
+     * kind numbering stays stable. */
+    T_SCOPE,     /* :: — single token, never two split colons */
+    T_KW_NULLPTR, T_KW_CONSTEXPR, T_KW_EXPLICIT, T_KW_DYNAMIC_CAST,
     /* Special */
     T_BUILTIN,   /* __builtin_onyx_* */
 } token_kind_t;

@@ -126,10 +126,15 @@ type_t *parse_declarator(lexer_t *lx, type_t *base,
     if (out_name && name_sz > 0) out_name[0] = 0;
 
     type_t *t = base;
-    /* Leading pointer stars. */
+    /* Leading pointer stars (and, in a .cpp file, reference ampersands —
+     * a `T&` is represented as a pointer flagged is_ref). */
     for (;;) {
         if (accept(T_STAR)) {
             t = type_make_ptr(t);
+        } else if (g_cpp_mode && lx->cur.kind == T_AMP) {
+            lex_next(lx);
+            t = type_make_ptr(t);
+            t->is_ref = true;
         } else if (lx->cur.kind == T_KW_CONST || lx->cur.kind == T_KW_VOLATILE ||
                    lx->cur.kind == T_KW_RESTRICT) {
             /* Qualifier attached to the pointer: const char *const p */

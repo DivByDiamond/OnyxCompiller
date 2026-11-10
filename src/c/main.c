@@ -37,6 +37,19 @@
 #include "front/parse.h"
 #include "back/gen.h"
 #include "back/emit.h"
+#include "front/parser_priv.h"
+
+/* Per-file C++ mode detection: multi-file builds mix C and C++, so the
+ * flag is recomputed for every input. Recognized extensions: .cpp, .cc,
+ * .cxx (case-sensitive — plain ".C" is deliberately NOT recognized, per
+ * spec §1 choice). libonyxc .c files and any other input stay C mode. */
+static bool is_cpp_source(const char *path) {
+    size_t n = strlen(path);
+    if (n >= 4 && strcmp(path + n - 4, ".cpp") == 0) return true;
+    if (n >= 3 && strcmp(path + n - 3, ".cc") == 0) return true;
+    if (n >= 4 && strcmp(path + n - 4, ".cxx") == 0) return true;
+    return false;
+}
 
 static void usage(void) {
     fprintf(stderr,
@@ -231,6 +244,7 @@ int main(int argc, char **argv) {
                 "/src/process/runtime.c",
                 "/src/format/float.c",
                 "/src/convert/strtod.c",
+                "/src/eh/eh.c",
             };
             static char libpaths[CC_LIB_SOURCE_COUNT][CC_MAX_PATH * 2];
             for (int i = 0; i < CC_LIB_SOURCE_COUNT; i++) {
@@ -283,6 +297,9 @@ int main(int argc, char **argv) {
          g_opts.current_file_idx++) {
 
         const char *input = g_opts.input_files[g_opts.current_file_idx];
+
+        /* Mode must be correct per file BEFORE preprocess/lex/parse. */
+        g_cpp_mode = is_cpp_source(input);
 
         if (g_opts.verbose) {
             fprintf(stderr, "onyxcc: processing [%d/%d] %s\n",

@@ -15,8 +15,10 @@
 #include "back/gen.h"
 #include "front/parser_priv.h"
 #include "front/decl.h"
+#include "cpp/cpp.h"
 
 lexer_t *g_lx = NULL;
+bool g_cpp_mode = false;
 
 void parser_set_lexer(lexer_t *lx) { g_lx = lx; }
 
@@ -61,6 +63,11 @@ void skip_attributes(void) {
 
 /* Parse a top-level declaration. */
 static void parse_top_level(void) {
+    /* C++ seam: class/template/namespace/out-of-line `X::y` decls are
+     * owned by the cpp module (Phases B/D/F); false in Phase A -> the
+     * normal C declaration path below runs unchanged. */
+    if (g_cpp_mode && cpp_top_level(g_lx)) return;
+
     type_t *base = NULL;
     bool is_static = false, is_extern = false, is_typedef = false, is_inline = false;
     char tag[CC_MAX_IDENT] = {0};
@@ -70,6 +77,11 @@ static void parse_top_level(void) {
         lex_next(g_lx);
         return;
     }
+
+    /* C++ seam: out-of-line member definitions (`int Foo::bar() {...}`,
+     * `Foo::Foo(...)`, `Foo::~Foo()`) — the return type (or the class
+     * name of a ctor) was just parsed. */
+    if (g_cpp_mode && cpp_try_out_of_line(g_lx, base)) return;
 
     if (g_lx->cur.kind == T_SEMI) {
         lex_next(g_lx);
@@ -141,6 +153,9 @@ void parse_translation_unit(lexer_t *lx) {
     while (lx->cur.kind != T_EOF) {
         size_t before = lx->pos;      /* byte offset before parsing this decl */
         parse_top_level();
+        /* C++: compile template bodies queued during this declaration
+         * (at top level, so they never splice into an active function). */
+        if (g_cpp_mode) cpp_drain_pending_templates();
         /* Error recovery: if a malformed declaration consumed nothing, skip
          * one token to guarantee forward progress (prevents infinite error
          * loops that used to hang the compiler on bad input). */
@@ -149,4 +164,10 @@ void parse_translation_unit(lexer_t *lx) {
             lex_next(lx);
         }
     }
+}
+
+/* Exposed to the C++ namespace parser (same translation unit, same
+ * lexer): one top-level declaration with the normal dispatch. */
+void parse_top_level_decl(void) {
+    parse_top_level();
 }
