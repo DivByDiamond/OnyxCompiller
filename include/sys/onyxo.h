@@ -66,8 +66,12 @@
 #ifndef ONYXO_H
 #define ONYXO_H
 
+/* Freestanding (self-host) builds get uint*_t/size_t from core/compat.h;
+ * <stdint.h>/<stddef.h> do not exist there — same guard as core/onx.h. */
+#ifndef CC_FREESTANDING
 #include <stdint.h>
 #include <stddef.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -129,6 +129,7 @@ typedef struct {
     bool dump_ast;
     bool preprocess_only;       /* -E: dump preprocessed source, no codegen */
     bool syntax_only;
+    bool compile_only;         /* -c: emit a relocatable ONYO object, no link */
     bool nostdlib;              /* -nostdlib: skip libonyxc auto-link */
     const char *include_paths[16];
     int n_include_paths;

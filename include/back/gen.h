@@ -104,4 +104,20 @@ int gen_reserve_data_symbol(const char *name);
  * function symbol indices (-1 = null). */
 void gen_fill_vtable(int sym_idx, const int *fn_syms, int n);
 
+/* Read-only access to the deferred address patches accumulated during
+ * parsing. `onyxcc -c` (back/obj.c) turns them into ONYO relocations
+ * instead of resolving them in place. Getters return 0 on success and -1
+ * when `i` is out of range. The tables are indexed exactly as the
+ * corresponding fixup is recorded, so order is stable within a run. */
+int gen_addr_fixup_count(void);
+int gen_addr_fixup_get(int i, int *sym_idx, uint32_t *patch_lui,
+                       uint32_t *patch_addi, int64_t *extra_off);
+int gen_rodata_fixup_count(void);
+int gen_rodata_fixup_get(int i, uint32_t *rodata_off, uint32_t *patch_lui,
+                         uint32_t *patch_addi);
+int gen_data_rodata_fixup_count(void);
+int gen_data_rodata_fixup_get(int i, uint32_t *rodata_off, uint32_t *data_off);
+int gen_data_sym_fixup_count(void);
+int gen_data_sym_fixup_get(int i, int *sym_idx, uint32_t *data_off);
+
 #endif /* CC_GEN_H */

@@ -174,6 +174,15 @@ typedef struct {
     int scope;
     bool is_used;
     bool is_defined;
+    /* Internal linkage: `static` file-scope functions/variables and the
+     * generated `__sl_<func>_<name>` backing symbol of a function-local
+     * static. Object emission marks these LOCAL so the linker never adds
+     * them to the global namespace. */
+    bool is_static;
+    /* True when this global actually reserves storage in .data or .bss.
+     * Distinguishes `int x;` (allocated) from `extern int x;` (declared
+     * only, no storage in this object). */
+    bool allocated;
     /* For static locals: index of the backing GLOBAL symbol, or -1 for
      * ordinary stack locals. References redirect to the global. */
     int alias_global;

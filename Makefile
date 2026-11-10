@@ -39,6 +39,11 @@ ONYXCC_SRCS = \
 	src/arch/riscv64.c \
 	src/arch/context.c \
 	src/c/emit.c \
+	src/c/driver/opts.c \
+	src/c/driver/compile.c \
+	src/c/driver/libpath.c \
+	src/back/obj.c \
+	src/back/obj_reloc.c \
 	src/cpp/front/hooks.c \
 	src/cpp/front/expr/primary.c \
 	src/cpp/front/expr/member.c \
@@ -83,9 +88,9 @@ all: $(ONYXCC) $(ONYXLD)
 # ── onyx-ld — OnyxOS linker ──────────────────────────────────────────
 # Reads .o object files (and .a archives) and produces a .onx binary.
 # Compiled natively on Linux/x86_64 for use as a host-side tool.
-ONYXLD_SRCS = src/tools/onyx-ld.c
+ONYXLD_SRCS = src/tools/onyx-ld.c src/tools/ld/parse.c src/tools/ld/link.c src/tools/ld/emit.c
 
-$(ONYXLD): $(ONYXLD_SRCS) include/sys/onyxo.h src/tools/onyx-ld.h
+$(ONYXLD): $(ONYXLD_SRCS) include/sys/onyxo.h src/tools/onyx-ld.h src/tools/ld/ld_internal.h
 	$(CC) $(CFLAGS) -Iinclude -Iinclude/sys -o $@ $(ONYXLD_SRCS) $(LDFLAGS)
 	@ls -la $@
 	@echo "--- onyx-ld ready"
@@ -169,6 +174,7 @@ check: all tools/onx-run
 	bash scripts/integration-runner.sh
 	python3 tests/driver/run.py
 	bash scripts/cpp_runner.sh
+	bash scripts/sepcomp-runner.sh
 
 # These harnesses use host ASan/UBSan and do not execute target code.
 check-native:

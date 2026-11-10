@@ -102,6 +102,25 @@ explicit type arguments. Multiple/virtual inheritance, RTTI, class
 templates, lambdas and unwinding destructors are not implemented; see
 [docs/STATUS.md](docs/STATUS.md) for the full list.
 
+## Separate compilation
+
+`onyxcc -c` emits a relocatable ONYO object per translation unit and
+`onyx-ld` links objects (and static archives) into a `.onx`:
+
+```sh
+./onyxcc -c -I libonyxc/include/core -o main.o main.c
+./onyxcc -c -I libonyxc/include/core -o util.o util.c
+./onyx-ld -o prog.onx -e _start main.o util.o
+```
+
+`-c` takes exactly one input file, does not auto-link libonyxc, and writes
+`a.o` by default. The pipeline is covered by `make check`
+(`scripts/sepcomp-runner.sh`, fixtures in `tests/separate/`); the object
+format and relocation contract are documented in
+[docs/plan-separate-compilation.md](docs/plan-separate-compilation.md).
+Current limits: linear archive extraction (no symbol index), no weak
+symbols, one object per invocation, `-e` must name a GLOBAL symbol.
+
 ## Layout
 
 - `src/core`: driver, buffers, types and the freestanding shim.
