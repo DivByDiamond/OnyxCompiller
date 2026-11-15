@@ -121,47 +121,6 @@ bool ld_sym_vaddr(const sym_t *sym, uint64_t *out_vaddr) {
     return true;
 }
 
-int onyx_ld_build_symbol_table(void) {
-    if (!g_global_syms &&
-        !(g_global_syms = (sym_t *)calloc(MAX_SYMS_TOTAL, sizeof(sym_t)))) {
-        fprintf(stderr, "onyx-ld: OOM allocating global symbol table\n");
-        return -1;
-    }
-    /* Only DEFINED GLOBAL symbols enter the shared namespace. LOCAL and
-     * section symbols resolve inside their own object during relocation. */
-    for (int i = 0; i < g_n_objs; i++) {
-        obj_t *obj = &g_objs[i];
-        for (int j = 0; j < obj->n_syms; j++) {
-            sym_t *s = &obj->syms[j];
-            const uint32_t wanted = ONYO_SYM_DEFINED | ONYO_SYM_GLOBAL;
-            if ((s->flags & (wanted | ONYO_SYM_LOCAL)) != wanted || !s->name[0]) continue;
-            int existing = ld_find_global_sym(s->name);
-            if (existing >= 0) {
-                fprintf(stderr, "onyx-ld: duplicate symbol '%s' (in %s and %s)\n",
-                        s->name, g_objs[g_global_syms[existing].obj_idx].name, obj->name);
-                return -1;
-            }
-            if (g_n_global_syms >= MAX_SYMS_TOTAL) {
-                fprintf(stderr, "onyx-ld: too many symbols\n"); return -1;
-            }
-            g_global_syms[g_n_global_syms++] = *s;
-        }
-    }
-    for (int i = 0; i < g_n_objs; i++) {   /* every undefined name must resolve */
-        obj_t *obj = &g_objs[i];
-        for (int j = 0; j < obj->n_syms; j++) {
-            sym_t *s = &obj->syms[j];
-            if ((s->flags & ONYO_SYM_DEFINED) || !s->name[0]) continue;
-            if (ld_find_global_sym(s->name) < 0) {
-                fprintf(stderr, "onyx-ld: undefined symbol '%s' (referenced from %s)\n",
-                        s->name, obj->name);
-                return -1;
-            }
-        }
-    }
-    return 0;
-}
-
 /* ── Relocations ────────────────────────────────────────────────────── */
 
 int onyx_ld_apply_relocations(void) {
@@ -187,22 +146,12 @@ int onyx_ld_apply_relocations(void) {
                 fprintf(stderr, "onyx-ld: %s: malformed reloc %d\n", obj->name, j);
                 return -1;
             }
-            /* DEFINED targets — LOCAL, section and GLOBAL symbols — are
-             * resolved inside their own object. Only UNDEF targets are
-             * looked up by name in the global table. */
+            /* Global definitions, including references from their own object,
+             * bind to the winning strong/weak definition. Locals stay private. */
             sym_t *target = &obj->syms[r->sym_idx];
-            if (!(target->flags & ONYO_SYM_DEFINED)) {
-                int gi = ld_find_global_sym(target->name);
-                if (gi < 0) {
-                    fprintf(stderr, "onyx-ld: undefined symbol '%s' (referenced from %s)\n",
-                            target->name, obj->name);
-                    return -1;
-                }
-                target = &g_global_syms[gi];
-            }
             uint64_t S;
-            if (!ld_sym_vaddr(target, &S)) {
-                fprintf(stderr, "onyx-ld: %s: symbol '%s' has an invalid section\n",
+            if (!ld_resolve_symbol(target, &S)) {
+                fprintf(stderr, "onyx-ld: %s: cannot resolve symbol '%s'\n",
                         obj->name, target->name);
                 return -1;
             }

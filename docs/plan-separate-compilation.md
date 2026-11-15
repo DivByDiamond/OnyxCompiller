@@ -29,6 +29,34 @@ undefined symbols are rejected. `make selfhost-test` stays green.
 
 One object per translation unit. No libonyxc auto-link in `-c` mode.
 
+### Versions and weak binding (2026-11-15)
+
+ONYO v1 remains the compiler's output. The linker also accepts v2, which
+keeps all table layouts and relocation numbers unchanged and adds symbol
+flag `ONYO_SYM_WEAK` (`0x80`). Weak symbols require v2, a nonempty name,
+GLOBAL without LOCAL and exactly one of DEFINED/UNDEF. Unsupported symbol
+flag bits are rejected. A v1 linker rejects v2 rather than silently
+misinterpreting weak binding. This does not change ONX executable versions.
+
+Strong definitions win over weak ones regardless of input order; two
+strong definitions remain an error. The first selected weak definition
+wins over later weak definitions. All global relocations, including those
+from the defining object, use the winning definition. Local symbols keep
+object-private binding. An unresolved weak reference has value zero before
+adding its relocation addend; callers must check optional function pointers.
+
+An undefined weak reference does not pull archive members. A strong
+reference (or the entry root) can pull a weak definition; an existing weak
+definition satisfies a name and does not itself demand a stronger archive
+member. Members pulled for other exports can supply overriding strong
+definitions. An entry definition is always required, even when an undefined
+entry symbol is marked weak. A defined weak entry is valid.
+
+This is linker support only: `onyxcc` does not emit weak binding or expose
+a supported weak attribute syntax yet. Tests under `tests/weak/` compile
+ordinary C objects then explicitly change their binding/version fields.
+They check executable behavior and rejection of malformed weak metadata.
+
 ### Sections (fixed order, all four always emitted)
 
 | idx | name      | align | contents                    |

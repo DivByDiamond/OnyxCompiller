@@ -24,7 +24,8 @@ static bool needed(const char *name) {
     for (int i = 0; i < g_n_objs; i++)
         for (int j = 0; j < g_objs[i].n_syms; j++) {
             sym_t *s = &g_objs[i].syms[j];
-            if (!(s->flags & ONYO_SYM_DEFINED) && !strcmp(name, s->name)) return true;
+            if (!(s->flags & (ONYO_SYM_DEFINED | ONYO_SYM_WEAK)) &&
+                !strcmp(name, s->name)) return true;
         }
     return false;
 }

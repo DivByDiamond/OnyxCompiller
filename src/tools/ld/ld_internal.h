@@ -101,6 +101,7 @@ void ld_cleanup(void);
 /* link.c helpers shared with emit.c. */
 int  ld_find_global_sym(const char *name);
 bool ld_sym_vaddr(const sym_t *sym, uint64_t *out_vaddr);
+bool ld_resolve_symbol(const sym_t *sym, uint64_t *out_vaddr);
 
 /* Little-endian accessors shared by every stage. */
 static inline uint32_t ld_rd_u32(const uint8_t *p) {

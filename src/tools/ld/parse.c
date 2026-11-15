@@ -36,7 +36,7 @@ int ld_decode_object(obj_t *obj, uint8_t *data, size_t size, const char *name, b
         return -1;
     }
     uint32_t version = ld_rd_u32(data + 4);
-    if (version != ONYO_VERSION_1) {
+    if (version != ONYO_VERSION_1 && version != ONYO_VERSION_2) {
         fprintf(stderr, "onyx-ld: %s: unsupported version %u\n", name, version);
         return -1;
     }
@@ -106,10 +106,23 @@ int ld_decode_object(obj_t *obj, uint8_t *data, size_t size, const char *name, b
         sym_t *s = &obj->syms[i];
         uint32_t name_off = ld_rd_u32(data + off + 0);
         s->flags       = ld_rd_u32(data + off + 4);
+        uint32_t allowed_flags = version == ONYO_VERSION_2 ? 0xffu : 0x7fu;
+        if (s->flags & ~allowed_flags) {
+            fprintf(stderr, "onyx-ld: %s: unsupported symbol flags\n", name);
+            return -1;
+        }
+        if ((s->flags & ONYO_SYM_WEAK) &&
+            (version != ONYO_VERSION_2 || !(s->flags & ONYO_SYM_GLOBAL) ||
+             (s->flags & ONYO_SYM_LOCAL) ||
+             !!(s->flags & ONYO_SYM_DEFINED) == !!(s->flags & ONYO_SYM_UNDEF))) {
+            fprintf(stderr, "onyx-ld: %s: invalid weak symbol binding/version\n", name);
+            return -1;
+        }
         s->section_idx = (int32_t)ld_rd_u32(data + off + 8);
         s->value       = ld_rd_u64(data + off + 16);
         s->size        = ld_rd_u64(data + off + 24);
-        if (!read_string(obj, name_off, s->name, sizeof(s->name))) {
+        if (!read_string(obj, name_off, s->name, sizeof(s->name)) ||
+            ((s->flags & ONYO_SYM_WEAK) && !s->name[0])) {
             fprintf(stderr, "onyx-ld: %s: invalid symbol name\n", name);
             return -1;
         }

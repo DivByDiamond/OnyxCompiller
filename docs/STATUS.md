@@ -80,14 +80,10 @@ pipeline. Runtime tests verify both exit status and expected output.
 for driver bounds checks. These checks require a host C compiler, Python 3,
 Bash, coreutils and binutils; sanitizer harnesses require ASan/UBSan support.
 
-Verification on 2026-11-15: `make check` passed 66 frontend, 43 runtime,
-5 driver, 15 C++ and 5 separate-compilation checks; `make check-native`
-passed all seven sanitizer suites. The unchanged
-`tests/run/43_octal_escapes.c` failed with the stale tracked `onyxcc` and
-passed after `make -B onyxcc`; the lexer source already contained the fix.
-The rebuilt `onyxcc` preserves that fix in the shipped host tool. Native
-arena and type-metadata harnesses now reference `src/c/` after the source
-reorganization. These runs do not establish target-system behavior.
+The 2026-11-15 baseline passed 66 frontend, 43 runtime, 5 driver,
+15 C++, 5 separate-compilation and seven native sanitizer suites.
+The tracked compiler was rebuilt to include the existing octal-escape fix;
+arena/type harness paths were updated after the `src/c/` reorganization.
 
 The compiler and `.onx` emulator are developed together, so agreement
 between them is not sufficient evidence of ISA or ABI correctness. Compare
@@ -137,15 +133,11 @@ into a `.onx`. The contract and mapping tables are in
 `scripts/sepcomp-runner.sh`: it compiles **all 17 libonyxc sources** and
 the C app fixtures and a C++ fixture into separate objects, links and runs
 them, and asserts that duplicate globals and undefined symbols are rejected.
-As fixed in `e7a57ec` and verified on 2026-11-15, the linker uses `include/core/onx.h` for the
-ONX wire contract: R/W/X permissions are RISC-V PTE bits `2/4/8`, giving
-text/rodata/data/bss flags `10/2/6/6`; `--ring1` sets header flag `0x2`.
-The runner checks these fields directly for both linked fixtures and a
-ring1 image, independently of emulator execution. This catches the former
-linker constants `1/2/4` and ring1 flag `0x1`, which `onx-run` did not reject.
-The linked C++ fixture also printed `3 2` in QEMU with kernel `14937bc`;
-the kernel now rejects invalid permissions before mapping. This is a
-coordinated wire-contract fix, not a syscall ABI change.
+The ONX wire fix `e7a57ec` uses shared `include/core/onx.h` permissions
+R/W/X=`2/4/8` (text/rodata/data/bss=`10/2/6/6`) and ring1=`0x2`.
+The runner checks these fields directly. Linked C++ printed `3 2` in QEMU
+with kernel `14937bc`, which rejects invalid permissions before mapping.
+This coordinated wire fix does not change the syscall ABI.
 The C++ object fixture covers a non-polymorphic class and virtual dispatch
 through a base pointer; it does not validate every C++ feature through `-c`.
 
@@ -177,15 +169,23 @@ corrupt recognized objects are rejected rather than silently discarded.
 Non-ONYO members are ignored. Thin archives are unsupported. Regression
 coverage is in `tests/archives/`, invoked by `make check`.
 
-Verification on 2026-11-15: all 44 archive checks passed with the regular
-linker and an ASan/UBSan build; the previous linker failed 24 of them.
-The full `make check`, seven `make check-native` sanitizer suites, five
-sanitized driver checks and `make selfhost-test` passed. The full ecosystem
-fmt/Clippy and dead-code guard passed using an isolated target directory.
-These are host checks; OC2R validation is tracked separately.
+Archive validation on 2026-11-15: 44 regular/ASan/UBSan checks passed;
+the old linker failed 24. Full host suites, selfhost, fmt/Clippy and the
+dead-code guard also passed. These do not establish OC2R behavior.
+
+Weak binding (2026-11-15): the linker accepts ONYO v2 with strong-over-weak
+resolution, deterministic first-weak selection and zero-valued unresolved
+weak references. Weak references do not demand archive members; entry
+symbols still require definitions. `onyxcc` still emits v1 and does not
+provide weak attribute support. The contract and compatibility boundary
+are documented in `docs/plan-separate-compilation.md`; tests live in
+`tests/weak/` and run via `make check`.
+Validation on 2026-11-15: 36 weak checks and 44 archive checks passed in
+regular and ASan/UBSan builds; full `make check`, native/driver sanitizers,
+selfhost and full ecosystem fmt/Clippy passed.
 
 Remaining limitations (also in the plan): one input per `-c`; lazy linear
-archive extraction with no `__.SYMDEF` index; no weak/COMDAT symbols,
+archive extraction with no `__.SYMDEF` index; no COMDAT symbols,
 symbol versioning, relaxation or section GC; `-e` accepts only GLOBAL
 symbols; PCREL reloc types are not emitted by the compiler yet; hard caps
 of 64 objects and 4 sections per object. The driver was split to satisfy
@@ -195,7 +195,7 @@ libonyxc discovery and `-c` compilation in `src/c/driver/`
 
 ## Next stages
 
-1. Extend the object pipeline: archive index (`__.SYMDEF`), weak symbols, and a documented object ABI/version.
+1. Extend the object pipeline: archive index (`__.SYMDEF`) and compiler emission of weak symbols.
    Expand C conformance/negative tests and libc behavior.
 2. Extend the C++ frontend beyond the subset above: multiple and virtual
    inheritance with pointer adjustment, RTTI/`dynamic_cast`, class
@@ -229,21 +229,13 @@ libonyxc discovery and `-c` compilation in `src/c/driver/`
 
 ## Source organization
 
-Cleanup on 2026-11-15 (`773a8b5`): removed the disconnected
-Rust backend scaffolds `src/back/llvm.rs` and `src/back/codegen.rs`, unused
-private C helpers and variables, and unused-function/variable suppressions
-from compiler and libonyxc build flags. Public ABI exports are preserved.
-The raw `_onyx_exit` declaration now exposes its existing nonreturning
-contract to GCC/Clang, eliminating standalone libc `exit`/`abort` warnings
-without changing syscall termination or its fallback loop.
-
-Constant operands and arithmetic live under `src/c/constant/`; libc
-responsibilities use directories such as `memory`, `format`, `convert`,
-`locale` and `process`. Prefer focused C modules with at most 250 lines and
-four source files per folder. Existing large parser/backend files still
-need incremental extraction; do not claim the repository already meets
-those limits everywhere. Vendored upstream archives preserve their source
-layout and license rather than mechanically rewriting external projects.
+Cleanup on 2026-11-15 (`773a8b5`) removed disconnected Rust backend
+scaffolds, unused private C code and unused-function/variable suppressions.
+Public ABI exports are preserved; `_onyx_exit` exposes its nonreturning
+contract to GCC/Clang. Constant operations live under `src/c/constant/`;
+libc code is split by responsibility. Existing large parser/backend files
+still need extraction to meet the 250-line/four-files rules. Vendored
+upstream archives preserve their source layout and license.
 
 C++ frontend layout:
 

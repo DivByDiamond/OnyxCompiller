@@ -9,7 +9,7 @@
  * Layout (all integers little-endian):
  *
  *   0x00  magic[4]      = "ONYO"
- *   0x04  version       = 1            (u32)
+ *   0x04  version       = 1 or 2       (u32)
  *   0x08  flags         = 0            (u32)  [bit 0 = RING1]
  *   0x0C  n_sections     (u32)
  *   0x10  n_symbols      (u32)
@@ -30,7 +30,7 @@
  *     0x00  name_off      (u32)
  *     0x04  flags        (u32)  -- 0x1=defined, 0x2=undef, 0x4=global,
  *                                  0x8=local, 0x10=function, 0x20=data,
- *                                  0x40=entry
+ *                                  0x40=entry, 0x80=weak (v2 only)
  *     0x08  section_idx   (s32)  -- -1 if undef
  *     0x0C  reserved      (u32)
  *     0x10  value         (u64)  -- offset within section (if defined)
@@ -84,6 +84,8 @@ extern "C" {
 #define ONYO_MAGIC 0x4F594E4F  /* "ONYO" little-endian = 0x4F,0x59,0x4E,0x4F */
 
 #define ONYO_VERSION_1  1
+/* v2 retains the layout and adds explicit weak symbol binding. */
+#define ONYO_VERSION_2  2
 
 #define ONYO_FLAG_RING1 0x1
 
@@ -111,6 +113,7 @@ extern "C" {
 #define ONYO_SYM_FUNC    0x10
 #define ONYO_SYM_DATA    0x20
 #define ONYO_SYM_ENTRY   0x40
+#define ONYO_SYM_WEAK    0x80  /* GLOBAL only; requires ONYO v2 */
 
 /* Reloc types. */
 #define R_ONYO_64            1
