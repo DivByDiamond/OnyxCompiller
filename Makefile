@@ -32,6 +32,8 @@ ONYXCC_SRCS = \
 	src/c/types.c \
 	src/c/ast.c \
 	src/c/parse.c \
+	src/c/attributes/binding.c \
+	src/c/attributes/read.c \
 	src/c/constant/eval.c \
 	src/c/constant/operations.c \
 	src/c/decl.c \
@@ -177,6 +179,7 @@ check: all tools/onx-run
 	bash scripts/sepcomp-runner.sh
 	python3 tests/archives/run.py
 	python3 tests/weak/run.py
+	python3 tests/weak/source/run.py
 
 # These harnesses use host ASan/UBSan and do not execute target code.
 check-native:

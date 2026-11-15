@@ -26,7 +26,12 @@ bool accept(token_kind_t k);
 /* Constant expression evaluator (parse.c) — uses g_lx. */
 long long parse_const_expr(void);
 
-/* Skip __attribute__((...)) or asm(...) if present. */
+/* Read declaration attributes, returning weak (or __weak__). Unknown
+ * attributes and asm groups retain their historical skip behavior.
+ * Only top-level declaration parsing may consume the returned weak flag. */
+bool read_attributes(void);
+
+/* Other contexts must reject weak rather than silently discard it. */
 void skip_attributes(void);
 
 /* Set the current lexer (called by parse_translation_unit). */

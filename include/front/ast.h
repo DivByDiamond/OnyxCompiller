@@ -125,6 +125,7 @@ typedef enum {
 typedef struct decl decl_t;
 
 struct decl {
+    bool is_weak;
     bool is_static;
     bool is_extern;
     decl_kind_t kind;
@@ -182,6 +183,7 @@ typedef struct {
     /* True when this global actually reserves storage in .data or .bss.
      * Distinguishes `int x;` (allocated) from `extern int x;` (declared
      * only, no storage in this object). */
+    bool is_weak;     /* external weak binding, emitted only through ONYO v2 */
     bool allocated;
     /* For static locals: index of the backing GLOBAL symbol, or -1 for
      * ordinary stack locals. References redirect to the global. */

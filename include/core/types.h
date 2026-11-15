@@ -74,6 +74,7 @@ struct type {
     func_param_t *params; /* lazy arena payload, capacity CC_MAX_FUNC_PARAMS */
     int nparams;
     bool is_varargs;
+    bool has_prototype;  /* C () differs from (void); C++ () is a prototype. */
     type_t *ret;
     /* For structs/unions: */
     char tag[CC_MAX_IDENT];

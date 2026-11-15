@@ -176,13 +176,13 @@ dead-code guard also passed. These do not establish OC2R behavior.
 Weak binding (2026-11-15, `4845c52`): the linker accepts ONYO v2 with strong-over-weak
 resolution, deterministic first-weak selection and zero-valued unresolved
 weak references. Weak references do not demand archive members; entry
-symbols still require definitions. `onyxcc` still emits v1 and does not
-provide weak attribute support. The contract and compatibility boundary
+symbols still require definitions. `onyxcc -c` emits weak functions/data
+from GNU weak attributes as v2; ordinary objects remain v1. The contract
 are documented in `docs/plan-separate-compilation.md`; tests live in
 `tests/weak/` and run via `make check`.
-Validation on 2026-11-15: 36 weak checks and 44 archive checks passed in
-regular and ASan/UBSan builds; full `make check`, native/driver sanitizers,
-selfhost and full ecosystem fmt/Clippy passed.
+Validation on 2026-11-15: 48 source, 36 weak-format and 44 archive checks
+passed; source cases also passed with ASan/UBSan compiler and linker. Full
+`make check`, native/driver sanitizers, selfhost and fmt/Clippy passed.
 
 Remaining limitations (also in the plan): one input per `-c`; lazy linear
 archive extraction with no `__.SYMDEF` index; no COMDAT symbols,
@@ -195,7 +195,7 @@ libonyxc discovery and `-c` compilation in `src/c/driver/`
 
 ## Next stages
 
-1. Extend the object pipeline: archive index (`__.SYMDEF`) and compiler emission of weak symbols.
+1. Extend the object pipeline: archive indexes (`__.SYMDEF`), COMDAT and section GC.
    Expand C conformance/negative tests and libc behavior.
 2. Extend the C++ frontend beyond the subset above: multiple and virtual
    inheritance with pointer adjustment, RTTI/`dynamic_cast`, class

@@ -47,6 +47,7 @@ type_t *type_splice_base(type_t *t, type_t *base) {
 void parse_param_list(lexer_t *lx, type_t *ftype) {
     ftype->nparams = 0;
     ftype->is_varargs = false;
+    ftype->has_prototype = g_cpp_mode || lx->cur.kind != T_RPAREN;
 
     if (lx->cur.kind == T_RPAREN) return;   /* () — old-style, no proto */
 

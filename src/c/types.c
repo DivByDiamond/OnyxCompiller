@@ -51,6 +51,7 @@ static type_t *type_alloc(void) {
 type_t *type_make_function(type_t *ret) {
     type_t *t = type_alloc();
     t->kind = TY_FUNC; t->ret = ret;
+    t->has_prototype = true;
     t->size = 8; t->align = 8; t->is_complete = true;
     return t;
 }

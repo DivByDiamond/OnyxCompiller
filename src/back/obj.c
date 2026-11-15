@@ -94,6 +94,7 @@ static bool push_global_symbol(cc_buf_t *syms, cc_buf_t *strtab, int gidx) {
     } else {
         return false;
     }
+    if (s->is_weak) flags |= ONYO_SYM_WEAK;
     uint32_t name_off = strtab_add(strtab, s->name);
     if (g_opts.verbose)
         fprintf(stderr, "obj: sym[%d] %s flags=0x%x sec=%d value=0x%llx\n",
@@ -156,7 +157,10 @@ int obj_emit(const char *path) {
     uint64_t data_off = rodata_off + g_rodata.size;
 
     cc_buf_push32(&hdr, ONYO_MAGIC);
-    cc_buf_push32(&hdr, ONYO_VERSION_1);
+    bool has_weak = false;
+    for (size_t i = 0; i < syms.size; i += ONYO_SYMBOL_SIZE)
+        if (syms.data[i + 4] & ONYO_SYM_WEAK) has_weak = true;
+    cc_buf_push32(&hdr, has_weak ? ONYO_VERSION_2 : ONYO_VERSION_1);
     cc_buf_push32(&hdr, 0);            /* flags: RING1 is a link-time choice */
     cc_buf_push32(&hdr, OBJ_N_SECS);
     cc_buf_push32(&hdr, (uint32_t)(syms.size / ONYO_SYMBOL_SIZE));

@@ -40,27 +40,6 @@ bool accept(token_kind_t k) {
     return false;
 }
 
-/* Skip __attribute__((...)) or asm(...). No-op if current token is not
- * an identifier matching those names. */
-void skip_attributes(void) {
-    while (g_lx->cur.kind == T_IDENT &&
-           (strcmp(g_lx->cur.text, "__attribute__") == 0 ||
-            strcmp(g_lx->cur.text, "__attribute") == 0 ||
-            strcmp(g_lx->cur.text, "asm") == 0 ||
-            strcmp(g_lx->cur.text, "__asm__") == 0)) {
-        lex_next(g_lx);  /* consume the identifier */
-        /* Expect one or more parenthesized groups. */
-        while (accept(T_LPAREN)) {
-            int depth = 1;
-            while (depth > 0 && g_lx->cur.kind != T_EOF) {
-                if (g_lx->cur.kind == T_LPAREN) depth++;
-                else if (g_lx->cur.kind == T_RPAREN) depth--;
-                lex_next(g_lx);
-            }
-        }
-    }
-}
-
 /* Parse a top-level declaration. */
 static void parse_top_level(void) {
     /* C++ seam: class/template/namespace/out-of-line `X::y` decls are
@@ -68,27 +47,64 @@ static void parse_top_level(void) {
      * normal C declaration path below runs unchanged. */
     if (g_cpp_mode && cpp_top_level(g_lx)) return;
 
+    bool prefix_weak = read_attributes();
     type_t *base = NULL;
     bool is_static = false, is_extern = false, is_typedef = false, is_inline = false;
-    char tag[CC_MAX_IDENT] = {0};
-    if (!parse_decl_spec(g_lx, &base, &is_static, &is_extern, &is_typedef, &is_inline, tag)) {
-        if (accept(T_SEMI)) return;
-        parse_error("expected declaration");
+    /* Attributes may surround storage specifiers, but do not split a
+     * multi-token base type (e.g. unsigned long). Keep state on this stack:
+     * parsing a body must never inherit the enclosing declaration's weak. */
+    for (;;) {
+        switch (g_lx->cur.kind) {
+            case T_KW_STATIC: is_static = true; break;
+            case T_KW_EXTERN: is_extern = true; break;
+            case T_KW_TYPEDEF: is_typedef = true; break;
+            case T_KW_INLINE: is_inline = true; break;
+            default: goto storage_done;
+        }
         lex_next(g_lx);
-        return;
+        if (read_attributes()) prefix_weak = true;
     }
+storage_done:;
+    bool spec_static = false, spec_extern = false;
+    bool spec_typedef = false, spec_inline = false;
+    char tag[CC_MAX_IDENT] = {0};
+    if (!parse_decl_spec(g_lx, &base, &spec_static, &spec_extern, &spec_typedef, &spec_inline, tag)) {
+        if (is_static || is_extern || is_typedef || is_inline) {
+            base = &ty_int; /* Existing implicit-int storage-class grammar. */
+        } else {
+            if (prefix_weak) parse_error("weak requires a named declaration");
+            if (accept(T_SEMI)) return;
+            parse_error("expected declaration");
+            lex_next(g_lx);
+            return;
+        }
+    }
+
+    is_static |= spec_static;
+    is_extern |= spec_extern;
+    is_typedef |= spec_typedef;
+    is_inline |= spec_inline;
+    if (read_attributes()) prefix_weak = true;
+    if (prefix_weak && (is_static || is_typedef))
+        parse_error("weak is not supported on static or typedef declarations");
 
     /* C++ seam: out-of-line member definitions (`int Foo::bar() {...}`,
      * `Foo::Foo(...)`, `Foo::~Foo()`) — the return type (or the class
      * name of a ctor) was just parsed. */
-    if (g_cpp_mode && cpp_try_out_of_line(g_lx, base)) return;
+    if (g_cpp_mode && cpp_try_out_of_line(g_lx, base)) {
+        if (prefix_weak)
+            parse_error("weak is not supported on out-of-line members");
+        return;
+    }
 
     if (g_lx->cur.kind == T_SEMI) {
+        if (prefix_weak) parse_error("weak requires a named declaration");
         lex_next(g_lx);
         return;
     }
 
     for (;;) {
+        bool declarator_weak = read_attributes();
         /* Full declarator: handles pointers, arrays, function types and
          * function pointers via the splice algorithm in decl.c. */
         char name[CC_MAX_IDENT] = {0};
@@ -103,15 +119,19 @@ static void parse_top_level(void) {
             return;
         }
 
+        bool is_weak = read_attributes() || declarator_weak || prefix_weak;
+        if (is_weak && (is_static || is_typedef))
+            parse_error("weak is not supported on static or typedef declarations");
+
         if (t->kind == TY_FUNC) {
             /* Function definition or prototype. */
-            skip_attributes();
 
             if (g_lx->cur.kind == T_LBRACE) {
                 decl_t *d = ast_new_decl(D_FUNC_DEF, pos);
                 d->type = t;
                 strncpy(d->name, name, CC_MAX_IDENT - 1);
                 d->is_static = is_static;
+                d->is_weak = is_weak;
                 if (is_inline) t->is_inline = true;
                 gen_decl(d);
                 return;
@@ -120,6 +140,7 @@ static void parse_top_level(void) {
                 d->type = t;
                 strncpy(d->name, name, CC_MAX_IDENT - 1);
                 d->is_static = is_static;
+                d->is_weak = is_weak;
                 if (is_inline) t->is_inline = true;
                 gen_decl(d);
             }
@@ -133,6 +154,7 @@ static void parse_top_level(void) {
             strncpy(d->name, name, CC_MAX_IDENT - 1);
             d->init = init;
             d->is_static = is_static;
+            d->is_weak = is_weak;
             d->is_extern = is_extern;
             if (is_typedef) {
                 d->kind = D_TYPEDEF;

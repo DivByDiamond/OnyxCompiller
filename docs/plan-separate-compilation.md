@@ -52,10 +52,14 @@ member. Members pulled for other exports can supply overriding strong
 definitions. An entry definition is always required, even when an undefined
 entry symbol is marked weak. A defined weak entry is valid.
 
-This is linker support only: `onyxcc` does not emit weak binding or expose
-a supported weak attribute syntax yet. Tests under `tests/weak/` compile
-ordinary C objects then explicitly change their binding/version fields.
-They check executable behavior and rejection of malformed weak metadata.
+`onyxcc -c` accepts GNU weak attributes on file-scope functions and data,
+keeps weak binding across redeclarations and emits v2 only when an emitted
+symbol is weak. Ordinary objects and unreferenced extern declarations keep
+v1. Static/typedef weak declarations are rejected. Direct executable builds
+with weak symbols require `-c` followed by `onyx-ld`; syntax-only is allowed.
+The explicit object tests in `tests/weak/` still patch metadata to cover
+malformed inputs. `tests/weak/source/` checks real attribute emission and
+linked execution without modifying object metadata.
 
 ### Sections (fixed order, all four always emitted)
 

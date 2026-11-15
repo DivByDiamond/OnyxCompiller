@@ -4285,16 +4285,12 @@ void gen_decl(decl_t *d) {
             return;
         }
         case D_FUNC_DECL: {
-            int idx = symtab_install_global(name, SYM_FUNCTION, d->type);
-            /* Internal linkage is a property of the symbol, not of the
-             * particular declaration: keep it once any declaration said
-             * `static` (a later definition may omit the keyword). */
-            if (d->is_static) g_globals[idx].is_static = true;
+            gen_bind_global(name, SYM_FUNCTION, d);
             return;
         }
         case D_FUNC_DEF: {
-            int idx = symtab_install_global(name, SYM_FUNCTION, d->type);
-            if (d->is_static) g_globals[idx].is_static = true;
+            int idx = gen_bind_global(name, SYM_FUNCTION, d);
+            if (idx < 0) return;
             const char *entry_name = g_opts.entry_sym ? g_opts.entry_sym : "_start";
             bool is_entry = (strcmp(name, entry_name) == 0);
             /* First definition of the entry symbol wins. Without this,
@@ -4314,8 +4310,8 @@ void gen_decl(decl_t *d) {
             return;
         }
         case D_VAR: {
-            int idx = symtab_install_global(name, SYM_GLOBAL_VAR, d->type);
-            if (d->is_static) g_globals[idx].is_static = true;
+            int idx = gen_bind_global(name, SYM_GLOBAL_VAR, d);
+            if (idx < 0) return;
             /* Extern declarations without initializer are pure references —
              * don't allocate space; a definition elsewhere provides it. */
             if (d->is_extern && !d->init) {
