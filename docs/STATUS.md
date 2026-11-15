@@ -233,7 +233,7 @@ suppressions; public exports remain. `_onyx_exit` exposes its nonreturning
 contract. Code is split by responsibility; large parser/backend files still
 need extraction. Vendored archives retain upstream layout and licenses.
 
-Static-local storage (2026-11-15) uses short private backing symbols and scoped
+Static-local storage (2026-11-15, `c26fa17`) uses short private backing symbols and scoped
 aliases, fixing nested/sibling shadows and long-name collisions. Constant
 initializers resolve static-local/self addresses; all 26 direct/linked storage checks pass, including ASan/UBSan.
 
