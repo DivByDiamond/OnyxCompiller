@@ -80,12 +80,18 @@ int obj_write_relocs(cc_buf_t *relocs, const int32_t *sym_map, int n_globals) {
     for (int i = 0; i < gen_data_sym_fixup_count(); i++) {
         int sym_idx;
         uint32_t data_off;
-        gen_data_sym_fixup_get(i, &sym_idx, &data_off);
+        int64_t addend;
+        gen_data_sym_fixup_get(i, &sym_idx, &data_off, &addend);
         if (sym_idx < 0) continue;
+        if (addend < OBJ_ADDEND_MIN || addend > OBJ_ADDEND_MAX) {
+            cc_error("obj: addend %lld for '%s' does not fit int32",
+                     (long long)addend, g_globals[sym_idx].name);
+            return -1;
+        }
         int32_t target = sym_target(sym_map, n_globals, sym_idx);
         if (target < 0) return -1;
         push_reloc(relocs, ONYO_SEC_DATA, R_ONYO_64, data_off,
-                   (uint32_t)target, 0);
+                   (uint32_t)target, (int32_t)addend);
     }
     return 0;
 }

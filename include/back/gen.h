@@ -122,6 +122,6 @@ int gen_rodata_fixup_get(int i, uint32_t *rodata_off, uint32_t *patch_lui,
 int gen_data_rodata_fixup_count(void);
 int gen_data_rodata_fixup_get(int i, uint32_t *rodata_off, uint32_t *data_off);
 int gen_data_sym_fixup_count(void);
-int gen_data_sym_fixup_get(int i, int *sym_idx, uint32_t *data_off);
+int gen_data_sym_fixup_get(int i, int *sym_idx, uint32_t *data_off, int64_t *addend);
 
 #endif /* CC_GEN_H */

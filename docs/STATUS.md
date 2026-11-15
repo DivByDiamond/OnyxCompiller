@@ -57,10 +57,10 @@ that the complete Lua test suite or every standard-library operation passes.
   not make these conventions a standard platform ABI.
 - `long double` uses 16-byte storage with binary64 arithmetic and does not
   provide genuine extended precision.
-- Arbitrary `sizeof(expression)` and unevaluated-expression side effects
-  are incomplete. Compound literals are block-scope only; designators lack
-  GNU `[a ... b]`/`field:` forms; `&arr[i]` is not a constant initializer.
-  C99 diagnostics and other untested constructs remain gaps.
+- `sizeof expr` discards the operand's code; in constant expressions only
+  types, strings and plain names work. File-scope compound literals must
+  be arrays or `&(T){...}`; one `[lo ... hi]` range per designator.
+  Address constants take `&obj[i].f` and `arr + n`, nothing broader.
 - Inline assembly is restricted; use documented syscall builtins for the
   supported runtime paths. There is no optimizing IR, complete debug-info
   pipeline or general-purpose system linker compatibility guarantee.
@@ -81,7 +81,7 @@ pipeline. Runtime tests verify both exit status and expected output.
 for driver bounds checks. These checks require a host C compiler, Python 3,
 Bash, coreutils and binutils; sanitizer harnesses require ASan/UBSan support.
 
-The 2026-11-15 baseline passed 66 frontend, 44 runtime, 5 driver,
+The 2026-11-15 baseline passed 66 frontend, 48 runtime, 5 driver,
 15 C++, 5 separate-compilation and seven native sanitizer suites.
 
 The compiler and `.onx` emulator are developed together, so agreement
@@ -234,8 +234,8 @@ need extraction. Vendored archives retain upstream layout and licenses.
 
 Static locals (`c26fa17`) use private backing symbols and scoped aliases;
 26 storage checks pass, including ASan/UBSan. Designated initializers and
-compound literals share one slot iterator (`src/c/init/`); global slots are
-moved into place with their fixups; 8 diagnostics: `tests/init/run.py`.
+compound literals share one slot iterator (`src/c/init/`), including GNU
+ranges and `f:`; data address fixups carry an addend; `tests/init/run.py`.
 
 C++ frontend layout:
 

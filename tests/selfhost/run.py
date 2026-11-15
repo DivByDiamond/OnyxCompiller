@@ -134,6 +134,6 @@ int main(int argc, char **argv) {
     heap_output = temporary / "heap.onx"
     run(["./onyxcc", "-DCC_FREESTANDING", "-N", "-I", "include",
          "-I", "include/core", "-e", "_start", "-o", heap_output,
-         canary, "src/core/shim.c"])
+         canary, "src/c/shim.c"])
     run([runner, heap_output, temporary / "shim-io.txt"], timeout=30)
     print("selfhost-runtime-ok: help, compile/run, includes/options, output truncation, rejection, heap")

@@ -828,10 +828,21 @@ static int g_n_data_rodata_fixups = 0;
 typedef struct {
     int      sym_idx;      /* referenced global symbol */
     uint32_t data_off;     /* 8-byte slot in g_data to patch */
+    int64_t  addend;       /* byte offset added to the symbol address */
 } data_sym_fixup_t;
 
 static data_sym_fixup_t g_data_sym_fixups[CC_MAX_REFS];
 static int g_n_data_sym_fixups = 0;
+
+/* Reserve an 8-byte data slot holding `&symbol + addend`. */
+static void gen_emit_data_address(int sym_idx, int64_t addend) {
+    if (g_n_data_sym_fixups >= CC_MAX_REFS) cc_fatal("too many data-symbol fixups");
+    g_data_sym_fixups[g_n_data_sym_fixups].sym_idx = sym_idx;
+    g_data_sym_fixups[g_n_data_sym_fixups].data_off = (uint32_t)g_data.size;
+    g_data_sym_fixups[g_n_data_sym_fixups].addend = addend;
+    g_n_data_sym_fixups++;
+    cc_buf_push64(&g_data, 0);
+}
 
 /* ---- Read-only views of the fixup tables ---------------------------- */
 /* `onyxcc -c` rewrites every deferred address patch as an ONYO relocation.
@@ -872,10 +883,11 @@ int gen_data_rodata_fixup_get(int i, uint32_t *rodata_off, uint32_t *data_off) {
 
 int gen_data_sym_fixup_count(void) { return g_n_data_sym_fixups; }
 
-int gen_data_sym_fixup_get(int i, int *sym_idx, uint32_t *data_off) {
+int gen_data_sym_fixup_get(int i, int *sym_idx, uint32_t *data_off, int64_t *addend) {
     if (i < 0 || i >= g_n_data_sym_fixups) return -1;
     if (sym_idx)  *sym_idx  = g_data_sym_fixups[i].sym_idx;
     if (data_off) *data_off = g_data_sym_fixups[i].data_off;
+    if (addend)   *addend   = g_data_sym_fixups[i].addend;
     return 0;
 }
 
@@ -978,15 +990,8 @@ void gen_fill_vtable(int sym_idx, const int *fn_syms, int n) {
     if (n <= 0) n = 1;
     uint32_t base_off = (uint32_t)g_data.size;
     for (int i = 0; i < n; i++) {
-        uint32_t off = (uint32_t)g_data.size;
-        cc_buf_push64(&g_data, 0);
-        if (fn_syms && fn_syms[i] >= 0) {
-            if (g_n_data_sym_fixups >= CC_MAX_REFS)
-                cc_fatal("too many data-symbol fixups");
-            g_data_sym_fixups[g_n_data_sym_fixups].sym_idx = fn_syms[i];
-            g_data_sym_fixups[g_n_data_sym_fixups].data_off = off;
-            g_n_data_sym_fixups++;
-        }
+        if (fn_syms && fn_syms[i] >= 0) gen_emit_data_address(fn_syms[i], 0);
+        else cc_buf_push64(&g_data, 0);
     }
     g_globals[sym_idx].text_off = base_off;
     /* The vtable now really occupies .data (gen_reserve_data_symbol() only
@@ -1828,24 +1833,28 @@ static val_t parse_primary(lexer_t *lx) {
         }
         case T_KW_SIZEOF: {
             lex_next(lx);
-            parse_expect(T_LPAREN, "expected '(' after sizeof");
-            if (is_type_start(lx)) {
-                type_t *t = parse_type_spec(lx);
+            lexer_t operand_start = *lx;
+            type_t *t = NULL;
+            if (accept(T_LPAREN) && is_type_start(lx)) {
+                t = parse_type_spec(lx);
                 char dummy_name[CC_MAX_IDENT];
                 t = parse_declarator(lx, t, dummy_name, sizeof(dummy_name));
                 parse_expect(T_RPAREN, "expected ')'");
-                v.kind = VAL_IMM;
-                v.imm = (int64_t)type_sizeof(t);
-                v.type = &ty_ulong;
-                return v;
             } else {
-                val_t e = parse_expr(lx);
-                parse_expect(T_RPAREN, "expected ')'");
-                v.kind = VAL_IMM;
-                v.imm = (int64_t)type_sizeof(e.type);
-                v.type = &ty_ulong;
-                return v;
+                /* sizeof unary-expression, parenthesized or not. The operand
+                 * is not evaluated: drop the code it generated. */
+                *lx = operand_start;
+                size_t text_mark = g_text.size;
+                int fixup_mark = g_n_fixups, rodata_mark = g_n_rodata_fixups;
+                t = parse_unary(lx).type;
+                g_text.size = text_mark;
+                g_n_fixups = fixup_mark;
+                g_n_rodata_fixups = rodata_mark;
             }
+            v.kind = VAL_IMM;
+            v.imm = (int64_t)type_sizeof(t);
+            v.type = &ty_ulong;
+            return v;
         }
         default:
             parse_error("expected expression");
@@ -3385,6 +3394,162 @@ static void parse_compound(lexer_t *lx) {
     parse_expect(T_RBRACE, "expected '}'");
 }
 
+/* ---- File-scope compound literals ------------------------------------ */
+/* `&(T){...}` / `(T[]){...}` outside functions name an anonymous static
+ * object. The enclosing initializer is still streaming into g_data, so the
+ * literal's bytes and fixups are set aside and laid out after that
+ * declaration finishes (gen_flush_file_literals). */
+typedef struct {
+    int sym;
+    uint8_t *bytes;
+    size_t size;
+    data_sym_fixup_t *sym_fixups;
+    int n_sym_fixups;
+    data_rodata_fixup_t *rodata_fixups;
+    int n_rodata_fixups;
+} pending_literal_t;
+
+#define MAX_PENDING_LITERALS 256
+static pending_literal_t g_pending_literals[MAX_PENDING_LITERALS];
+static int g_n_pending_literals;
+
+static void *gen_copy_range(const void *src, size_t count, size_t width) {
+    if (count == 0) return NULL;
+    void *copy = malloc(count * width);
+    if (!copy) cc_fatal("out of memory");
+    memcpy(copy, src, count * width);
+    return copy;
+}
+
+static void gen_flush_file_literals(void) {
+    for (int i = 0; i < g_n_pending_literals; i++) {
+        pending_literal_t *lit = &g_pending_literals[i];
+        while (g_data.size & 7) cc_buf_push8(&g_data, 0);
+        uint32_t base = (uint32_t)g_data.size;
+        if (lit->size) cc_buf_push(&g_data, lit->bytes, lit->size);
+        for (int j = 0; j < lit->n_sym_fixups; j++) {
+            if (g_n_data_sym_fixups >= CC_MAX_REFS) cc_fatal("too many data-symbol fixups");
+            g_data_sym_fixups[g_n_data_sym_fixups] = lit->sym_fixups[j];
+            g_data_sym_fixups[g_n_data_sym_fixups++].data_off += base;
+        }
+        for (int j = 0; j < lit->n_rodata_fixups; j++) {
+            if (g_n_data_rodata_fixups >= CC_MAX_REFS) cc_fatal("too many data-rodata fixups");
+            g_data_rodata_fixups[g_n_data_rodata_fixups] = lit->rodata_fixups[j];
+            g_data_rodata_fixups[g_n_data_rodata_fixups++].data_off += base;
+        }
+        g_globals[lit->sym].text_off = base;
+        g_globals[lit->sym].allocated = true;
+        g_globals[lit->sym].is_defined = true;
+        free(lit->bytes);
+        free(lit->sym_fixups);
+        free(lit->rodata_fixups);
+    }
+    g_n_pending_literals = 0;
+}
+
+/* Returns an EX_ADDR node for `&(T){...}` or an array-typed `(T[]){...}`,
+ * or NULL (lexer restored) when the tokens are anything else. */
+static expr_t *gen_parse_file_compound_literal(lexer_t *lx) {
+    lexer_t saved = *lx;
+    bool explicit_address = accept(T_AMP);
+    if (!accept(T_LPAREN) || !is_type_start(lx)) { *lx = saved; return NULL; }
+    type_t *type = parse_type_spec(lx);
+    char unused[CC_MAX_IDENT];
+    type = parse_declarator(lx, type, unused, sizeof(unused));
+    bool literal = accept(T_RPAREN) && lx->cur.kind == T_LBRACE;
+    if (!literal || (!explicit_address && type->kind != TY_ARRAY)) { *lx = saved; return NULL; }
+    if (g_n_pending_literals >= MAX_PENDING_LITERALS) cc_fatal("too many file-scope compound literals");
+
+    uint32_t start = (uint32_t)g_data.size;
+    int sym_mark = g_n_data_sym_fixups, rodata_mark = g_n_data_rodata_fixups;
+    cc_pos_t pos = lx->cur.pos;
+    gen_parse_global_init(lx, type); /* completes `T[]`, appends bytes + fixups */
+    pending_literal_t *lit = &g_pending_literals[g_n_pending_literals++];
+    lit->size = g_data.size - start;
+    lit->bytes = gen_copy_range(g_data.data + start, lit->size, 1);
+    lit->n_sym_fixups = g_n_data_sym_fixups - sym_mark;
+    lit->sym_fixups = gen_copy_range(&g_data_sym_fixups[sym_mark], (size_t)lit->n_sym_fixups, sizeof(data_sym_fixup_t));
+    lit->n_rodata_fixups = g_n_data_rodata_fixups - rodata_mark;
+    lit->rodata_fixups = gen_copy_range(&g_data_rodata_fixups[rodata_mark], (size_t)lit->n_rodata_fixups, sizeof(data_rodata_fixup_t));
+    for (int i = 0; i < lit->n_sym_fixups; i++) lit->sym_fixups[i].data_off -= start;
+    for (int i = 0; i < lit->n_rodata_fixups; i++) lit->rodata_fixups[i].data_off -= start;
+    g_data.size = start;
+    g_n_data_sym_fixups = sym_mark;
+    g_n_data_rodata_fixups = rodata_mark;
+
+    char name[CC_MAX_IDENT];
+    int serial = g_n_globals;
+    do {
+        snprintf(name, sizeof(name), "__cl_%d", serial++);
+    } while (symtab_lookup_global(name) >= 0);
+    lit->sym = symtab_install_global(name, SYM_GLOBAL_VAR, type);
+    g_globals[lit->sym].is_static = true;
+
+    expr_t *e = ast_new_expr(EX_ADDR, pos);
+    e->ival = (uint64_t)lit->sym;
+    e->addend = 0;
+    e->type = type_make_ptr(type->kind == TY_ARRAY && !explicit_address ? type->base : type);
+    return e;
+}
+
+/* Parse `&object` followed by constant `[i]` / `.member` steps, or a bare
+ * array/function name followed by an optional `+ const`. Returns an EX_ADDR
+ * node, or NULL (lexer restored) when this is not an address constant. */
+static expr_t *gen_parse_address_constant(lexer_t *lx) {
+    lexer_t saved = *lx;
+    bool explicit_address = lx->cur.kind == T_AMP;
+    if (explicit_address) lex_next(lx);
+    if (lx->cur.kind != T_IDENT) { *lx = saved; return NULL; }
+    int sym = gen_initializer_symbol(lx->cur.text);
+    cc_pos_t pos = lx->cur.pos;
+    bool is_function = sym >= 0 && g_globals[sym].kind == SYM_FUNCTION;
+    bool is_object = sym >= 0 && g_globals[sym].kind == SYM_GLOBAL_VAR;
+    if (!is_function && !is_object) { *lx = saved; return NULL; }
+    lex_next(lx);
+    type_t *type = g_globals[sym].type;
+    int64_t offset = 0;
+    while (explicit_address && is_object) {
+        if (lx->cur.kind == T_LBRACKET && type->kind == TY_ARRAY) {
+            lex_next(lx);
+            offset += (int64_t)parse_const_expr() * (int64_t)type_sizeof(type->base);
+            parse_expect(T_RBRACKET, "expected ']'");
+            type = type->base;
+        } else if (lx->cur.kind == T_DOT && (type->kind == TY_STRUCT || type->kind == TY_UNION)) {
+            lex_next(lx);
+            struct_field_t *field = NULL;
+            for (int i = 0; lx->cur.kind == T_IDENT && i < type->nfields; i++)
+                if (!type->fields[i].is_anon && !strcmp(type->fields[i].name, lx->cur.text))
+                    field = &type->fields[i];
+            if (!field) { *lx = saved; return NULL; }
+            lex_next(lx);
+            offset += (int64_t)field->offset;
+            type = field->type;
+        } else {
+            break;
+        }
+    }
+    type_t *pointee = type;
+    if (!explicit_address && is_object && type->kind == TY_ARRAY) {
+        pointee = type->base;
+        if (lx->cur.kind == T_PLUS) {
+            lex_next(lx);
+            offset += (int64_t)parse_const_expr() * (int64_t)type_sizeof(pointee);
+        }
+    } else if (!explicit_address && !is_function) {
+        *lx = saved;
+        return NULL;
+    }
+    if (lx->cur.kind != T_COMMA && lx->cur.kind != T_SEMI && lx->cur.kind != T_RBRACE) {
+        *lx = saved;
+        return NULL;
+    }
+    expr_t *e = ast_new_expr(EX_ADDR, pos);
+    e->ival = (uint64_t)sym;
+    e->addend = offset;
+    e->type = type_make_ptr(pointee);
+    return e;
+}
+
 /* ---- Global init parser (constant only) ---------------------------- */
 expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
     /* Support string literal initializers: char *s = "hello"; char s[] = "hello" */
@@ -3424,53 +3589,12 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
         return e;
     }
 
-    /* Address-of-global initializers: &symbol, or a bare array/function
-     * name that decays to its address. Resolved at finalize time. */
+    /* Address-of-global initializers: &symbol[const].member..., or a bare
+     * array/function name (optionally `+ const`). Resolved at finalize time. */
     {
-        bool handled = false;
-        if (lx->cur.kind == T_AMP) {
-            lexer_t save = *lx;
-            lex_next(lx);
-            if (lx->cur.kind == T_IDENT) {
-                int idx = gen_initializer_symbol(lx->cur.text);
-                if (idx >= 0 && (g_globals[idx].kind == SYM_GLOBAL_VAR ||
-                                 g_globals[idx].kind == SYM_FUNCTION)) {
-                    lex_next(lx);
-                    expr_t *e = ast_new_expr(EX_ADDR, lx->cur.pos);
-                    e->ival = idx;
-                    e->type = type_make_ptr(g_globals[idx].type);
-                    return e;
-                }
-            }
-            *lx = save;   /* not a resolvable symbol — fall through */
-            handled = true;
-        }
-        if (!handled && lx->cur.kind == T_IDENT) {
-            lexer_t save = *lx;
-            char nm[CC_MAX_IDENT];
-            strncpy(nm, lx->cur.text, CC_MAX_IDENT - 1);
-            nm[CC_MAX_IDENT - 1] = 0;
-            lex_next(lx);
-            if (lx->cur.kind == T_COMMA || lx->cur.kind == T_SEMI || lx->cur.kind == T_RBRACE) {
-                int idx = gen_initializer_symbol(nm);
-                if (idx >= 0 && g_globals[idx].kind == SYM_GLOBAL_VAR &&
-                    (g_globals[idx].type->kind == TY_ARRAY)) {
-                    /* Array name decays to its address. */
-                    expr_t *e = ast_new_expr(EX_ADDR, lx->cur.pos);
-                    e->ival = idx;
-                    e->type = type_make_ptr(g_globals[idx].type->base);
-                    return e;
-                }
-                if (idx >= 0 && g_globals[idx].kind == SYM_FUNCTION) {
-                    /* Function name decays to pointer-to-function. */
-                    expr_t *e = ast_new_expr(EX_ADDR, lx->cur.pos);
-                    e->ival = idx;
-                    e->type = type_make_ptr(g_globals[idx].type);
-                    return e;
-                }
-            }
-            *lx = save;
-        }
+        expr_t *address = gen_parse_file_compound_literal(lx);
+        if (!address) address = gen_parse_address_constant(lx);
+        if (address) return address;
     }
 
     /* Integer constant expressions must be evaluated without emitting
@@ -3523,6 +3647,14 @@ static void gen_emit_global_init_member(lexer_t *lx, type_t *type, uint64_t targ
     gen_global_place(mark, target);
 }
 
+static void gen_emit_global_init_slot(lexer_t *lx, const init_slot_t *slot, uint64_t start) {
+    lexer_t value_start = *lx;
+    for (uint64_t i = 0; i < slot->repeat; i++) {
+        if (i) *lx = value_start;
+        gen_emit_global_init_member(lx, slot->type, start + slot->offset + i * slot->stride);
+    }
+}
+
 /* ---- Brace-elided initializer processing (global) --------------------- */
 /* Process a sub-aggregate initializer whose braces are elided.
  * Unlike gen_handle_braced_init_global(), this function does NOT consume
@@ -3548,7 +3680,7 @@ static uint64_t gen_emit_global_init_elided(lexer_t *lx, type_t *type) {
         init_slot_t slot;
         uint64_t cursor = 0;
         while (init_next_slot(lx, type, &first, &cursor, &slot))
-            gen_emit_global_init_member(lx, slot.type, start_off + slot.offset);
+            gen_emit_global_init_slot(lx, &slot, start_off);
 
         /* Pad remaining elements with zeros if array size is fixed. */
         if (type->length > 0 && !type->is_incomplete) {
@@ -3563,7 +3695,7 @@ static uint64_t gen_emit_global_init_elided(lexer_t *lx, type_t *type) {
         init_slot_t slot;
         uint64_t cursor = 0;
         while (init_next_slot(lx, type, &first, &cursor, &slot))
-            gen_emit_global_init_member(lx, slot.type, start_off + slot.offset);
+            gen_emit_global_init_slot(lx, &slot, start_off);
 
         /* Fill to struct/union total size. */
         uint64_t total = type_sizeof(type);
@@ -3611,7 +3743,7 @@ static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type) {
         uint64_t elem_sz = type_sizeof(elem);
         init_slot_t slot;
         while (init_next_slot(lx, type, &first, &elem_idx, &slot))
-            gen_emit_global_init_member(lx, slot.type, start_off + slot.offset);
+            gen_emit_global_init_slot(lx, &slot, start_off);
 
         /* Pad remaining elements with zeros if array size is fixed. */
         if (type->length > 0 && !type->is_incomplete) {
@@ -3624,7 +3756,7 @@ static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type) {
     } else if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
         init_slot_t slot;
         while (init_next_slot(lx, type, &first, &elem_idx, &slot))
-            gen_emit_global_init_member(lx, slot.type, start_off + slot.offset);
+            gen_emit_global_init_slot(lx, &slot, start_off);
 
         /* Fill to struct/union total size. */
         uint64_t total = type_sizeof(type);
@@ -3675,6 +3807,7 @@ static uint64_t gen_count_brace_elements(lexer_t *lx, type_t *type) {
         if (lx->cur.kind == T_LBRACKET) {
             lex_next(lx);
             position = (uint64_t)parse_const_expr();
+            if (accept(T_ELLIPSIS)) position = (uint64_t)parse_const_expr();
             if (lx->cur.kind == T_RBRACKET) lex_next(lx);
         }
 
@@ -3717,6 +3850,8 @@ static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
                                        int64_t fp_off, int64_t field_off);
 static void gen_emit_local_init_member(lexer_t *lx, type_t *type,
                                        int64_t fp_off, int64_t off);
+static void gen_emit_local_init_slot(lexer_t *lx, const init_slot_t *slot,
+                                     int64_t fp_off, int64_t field_off);
 static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
                                        int64_t fp_off, int64_t field_off) {
     if (lx->cur.kind == T_STRING) {
@@ -3764,6 +3899,17 @@ static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
     }
 }
 
+/* A GNU range slot re-reads its value once per element. */
+static void gen_emit_local_init_slot(lexer_t *lx, const init_slot_t *slot,
+                                     int64_t fp_off, int64_t field_off) {
+    lexer_t value_start = *lx;
+    for (uint64_t i = 0; i < slot->repeat; i++) {
+        if (i) *lx = value_start;
+        gen_emit_local_init_member(lx, slot->type, fp_off,
+                                   field_off + (int64_t)(slot->offset + i * slot->stride));
+    }
+}
+
 /* One initializer slot: braced aggregate, brace-elided aggregate or scalar. */
 static void gen_emit_local_init_member(lexer_t *lx, type_t *type,
                                        int64_t fp_off, int64_t off) {
@@ -3801,13 +3947,13 @@ static void gen_emit_local_init_recurse(lexer_t *lx, type_t *type,
         uint64_t cursor = 0;
         bool first = true;
         while (init_next_slot(lx, type, &first, &cursor, &slot))
-            gen_emit_local_init_member(lx, slot.type, fp_off, field_off + (int64_t)slot.offset);
+            gen_emit_local_init_slot(lx, &slot, fp_off, field_off);
     } else if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
         init_slot_t slot;
         uint64_t cursor = 0;
         bool first = true;
         while (init_next_slot(lx, type, &first, &cursor, &slot))
-            gen_emit_local_init_member(lx, slot.type, fp_off, field_off + (int64_t)slot.offset);
+            gen_emit_local_init_slot(lx, &slot, fp_off, field_off);
     } else {
         /* Scalar in braces: int x = {42}; */
         gen_emit_local_init_scalar(lx, type, fp_off, field_off);
@@ -3881,11 +4027,7 @@ static void gen_emit_global_init_scalar(lexer_t *lx, type_t *type) {
     uint64_t size = type_sizeof(type);
     if (constant->kind == EX_ADDR) {
         if (size != 8) { cc_error("address initializer requires pointer-sized object"); return; }
-        if (g_n_data_sym_fixups >= CC_MAX_REFS) cc_fatal("too many data-symbol fixups");
-        g_data_sym_fixups[g_n_data_sym_fixups].sym_idx = (int)constant->ival;
-        g_data_sym_fixups[g_n_data_sym_fixups].data_off = (uint32_t)g_data.size;
-        g_n_data_sym_fixups++;
-        cc_buf_push64(&g_data, 0);
+        gen_emit_data_address((int)constant->ival, constant->addend);
         return;
     }
     uint64_t value = constant->ival;
@@ -4207,13 +4349,7 @@ void gen_decl(decl_t *d) {
                      * gen_finalize once addresses are known. */
                     g_globals[idx].is_defined = true;
                     g_globals[idx].text_off = (uint32_t)g_data.size;
-                    uint32_t data_off = (uint32_t)g_data.size;
-                    cc_buf_push64(&g_data, 0);
-                    if (g_n_data_sym_fixups >= CC_MAX_REFS)
-                        cc_fatal("too many data-symbol fixups");
-                    g_data_sym_fixups[g_n_data_sym_fixups].sym_idx = (int)d->init->ival;
-                    g_data_sym_fixups[g_n_data_sym_fixups].data_off = data_off;
-                    g_n_data_sym_fixups++;
+                    gen_emit_data_address((int)d->init->ival, d->init->addend);
                 } else if (d->init->kind == EX_NUM) {
                     /* Integer/pointer constant initializer. */
                     uint64_t v = d->init->ival;
@@ -4269,6 +4405,7 @@ void gen_decl(decl_t *d) {
                 g_bss_size += type_sizeof(d->type);
                 g_bss_size = (g_bss_size + 7) & ~7;
             }
+            gen_flush_file_literals();
             return;
         }
         default:
@@ -4380,7 +4517,7 @@ void gen_finalize(const char *entry_sym) {
     for (int i = 0; i < g_n_data_sym_fixups; i++) {
         data_sym_fixup_t *f = &g_data_sym_fixups[i];
         if (f->sym_idx < 0 || f->sym_idx >= g_n_globals) continue;
-        uint64_t addr = g_globals[f->sym_idx].vaddr;
+        uint64_t addr = g_globals[f->sym_idx].vaddr + (uint64_t)f->addend;
         for (int j = 0; j < 8; j++) {
             g_data.data[f->data_off + j] = (uint8_t)(addr >> (8 * j));
         }

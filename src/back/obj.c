@@ -128,7 +128,7 @@ int obj_emit(const char *path) {
     for (int i = 0; i < gen_data_sym_fixup_count(); i++) {
         int sym_idx;
         uint32_t data_off;
-        gen_data_sym_fixup_get(i, &sym_idx, &data_off);
+        gen_data_sym_fixup_get(i, &sym_idx, &data_off, NULL);
         if (sym_idx >= 0 && sym_idx < CC_MAX_GLOBALS) g_obj_referenced[sym_idx] = true;
     }
 

@@ -48,6 +48,7 @@ struct expr {
     expr_t *a, *b, *c;
     /* For literals. */
     uint64_t ival;
+    int64_t addend;   /* EX_ADDR: byte offset from the symbol */
     char *str;
     size_t str_len;
     /* For identifiers: symbol table slot index. */
