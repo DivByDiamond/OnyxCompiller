@@ -46,6 +46,9 @@ void gen_reset_for_file(void);
 
 /* Generate one top-level declaration. */
 void gen_decl(decl_t *d);
+void gen_static_local(lexer_t *lexer, type_t *type, const char *name);
+int gen_lookup_global(const char *name);
+int gen_initializer_symbol(const char *name);
 int gen_bind_global(const char *name, sym_kind_t kind, const decl_t *decl);
 
 /* Finalize: assign global address, resolve entry point. */

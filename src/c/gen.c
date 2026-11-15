@@ -2839,43 +2839,7 @@ static void parse_stmt_body(lexer_t *lx) {
                 break;
             }
             if (is_static) {
-                /* Static local: allocate in .data/.bss with a mangled name
-                 * (function-scoped, collision-free across functions).
-                 * Initialization happens at LOAD time like a global, so we
-                 * route through gen_decl() instead of emitting runtime
-                 * stores. Do NOT set is_static on the type — the name is
-                 * already unique (gen_decl's per-file mangling would break
-                 * symbol lookups). */
-                char gname[CC_MAX_IDENT * 2];
-                snprintf(gname, sizeof(gname), "__sl_%s_%s",
-                         g_cur_func_name[0] ? g_cur_func_name : "_", name);
-                int gidx = gen_lookup_global(gname);
-                if (gidx < 0) {
-                    gidx = symtab_install_global(gname, SYM_GLOBAL_VAR, t);
-                }
-                if (!g_globals[gidx].is_defined) {
-                    decl_t *sd = ast_new_decl(D_VAR, lx->cur.pos);
-                    sd->type = t;
-                    strncpy(sd->name, gname, CC_MAX_IDENT - 1);
-                    sd->name[CC_MAX_IDENT - 1] = '\0';
-                    if (accept(T_ASSIGN)) {
-                        sd->init = gen_parse_global_init(lx, t);
-                    }
-                    gen_decl(sd);
-                } else if (accept(T_ASSIGN)) {
-                    /* Redundant re-declaration — consume and ignore init. */
-                    gen_parse_global_init(lx, t);
-                }
-                /* The backing symbol has internal linkage by construction,
-                 * even though gen_decl() saw a non-static decl (per-file
-                 * mangling is already unnecessary for `__sl_*` names). */
-                g_globals[gidx].is_static = true;
-                /* Local alias so plain `name` resolves to the global. */
-                int lidx = symtab_lookup_local(name);
-                if (lidx < 0) {
-                    lidx = symtab_install_local(name, SYM_LOCAL_VAR, t, g_cur_scope);
-                }
-                g_locals[lidx].alias_global = gidx;
+                gen_static_local(lx, t, name);
                 if (accept(T_COMMA)) continue;
                 break;
             }
@@ -3491,12 +3455,7 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
             lexer_t save = *lx;
             lex_next(lx);
             if (lx->cur.kind == T_IDENT) {
-                int idx = gen_lookup_global(lx->cur.text);
-                if (idx < 0 && g_opts.n_input_files > 1) {
-                    char mangled[CC_MAX_IDENT + 16];
-                    mangle_static_name(lx->cur.text, mangled, sizeof(mangled));
-                    idx = gen_lookup_global(mangled);
-                }
+                int idx = gen_initializer_symbol(lx->cur.text);
                 if (idx >= 0 && (g_globals[idx].kind == SYM_GLOBAL_VAR ||
                                  g_globals[idx].kind == SYM_FUNCTION)) {
                     lex_next(lx);
@@ -3516,12 +3475,7 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
             nm[CC_MAX_IDENT - 1] = 0;
             lex_next(lx);
             if (lx->cur.kind == T_COMMA || lx->cur.kind == T_SEMI || lx->cur.kind == T_RBRACE) {
-                int idx = gen_lookup_global(nm);
-                if (idx < 0 && g_opts.n_input_files > 1) {
-                    char mangled[CC_MAX_IDENT + 16];
-                    mangle_static_name(nm, mangled, sizeof(mangled));
-                    idx = gen_lookup_global(mangled);
-                }
+                int idx = gen_initializer_symbol(nm);
                 if (idx >= 0 && g_globals[idx].kind == SYM_GLOBAL_VAR &&
                     (g_globals[idx].type->kind == TY_ARRAY)) {
                     /* Array name decays to its address. */

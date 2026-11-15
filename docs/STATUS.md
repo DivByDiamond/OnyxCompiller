@@ -170,15 +170,14 @@ Non-ONYO members are ignored. Thin archives are unsupported. Regression
 coverage is in `tests/archives/`, invoked by `make check`.
 
 Archive validation on 2026-11-15: 44 regular/ASan/UBSan checks passed;
-the old linker failed 24. Full host suites, selfhost, fmt/Clippy and the
-dead-code guard also passed. These do not establish OC2R behavior.
+the old linker failed 24. These checks do not establish OC2R behavior.
 
 Weak binding (2026-11-15, `4845c52`): the linker accepts ONYO v2 with strong-over-weak
 resolution, deterministic first-weak selection and zero-valued unresolved
 weak references. Weak references do not demand archive members; entry
 symbols still require definitions. `onyxcc -c` emits weak functions/data
 from GNU weak attributes as v2 (`f9d10cb`); ordinary objects remain v1. The contract
-are documented in `docs/plan-separate-compilation.md`; tests live in
+is documented in `docs/plan-separate-compilation.md`; tests live in
 `tests/weak/` and run via `make check`.
 Validation on 2026-11-15: 48 source, 36 weak-format and 44 archive checks
 passed; source cases also passed with ASan/UBSan compiler and linker. Full
@@ -229,13 +228,14 @@ libonyxc discovery and `-c` compilation in `src/c/driver/`
 
 ## Source organization
 
-Cleanup on 2026-11-15 (`773a8b5`) removed disconnected Rust backend
-scaffolds, unused private C code and unused-function/variable suppressions.
-Public ABI exports are preserved; `_onyx_exit` exposes its nonreturning
-contract to GCC/Clang. Constant operations live under `src/c/constant/`;
-libc code is split by responsibility. Existing large parser/backend files
-still need extraction to meet the 250-line/four-files rules. Vendored
-upstream archives preserve their source layout and license.
+Cleanup `773a8b5` (2026-11-15) removed unused backend code and lint
+suppressions; public exports remain. `_onyx_exit` exposes its nonreturning
+contract. Code is split by responsibility; large parser/backend files still
+need extraction. Vendored archives retain upstream layout and licenses.
+
+Static-local storage (2026-11-15) uses short private backing symbols and scoped
+aliases, fixing nested/sibling shadows and long-name collisions. Constant
+initializers resolve static-local/self addresses; all 26 direct/linked storage checks pass, including ASan/UBSan.
 
 C++ frontend layout:
 
