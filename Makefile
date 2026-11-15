@@ -19,8 +19,8 @@
 
 CC      ?= gcc
 CXX     ?= g++
-CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-stringop-truncation -O2 -g
-CXXFLAGS ?= -std=c++17 -Wall -Wno-unused-function -Wno-unused-variable -Wno-attributes -O2 -g -Iinclude -Iinclude/cpp -Iinclude/core -Iinclude/front -Iinclude/back -Iinclude/arch -Iinclude/sys
+CFLAGS  ?= -std=c99 -Wall -Wno-stringop-truncation -O2 -g
+CXXFLAGS ?= -std=c++17 -Wall -Wno-attributes -O2 -g -Iinclude -Iinclude/cpp -Iinclude/core -Iinclude/front -Iinclude/back -Iinclude/arch -Iinclude/sys
 LDFLAGS ?=
 
 ONYXCC_SRCS = \
@@ -76,8 +76,8 @@ LLD          ?= ld.lld-19
 ELF2ONX      ?= /home/z/my-project/onyx/OnyxKernel/target/release/elf2onx
 RISCV_FLAGS  = --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d -mcmodel=medany \
 	-Os -ffunction-sections -fdata-sections \
-	-ffreestanding -nostdlib -fno-builtin -Iinclude -Wall -Wno-unused-function \
-	-Wno-unused-variable -Wno-unused-but-set-variable -Wno-incompatible-pointer-types
+	-ffreestanding -nostdlib -fno-builtin -Iinclude -Wall \
+	-Wno-incompatible-pointer-types
 
 SELFHOST_FLAGS = -DCC_FREESTANDING -N -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
 

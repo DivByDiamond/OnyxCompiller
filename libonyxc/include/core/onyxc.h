@@ -71,6 +71,10 @@ extern int *___errno_location(void);
 /* ── Standard syscall declarations (defined in syscalls.c). */
 long _onyx_write(int fd, const void *buf, size_t n);
 long _onyx_read(int fd, void *buf, size_t n);
+/* The syscall wrapper retains control even if SYS_exit unexpectedly returns. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn))
+#endif
 void _onyx_exit(int code);
 long _onyx_yield(void);
 long _onyx_getpid(void);

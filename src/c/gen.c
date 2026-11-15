@@ -58,7 +58,6 @@ static val_t parse_primary(lexer_t *lx);
 static val_t parse_unary(lexer_t *lx);
 static void patch_jal(uint32_t off, int32_t delta);
 static void patch_branch(uint32_t off, int32_t delta);
-static void patch_sd_imm(uint32_t off, int32_t imm);
 static void parse_asm(lexer_t *lx);
 /* Current function name — for static-local mangling. */
 static char g_cur_func_name[CC_MAX_IDENT];
@@ -236,13 +235,6 @@ void gen_patch_here(uint32_t off) {
 }
 
 /* ---- Helpers --------------------------------------------------------- */
-static int alloc_int_reg(void) {
-    /* We use t0/t1/t2 for intermediates, a0 for return values, t3-t6 for
-     * spill in complex expressions. For MVP we cap expression complexity
-     * at what fits in t0-t6 + a0. */
-    return RV_T0;
-}
-
 /* Forward decl. */
 static void emit_load_global_addr(int reg, int sym_idx, int64_t add_off);
 
@@ -529,18 +521,6 @@ static void patch_jal(uint32_t off, int32_t delta) {
             ((uint32_t)(delta & 0x7FE) << 20) |
             ((uint32_t)(delta & 0x800) << 9)  |
             ((uint32_t)(delta & 0xFF000));
-    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
-    p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
-}
-
-static void patch_sd_imm(uint32_t off, int32_t imm) {
-    uint8_t *p = g_text.data + off;
-    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-    insn &= ~0xFE000F80;
-    uint32_t imm_lo = (uint32_t)(imm & 0x1F);
-    uint32_t imm_hi = (uint32_t)((imm >> 5) & 0x7F);
-    insn |= (imm_hi << 25) | (imm_lo << 7);
     p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
     p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
 }
@@ -2792,8 +2772,6 @@ static void parse_stmt_body(lexer_t *lx) {
     /* C++ seam: try/catch/throw statements (Phase E); false -> C path. */
     if (g_cpp_mode && cpp_try_stmt(lx)) return;
 
-    cc_pos_t pos = lx->cur.pos;
-
     /* Label: identifier : */
     if (lx->cur.kind == T_IDENT) {
         lex_peek(lx);
@@ -4107,7 +4085,6 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
      *
      * Approach: parse body into g_text with a placeholder prologue,
      * then patch frame_size. */
-    uint32_t prologue_start = (uint32_t)g_text.size;
     /* t1 = frame (patched lui+addi pair; a single addi immediate cannot
      * represent +2048 or larger, which silently became NEGATIVE and put
      * fp BELOW sp for functions with big locals like vformat_run). */

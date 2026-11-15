@@ -38,7 +38,6 @@ static int g_n_macros;
 static const char *g_inc_paths[16];
 static int g_n_inc_paths;
 
-static const char *g_predefines[64];
 static int g_n_predefines;
 
 static char g_seen_files[MAX_INCLUDES][CC_MAX_PATH];
@@ -66,17 +65,6 @@ static void out_emit(const char *s, size_t n) {
     }
     memcpy(g_out + g_out_len, s, n);
     g_out_len += n;
-}
-
-static void out_emit_str(const char *s) { out_emit(s, strlen(s)); }
-
-static void out_emitf(const char *fmt, ...) {
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n > 0) out_emit(buf, n);
 }
 
 static bool skipping(void) {

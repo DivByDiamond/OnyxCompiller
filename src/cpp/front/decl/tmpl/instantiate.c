@@ -124,7 +124,6 @@ bool cpp_template_instantiate(lexer_t *lx, const char *name, val_t *out) {
      * current declaration finishes. */
     size_t sig_end = 0;
     {
-        size_t paren = 0;
         bool seen = false;
         int depth = 0;
         for (size_t i = 0; i < len; i++) {

@@ -150,28 +150,6 @@ static void fmt_emit_str(fmt_ctx_t *c, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) fmt_emit(c, s[i]);
 }
 
-static void fmt_emit_uint(fmt_ctx_t *c, unsigned long long v, int base, int upper) {
-    char digits[32];
-    int n = 0;
-    const char *low = "0123456789abcdef";
-    const char *up  = "0123456789ABCDEF";
-    const char *set = upper ? up : low;
-    if (v == 0) { fmt_emit(c, '0'); return; }
-    while (v > 0 && n < (int)sizeof(digits)) {
-        digits[n++] = set[v % base];
-        v /= base;
-    }
-    while (n > 0) fmt_emit(c, digits[--n]);
-}
-
-static void fmt_emit_int(fmt_ctx_t *c, long long v) {
-    if (v < 0) {
-        fmt_emit(c, '-');
-        v = -v;
-    }
-    fmt_emit_uint(c, (unsigned long long)v, 10, 0);
-}
-
 /* Specifier state. */
 typedef struct {
     int width;        /* -1 = no width given */
@@ -568,13 +546,6 @@ static int scan_next_char(scan_ctx_t *c) {
 static int scan_peek(scan_ctx_t *c) {
     if (*c->p == 0) return -1;
     return *c->p;
-}
-
-static void scan_putback(scan_ctx_t *c, char ch) {
-    /* We don't really unread — we re-insert the char by going back one.
-     * This only works because c->p points into the user-supplied buffer. */
-    c->p--;
-    *(char *)c->p = (char)ch;
 }
 
 static long long scan_int(scan_ctx_t *c, int base, int *consumed_any) {
