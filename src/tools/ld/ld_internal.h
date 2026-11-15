@@ -92,6 +92,12 @@ extern uint64_t g_rodata_vaddr;
 extern uint64_t g_data_vaddr;
 extern uint64_t g_bss_vaddr;
 
+int ld_decode_object(obj_t *obj, uint8_t *data, size_t size, const char *name, bool member);
+int ld_adopt_object(obj_t *obj, bool copy);
+int ld_parse_archive(const char *path, uint8_t *data, size_t size);
+bool ld_archive_needed(const obj_t *obj);
+void ld_cleanup(void);
+
 /* link.c helpers shared with emit.c. */
 int  ld_find_global_sym(const char *name);
 bool ld_sym_vaddr(const sym_t *sym, uint64_t *out_vaddr);

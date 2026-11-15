@@ -161,7 +161,23 @@ Implemented:
   resolved by index, undefined globals by name;
 - object-level tests for duplicate definitions and undefined symbols.
 
-Remaining limitations (also in the plan): one input per `-c`; linear
+Archive selection (2026-11-15): `.a` members are selected only when they
+export an unresolved name from an already loaded object or the entry symbol.
+The current archive is rescanned until no more members are needed. Earlier
+archives are not revisited automatically; repeat an archive on the command
+line for cyclic cross-archive dependencies. Options, including `-e`, are
+resolved before loading inputs. Only selected objects count toward the
+64-object limit; unused objects do not contribute duplicate or undefined
+symbols. Selection is whole-object, not section garbage collection.
+
+The reader accepts regular `ar` containers, including GNU name tables and
+BSD extended names; symbol-index metadata is skipped. It validates archive
+framing and every recognized ONYO member, including unselected members;
+corrupt recognized objects are rejected rather than silently discarded.
+Non-ONYO members are ignored. Thin archives are unsupported. Regression
+coverage is in `tests/archives/`, invoked by `make check`.
+
+Remaining limitations (also in the plan): one input per `-c`; lazy linear
 archive extraction with no `__.SYMDEF` index; no weak/COMDAT symbols,
 symbol versioning, relaxation or section GC; `-e` accepts only GLOBAL
 symbols; PCREL reloc types are not emitted by the compiler yet; hard caps
@@ -172,8 +188,7 @@ libonyxc discovery and `-c` compilation in `src/c/driver/`
 
 ## Next stages
 
-1. Extend the object pipeline: archive index (`__.SYMDEF`), lazy archive
-   member selection, weak symbols, and a documented object ABI/version.
+1. Extend the object pipeline: archive index (`__.SYMDEF`), weak symbols, and a documented object ABI/version.
    Expand C conformance/negative tests and libc behavior.
 2. Extend the C++ frontend beyond the subset above: multiple and virtual
    inheritance with pointer adjustment, RTTI/`dynamic_cast`, class

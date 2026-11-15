@@ -10,11 +10,12 @@
  *           file1.o file2.o ... libfoo.a ...
  *
  * Limitations:
- *   - No archive symbol index; members are extracted linearly.
+ *   - No archive symbol index; needed members are selected by linear scans.
  *   - No weak symbols, no symbol versioning, no DWARF.
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ld/ld_internal.h"
@@ -43,6 +44,7 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
+    atexit(ld_cleanup);
     int i = 1;
     while (i < argc) {
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
@@ -63,9 +65,15 @@ int main(int argc, char **argv) {
             usage();
             return 1;
         } else {
-            if (onyx_ld_parse_input(argv[i]) != 0) return 1;
+            /* Inputs are loaded after all options, preserving their order. */
         }
         i++;
+    }
+
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-o") || !strcmp(argv[i], "--output") ||
+            !strcmp(argv[i], "-e") || !strcmp(argv[i], "--entry")) { i++; continue; }
+        if (argv[i][0] != '-' && onyx_ld_parse_input(argv[i]) != 0) return 1;
     }
 
     if (g_n_objs == 0) {

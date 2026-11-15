@@ -88,7 +88,7 @@ all: $(ONYXCC) $(ONYXLD)
 # ── onyx-ld — OnyxOS linker ──────────────────────────────────────────
 # Reads .o object files (and .a archives) and produces a .onx binary.
 # Compiled natively on Linux/x86_64 for use as a host-side tool.
-ONYXLD_SRCS = src/tools/onyx-ld.c src/tools/ld/parse.c src/tools/ld/link.c src/tools/ld/emit.c
+ONYXLD_SRCS = src/tools/onyx-ld.c src/tools/ld/parse.c src/tools/ld/link.c src/tools/ld/emit.c src/tools/ld/archive/read.c src/tools/ld/archive/select.c
 
 $(ONYXLD): $(ONYXLD_SRCS) include/core/onx.h include/sys/onyxo.h src/tools/onyx-ld.h src/tools/ld/ld_internal.h
 	$(CC) $(CFLAGS) -Iinclude -Iinclude/sys -o $@ $(ONYXLD_SRCS) $(LDFLAGS)
@@ -175,6 +175,7 @@ check: all tools/onx-run
 	python3 tests/driver/run.py
 	bash scripts/cpp_runner.sh
 	bash scripts/sepcomp-runner.sh
+	python3 tests/archives/run.py
 
 # These harnesses use host ASan/UBSan and do not execute target code.
 check-native:

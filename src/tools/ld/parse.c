@@ -2,7 +2,7 @@
  * parse.c — ONYO object and `ar` archive reader for onyx-ld.
  *
  * Objects are bounds-checked here so link.c can trust section offsets,
- * symbol section indices (still validated) and string table extents.
+ * string table extents, symbol indices and relocation extents.
  */
 
 #include <stdio.h>
@@ -14,26 +14,18 @@
 onyx_ld_options_t g_ld_opts = { "a.onx", "_start", false, false };
 
 /* Copy a NUL-terminated name out of the object's string table. */
-static void read_string(const obj_t *obj, uint32_t name_off, char *out, size_t out_sz) {
-    out[0] = 0;
-    if (out_sz < 2 || (size_t)name_off >= obj->strtab_size) return;
+static bool read_string(const obj_t *obj, uint32_t name_off, char *out, size_t out_sz) {
+    if ((size_t)name_off >= obj->strtab_size) return false;
     const char *src = (const char *)obj->file_data + obj->strtab_off + name_off;
-    size_t avail = obj->strtab_size - (size_t)name_off;
-    size_t i = 0;
-    while (i < out_sz - 1 && i < avail && src[i]) {
-        out[i] = src[i];
-        i++;
-    }
-    out[i] = 0;
+    const char *end = memchr(src, 0, obj->strtab_size - name_off);
+    if (!end || (size_t)(end - src) >= out_sz) return false;
+    memcpy(out, src, (size_t)(end - src) + 1);
+    return true;
 }
 
 /* ── Object parsing ─────────────────────────────────────────────────── */
 
-static int parse_object(uint8_t *data, size_t size, const char *name, bool is_archive_member) {
-    if (g_n_objs >= MAX_OBJECTS) {
-        fprintf(stderr, "onyx-ld: too many input objects (max %d)\n", MAX_OBJECTS);
-        return -1;
-    }
+int ld_decode_object(obj_t *obj, uint8_t *data, size_t size, const char *name, bool is_archive_member) {
     if (size < ONYO_HDR_SIZE) {
         fprintf(stderr, "onyx-ld: %s: file too small (%zu bytes)\n", name, size);
         return -1;
@@ -68,7 +60,6 @@ static int parse_object(uint8_t *data, size_t size, const char *name, bool is_ar
         return -1;
     }
 
-    obj_t *obj = &g_objs[g_n_objs];
     memset(obj, 0, sizeof(*obj));
     obj->file_data = data;
     obj->file_size = size;
@@ -91,6 +82,10 @@ static int parse_object(uint8_t *data, size_t size, const char *name, bool is_ar
         s->size     = ld_rd_u64(data + off + 16);
         s->data_off = ld_rd_u64(data + off + 24);
         s->data     = NULL;
+        if (s->type > ONYO_SEC_BSS || (s->align && (s->align & (s->align - 1)))) {
+            fprintf(stderr, "onyx-ld: %s: invalid section %u type/alignment\n", name, i);
+            return -1;
+        }
         /* Validate data extents before allocating symbol/reloc tables. */
         if (s->type != ONYO_SEC_BSS &&
             (s->data_off > (uint64_t)size || s->size > (uint64_t)size - s->data_off)) {
@@ -114,7 +109,17 @@ static int parse_object(uint8_t *data, size_t size, const char *name, bool is_ar
         s->section_idx = (int32_t)ld_rd_u32(data + off + 8);
         s->value       = ld_rd_u64(data + off + 16);
         s->size        = ld_rd_u64(data + off + 24);
-        read_string(obj, name_off, s->name, sizeof(s->name));
+        if (!read_string(obj, name_off, s->name, sizeof(s->name))) {
+            fprintf(stderr, "onyx-ld: %s: invalid symbol name\n", name);
+            return -1;
+        }
+        if ((s->flags & ONYO_SYM_DEFINED) &&
+            (s->section_idx < 0 || (uint32_t)s->section_idx >= n_secs ||
+             s->value > obj->secs[s->section_idx].size ||
+             s->size > obj->secs[s->section_idx].size - s->value)) {
+            fprintf(stderr, "onyx-ld: %s: invalid symbol extent\n", name);
+            return -1;
+        }
         s->obj_idx = g_n_objs;
         off += ONYO_SYMBOL_SIZE;
     }
@@ -126,6 +131,17 @@ static int parse_object(uint8_t *data, size_t size, const char *name, bool is_ar
         r->offset      = ld_rd_u64(data + off + 8);
         r->sym_idx     = ld_rd_u32(data + off + 16);
         r->addend      = (int32_t)ld_rd_u32(data + off + 20);
+        if (r->section_idx >= n_secs || r->sym_idx >= n_syms ||
+            r->type < R_ONYO_64 || r->type > R_ONYO_BRANCH) {
+            fprintf(stderr, "onyx-ld: %s: malformed reloc %u\n", name, i);
+            return -1;
+        }
+        const sec_t *section = &obj->secs[r->section_idx];
+        if (section->type == ONYO_SEC_BSS || r->offset > section->size ||
+            ld_reloc_width(r->type) > section->size - r->offset) {
+            fprintf(stderr, "onyx-ld: %s: malformed reloc extent %u\n", name, i);
+            return -1;
+        }
         off += ONYO_RELOC_SIZE;
     }
 
@@ -134,79 +150,6 @@ static int parse_object(uint8_t *data, size_t size, const char *name, bool is_ar
         if (s->type != ONYO_SEC_BSS) s->data = data + s->data_off;
     }
 
-    g_n_objs++;
-    return 0;
-}
-
-/* ── Archive (.a) parsing ───────────────────────────────────────────── */
-
-static int parse_archive(const char *path, uint8_t *data, size_t size) {
-    if (size < 8 || memcmp(data, "!<arch>\n", 8) != 0) {
-        fprintf(stderr, "onyx-ld: %s: not a valid archive\n", path);
-        return -1;
-    }
-    size_t off = 8;
-    int n_extracted = 0;
-    while (off + 60 <= size) {
-        char name_buf[17];
-        memcpy(name_buf, (char *)data + off, 16);
-        name_buf[16] = 0;
-        for (int i = 15; i >= 0 && name_buf[i] == ' '; i--) name_buf[i] = 0;
-
-        char size_buf[11];
-        memcpy(size_buf, (char *)data + off + 48, 10);
-        size_buf[10] = 0;
-        long msize = strtol(size_buf, NULL, 10);
-        if (msize < 0 || (size_t)msize > size - off - 60) break;
-        if (strcmp(name_buf, "/") == 0 || strcmp(name_buf, "//") == 0 ||
-            strcmp(name_buf, "__.SYMDEF") == 0 || name_buf[0] == 0) {
-            off += 60 + (size_t)msize;
-            if (msize & 1) off++;
-            continue;
-        }
-        long name_skip = 0;
-        if (strncmp(name_buf, "#1/", 3) == 0) {
-            name_skip = strtol(name_buf + 3, NULL, 10);
-            if (name_skip < 0 || (size_t)name_skip > (size_t)msize) {
-                off += 60 + (size_t)msize;
-                if (msize & 1) off++;
-                continue;
-            }
-        }
-        uint8_t *member = data + off + 60 + name_skip;
-        size_t member_size = (size_t)msize - (size_t)name_skip;
-
-        /* Members that are not ONYO objects (e.g. metadata) are skipped. */
-        if (member_size >= 4 && ld_rd_u32(member) == ONYO_MAGIC) {
-            uint8_t *copy = (uint8_t *)malloc(member_size);
-            if (!copy) {
-                fprintf(stderr, "onyx-ld: %s: out of memory extracting member\n", path);
-                return -1;
-            }
-            memcpy(copy, member, member_size);
-            char member_name[300];
-            if (name_skip > 0) {
-                size_t cn = (size_t)name_skip < sizeof(member_name) - 1 ? (size_t)name_skip
-                                                                       : sizeof(member_name) - 1;
-                memcpy(member_name, data + off + 60, cn);
-                member_name[cn] = 0;
-            } else {
-                snprintf(member_name, sizeof(member_name), "%s:%s", path, name_buf);
-            }
-            if (parse_object(copy, member_size, member_name, true) != 0) free(copy);
-            else n_extracted++;
-        }
-
-        off += 60 + (size_t)msize;
-        if (msize & 1) off++;
-    }
-    if (g_ld_opts.verbose) {
-        fprintf(stderr, "onyx-ld: archive %s: extracted %d member(s)\n", path, n_extracted);
-    }
-    if (n_extracted == 0) {
-        fprintf(stderr, "onyx-ld: %s: no ONYO objects in archive\n", path);
-        return -1;
-    }
     return 0;
 }
 
@@ -234,8 +177,8 @@ int onyx_ld_parse_input(const char *path) {
         return -1;
     }
     if (size >= 8 && memcmp(data, "!<arch>\n", 8) == 0) {
-        /* parse_archive copies every member object, so the image is free. */
-        int rc = parse_archive(path, data, size);
+        /* ld_parse_archive copies selected member objects, so the image is free. */
+        int rc = ld_parse_archive(path, data, size);
         free(data);
         return rc;
     }
@@ -244,7 +187,9 @@ int onyx_ld_parse_input(const char *path) {
         free(data);
         return -1;
     }
-    int rc = parse_object(data, size, path, false);
-    if (rc != 0) free(data);
+    obj_t obj = {0};
+    int rc = ld_decode_object(&obj, data, size, path, false);
+    if (rc == 0) rc = ld_adopt_object(&obj, false);
+    if (rc != 0) { free(obj.syms); free(obj.relocs); free(data); }
     return rc;
 }

@@ -14,16 +14,16 @@ undefined symbols are rejected. `make selfhost-test` stays green.
 
 ## Current state
 
-- `onyxcc` parses every input into one shared symbol table and one set of
-  segment buffers, then `gen_finalize()` resolves addresses and patches
-  every fixup in place. Output is a `.onx` executable only.
-- `onyx-ld` already parses ONYO objects/archives, merges sections,
-  resolves global symbols and applies RISC-V relocations. It has **never
-  been fed by the compiler** (no `-c` exists), so its object-side paths
-  are untested.
+- `onyxcc -c` emits ONYO v1 objects; `onyx-ld` links them into `.onx`.
+- As of 2026-11-15, archive members are selected lazily using unresolved
+  globals and the entry symbol, with a fixed point within each archive.
+  Archive order matters; repeat earlier archives to resolve cycles.
+- GNU/BSD long names are supported. Index metadata is skipped; no index,
+  weak symbols, COMDAT, section GC or thin archives are implemented.
+- Malformed archive framing and recognized ONYO members are rejected,
+  including malformed members which would otherwise remain unselected.
 - Format definition: `include/sys/onyxo.h` (header 64 B, section 40 B,
-  symbol 32 B, reloc 24 B; string table after the tables; section data
-  last).
+  symbol 32 B, reloc 24 B; string table after the tables; section data last).
 
 ## ONYO object contract (writer = compiler, reader = onyx-ld)
 
