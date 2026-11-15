@@ -15,7 +15,7 @@ undefined symbols are rejected. `make selfhost-test` stays green.
 ## Current state
 
 - `onyxcc -c` emits ONYO v1 objects; `onyx-ld` links them into `.onx`.
-- As of 2026-11-15, archive members are selected lazily using unresolved
+- As of 2026-11-15 (`c3d2bd7`), archive members are selected lazily using unresolved
   globals and the entry symbol, with a fixed point within each archive.
   Archive order matters; repeat earlier archives to resolve cycles.
 - GNU/BSD long names are supported. Index metadata is skipped; no index,

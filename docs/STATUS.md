@@ -161,7 +161,7 @@ Implemented:
   resolved by index, undefined globals by name;
 - object-level tests for duplicate definitions and undefined symbols.
 
-Archive selection (2026-11-15): `.a` members are selected only when they
+Archive selection (2026-11-15, `c3d2bd7`): `.a` members are selected only when they
 export an unresolved name from an already loaded object or the entry symbol.
 The current archive is rescanned until no more members are needed. Earlier
 archives are not revisited automatically; repeat an archive on the command
@@ -176,6 +176,13 @@ framing and every recognized ONYO member, including unselected members;
 corrupt recognized objects are rejected rather than silently discarded.
 Non-ONYO members are ignored. Thin archives are unsupported. Regression
 coverage is in `tests/archives/`, invoked by `make check`.
+
+Verification on 2026-11-15: all 44 archive checks passed with the regular
+linker and an ASan/UBSan build; the previous linker failed 24 of them.
+The full `make check`, seven `make check-native` sanitizer suites, five
+sanitized driver checks and `make selfhost-test` passed. The full ecosystem
+fmt/Clippy and dead-code guard passed using an isolated target directory.
+These are host checks; OC2R validation is tracked separately.
 
 Remaining limitations (also in the plan): one input per `-c`; lazy linear
 archive extraction with no `__.SYMDEF` index; no weak/COMDAT symbols,
