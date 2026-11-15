@@ -4,6 +4,8 @@
 build/
 onyxcc.riscv.elf
 onyxcc.onx
+onyxcc_self.onx
 tests/*.onx
 
 .claude/
+.clangd

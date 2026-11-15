@@ -1,6 +1,8 @@
 # Compiler status and next stages
 
 This describes the current compiler, not a claim of C or C++ conformance.
+Status reviewed: 2026-11-15; host tool/harness refresh `0d7e100`, C++
+subset `ca8546d`, separate compilation `bd14e5d`.
 The supported C99-oriented subset can build the unmodified Lua 5.5.1
 interpreter and bytecode compiler against libonyxc. OnyxApps retains the
 checksum-pinned MIT-licensed upstream archive and offline build wrappers.
@@ -44,12 +46,11 @@ that the complete Lua test suite or every standard-library operation passes.
 
 ## Material limitations
 
-- There is no C++ frontend. Classes, overload resolution, templates,
-  exceptions, RAII, the C++ runtime and the standard library remain work.
-- `onyxcc -c` does not yet emit relocatable objects. `onyx-ld` understands
-  the private ONYO object format and Unix archives, but its existence does
-  not provide a complete separate-compilation pipeline. Use multi-file
-  compilation to produce `.onx` directly.
+- C++ support is a subset with material gaps listed below; it does not
+  establish C++ conformance or standard-library support.
+- Separate compilation uses private ONYO objects for C and C++ inputs,
+  linked by `onyx-ld` into `.onx`. Its limits are listed below; this does
+  not establish compatibility with other toolchains' object formats.
 - Aggregate calls/returns and variadic calls use the compiler's current
   private conventions. Interoperability with independently compiled
   RISC-V toolchains is not established; ordinary register names alone do
@@ -72,11 +73,21 @@ that the complete Lua test suite or every standard-library operation passes.
 
 `make check` builds host tools, checks frontend fixtures with
 `-fsyntax-only`, compiles and executes runtime fixtures with `onx-run`, and
-checks multi-file driver bounds. Runtime tests verify both exit status and
-expected output. `make check-native` runs the native sanitizer harnesses.
+checks multi-file driver bounds, C++ fixtures and the separate-compilation
+pipeline. Runtime tests verify both exit status and expected output.
+`make check-native` runs the native sanitizer harnesses.
 `python3 tests/driver/run.py --sanitize` adds an instrumented host compiler
 for driver bounds checks. These checks require a host C compiler, Python 3,
 Bash, coreutils and binutils; sanitizer harnesses require ASan/UBSan support.
+
+Verification on 2026-11-15: `make check` passed 66 frontend, 43 runtime,
+5 driver, 15 C++ and 4 separate-compilation checks; `make check-native`
+passed all seven sanitizer suites. The unchanged
+`tests/run/43_octal_escapes.c` failed with the stale tracked `onyxcc` and
+passed after `make -B onyxcc`; the lexer source already contained the fix.
+The rebuilt `onyxcc` preserves that fix in the shipped host tool. Native
+arena and type-metadata harnesses now reference `src/c/` after the source
+reorganization. These runs do not establish target-system behavior.
 
 The compiler and `.onx` emulator are developed together, so agreement
 between them is not sufficient evidence of ISA or ABI correctness. Compare
@@ -124,8 +135,10 @@ into a `.onx`. The contract and mapping tables are in
 `docs/plan-separate-compilation.md`. End-to-end coverage lives in
 `tests/separate/` and runs as part of `make check` via
 `scripts/sepcomp-runner.sh`: it compiles **all 17 libonyxc sources** and
-the app fixtures into separate objects, links them, runs the result and
-also asserts that duplicate globals and undefined symbols are rejected.
+the C app fixtures and a C++ fixture into separate objects, links and runs
+them, and asserts that duplicate globals and undefined symbols are rejected.
+The C++ object fixture covers a non-polymorphic class and virtual dispatch
+through a base pointer; it does not validate every C++ feature through `-c`.
 
 Implemented:
 
@@ -179,9 +192,9 @@ libonyxc discovery and `-c` compilation in `src/c/driver/`
 - References are represented as flagged pointers (`type_t::is_ref`);
   reference return types and references to temporaries are not supported.
 - Temporary objects from functional casts are not destroyed automatically.
-- The C++ frontend shares the single-pass C backend: no optimizing IR, no
-  separate-compilation objects, and diagnostics follow the C parser's
-  error-recovery model.
+- The C++ frontend shares the single-pass C backend: no optimizing IR;
+  diagnostics follow the C parser's error-recovery model. C++ ONYO object
+  emission is supported, with the validation boundaries described above.
 
 ## Source organization
 
