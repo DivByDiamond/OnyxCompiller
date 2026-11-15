@@ -207,7 +207,15 @@ libonyxc discovery and `-c` compilation in `src/c/driver/`
 
 ## Source organization
 
-Constant operands and arithmetic live under `src/front/constant/`; libc
+Cleanup on 2026-11-15 (`773a8b5`): removed the disconnected
+Rust backend scaffolds `src/back/llvm.rs` and `src/back/codegen.rs`, unused
+private C helpers and variables, and unused-function/variable suppressions
+from compiler and libonyxc build flags. Public ABI exports are preserved.
+The raw `_onyx_exit` declaration now exposes its existing nonreturning
+contract to GCC/Clang, eliminating standalone libc `exit`/`abort` warnings
+without changing syscall termination or its fallback loop.
+
+Constant operands and arithmetic live under `src/c/constant/`; libc
 responsibilities use directories such as `memory`, `format`, `convert`,
 `locale` and `process`. Prefer focused C modules with at most 250 lines and
 four source files per folder. Existing large parser/backend files still
@@ -217,12 +225,10 @@ layout and license rather than mechanically rewriting external projects.
 
 C++ frontend layout:
 
-- `src/cpp/front/` — `parse_class.c` (class bodies, layout, vtables),
-  `parse_method.c` (member declarations/definitions, mangling calls),
-  `parse_call.c` (method markers, hidden `this`, `new`/`delete`, refs),
-  `parse_ns.c` (flattened namespaces), `parse_stmt.c` (exceptions),
-  `parse_tmpl.c` (function templates), `hooks.c` (RAII registry, ctor
-  prologue, remaining hooks).
+- `src/cpp/front/decl/class/` — class declarations, layout and vtables;
+  `decl/` — namespaces and methods; `decl/tmpl/` — template instantiation.
+- `src/cpp/front/expr/` — primary/member expressions, allocation and ctors.
+- `src/cpp/front/stmt/` — exception handlers; `front/hooks.c` — RAII/ctor hooks.
 - `src/cpp/tables/` — `mangle.c`, `method_table.c`, `class_table.c`
   (records, access control).
 - `include/cpp/` — `cpp.h` (gen.c/parse.c seam), `cpp_front.h`
