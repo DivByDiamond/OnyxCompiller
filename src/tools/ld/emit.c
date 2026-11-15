@@ -11,15 +11,6 @@
 
 #include "ld_internal.h"
 
-#define ONX_V1_MAGIC        0x31584E4F   /* "ONX1" LE */
-#define ONX_V1_VERSION_1    1
-#define ONX_V1_HEADER_SIZE  344
-#define ONX_V1_SEG_SIZE     40
-#define ONX_V1_FIXED_HDR    24
-#define ONX_VMM_R           0x1
-#define ONX_VMM_W           0x2
-#define ONX_VMM_X           0x4
-
 typedef struct {
     uint64_t vaddr, filesz, memsz;
     uint32_t offset, flags, align, reserved;
@@ -58,11 +49,11 @@ int onyx_ld_emit_onx(const char *path) {
 
     uint8_t hdr[ONX_V1_HEADER_SIZE];
     memset(hdr, 0, sizeof(hdr));
-    ld_wr_u32(hdr + 0, ONX_V1_MAGIC);
-    ld_wr_u32(hdr + 4, ONX_V1_VERSION_1);
+    ld_wr_u32(hdr + 0, ONX_MAGIC);
+    ld_wr_u32(hdr + 4, ONX_VERSION_1);
     ld_wr_u64(hdr + 8, entry);
     ld_wr_u32(hdr + 16, (uint32_t)nsegs);
-    ld_wr_u32(hdr + 20, g_ld_opts.ring1 ? ONYX_LD_FLAG_RING1 : 0);
+    ld_wr_u32(hdr + 20, g_ld_opts.ring1 ? ONX_FLAGS_RING1 : 0);
     for (int i = 0; i < nsegs; i++) {
         uint8_t *p = hdr + ONX_V1_FIXED_HDR + i * ONX_V1_SEG_SIZE;
         ld_wr_u64(p + 0, segs[i].vaddr);

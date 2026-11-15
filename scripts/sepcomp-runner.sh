@@ -86,6 +86,28 @@ compile_obj() {
     return 0
 }
 
+# Check the kernel wire contract independently of onx-run, which does not
+# enforce segment permissions. These fixtures contain all four segments.
+check_onx_header() {
+    python3 - "$1" "${2:-0}" <<'PYTHON'
+import struct
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = path.read_bytes()
+magic, version, entry, count, flags = struct.unpack_from("<IIQII", data)
+if (magic, version, count, flags) != (0x31584E4F, 1, 4, int(sys.argv[2])):
+    sys.exit(f"{path}: invalid ONX v1 header or ring flags {flags:#x}")
+# ONX uses RISC-V PTE R/W/X bits (2/4/8), not ONYO section bits (1/2/4).
+expected = [0xA, 0x2, 0x6, 0x6]  # text RX, rodata R, data RW, bss RW
+actual = [struct.unpack_from("<I", data, 24 + i * 40 + 28)[0]
+          for i in range(count)]
+if actual != expected:
+    sys.exit(f"{path}: segment flags {actual}, expected {expected}")
+PYTHON
+}
+
 # run_program <name> <expect-src> <out.onx> <objects...>
 run_program() {
     local name="$1" expect_src="$2" out="$3"
@@ -93,6 +115,10 @@ run_program() {
     if ! $LD -o "$out" -e _start "$@" >"$TMP/$name.ld.log" 2>&1; then
         fail_case "$name" "link"
         sed -n '1,5p' "$TMP/$name.ld.log"
+        return
+    fi
+    if ! check_onx_header "$out"; then
+        fail_case "$name" "ONX header contract"
         return
     fi
     local actual rc expected
@@ -139,6 +165,13 @@ else
         "${lib_objs[@]}" "$TMP/c/main.o" "$TMP/c/lib_math.o"
     run_program "cpp-objects-link-run" "$FIX/cpp_objects.cpp" "$TMP/prog_cpp.onx" \
         "${lib_objs[@]}" "$TMP/cpp/cpp_objects.o"
+    if $LD --ring1 -o "$TMP/prog_ring1.onx" -e _start \
+        "${lib_objs[@]}" "$TMP/cpp/cpp_objects.o" >"$TMP/ring1.ld.log" 2>&1 &&
+        check_onx_header "$TMP/prog_ring1.onx" 2; then
+        pass_case "ring1-header-contract"
+    else
+        fail_case "ring1-header-contract"
+    fi
 fi
 
 # ── Negative case: duplicate global definition must be rejected ─────────

@@ -90,7 +90,7 @@ all: $(ONYXCC) $(ONYXLD)
 # Compiled natively on Linux/x86_64 for use as a host-side tool.
 ONYXLD_SRCS = src/tools/onyx-ld.c src/tools/ld/parse.c src/tools/ld/link.c src/tools/ld/emit.c
 
-$(ONYXLD): $(ONYXLD_SRCS) include/sys/onyxo.h src/tools/onyx-ld.h src/tools/ld/ld_internal.h
+$(ONYXLD): $(ONYXLD_SRCS) include/core/onx.h include/sys/onyxo.h src/tools/onyx-ld.h src/tools/ld/ld_internal.h
 	$(CC) $(CFLAGS) -Iinclude -Iinclude/sys -o $@ $(ONYXLD_SRCS) $(LDFLAGS)
 	@ls -la $@
 	@echo "--- onyx-ld ready"
