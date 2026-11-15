@@ -52,7 +52,7 @@ member. Members pulled for other exports can supply overriding strong
 definitions. An entry definition is always required, even when an undefined
 entry symbol is marked weak. A defined weak entry is valid.
 
-`onyxcc -c` accepts GNU weak attributes on file-scope functions and data,
+As of 2026-11-15 (`f9d10cb`), `onyxcc -c` accepts GNU weak attributes on file-scope functions and data,
 keeps weak binding across redeclarations and emits v2 only when an emitted
 symbol is weak. Ordinary objects and unreferenced extern declarations keep
 v1. Static/typedef weak declarations are rejected. Direct executable builds

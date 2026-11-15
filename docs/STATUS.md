@@ -177,7 +177,7 @@ Weak binding (2026-11-15, `4845c52`): the linker accepts ONYO v2 with strong-ove
 resolution, deterministic first-weak selection and zero-valued unresolved
 weak references. Weak references do not demand archive members; entry
 symbols still require definitions. `onyxcc -c` emits weak functions/data
-from GNU weak attributes as v2; ordinary objects remain v1. The contract
+from GNU weak attributes as v2 (`f9d10cb`); ordinary objects remain v1. The contract
 are documented in `docs/plan-separate-compilation.md`; tests live in
 `tests/weak/` and run via `make check`.
 Validation on 2026-11-15: 48 source, 36 weak-format and 44 archive checks
