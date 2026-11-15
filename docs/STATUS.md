@@ -81,7 +81,7 @@ for driver bounds checks. These checks require a host C compiler, Python 3,
 Bash, coreutils and binutils; sanitizer harnesses require ASan/UBSan support.
 
 Verification on 2026-11-15: `make check` passed 66 frontend, 43 runtime,
-5 driver, 15 C++ and 4 separate-compilation checks; `make check-native`
+5 driver, 15 C++ and 5 separate-compilation checks; `make check-native`
 passed all seven sanitizer suites. The unchanged
 `tests/run/43_octal_escapes.c` failed with the stale tracked `onyxcc` and
 passed after `make -B onyxcc`; the lexer source already contained the fix.
@@ -137,6 +137,15 @@ into a `.onx`. The contract and mapping tables are in
 `scripts/sepcomp-runner.sh`: it compiles **all 17 libonyxc sources** and
 the C app fixtures and a C++ fixture into separate objects, links and runs
 them, and asserts that duplicate globals and undefined symbols are rejected.
+As fixed in `e7a57ec` and verified on 2026-11-15, the linker uses `include/core/onx.h` for the
+ONX wire contract: R/W/X permissions are RISC-V PTE bits `2/4/8`, giving
+text/rodata/data/bss flags `10/2/6/6`; `--ring1` sets header flag `0x2`.
+The runner checks these fields directly for both linked fixtures and a
+ring1 image, independently of emulator execution. This catches the former
+linker constants `1/2/4` and ring1 flag `0x1`, which `onx-run` did not reject.
+The linked C++ fixture also printed `3 2` in QEMU with kernel `14937bc`;
+the kernel now rejects invalid permissions before mapping. This is a
+coordinated wire-contract fix, not a syscall ABI change.
 The C++ object fixture covers a non-polymorphic class and virtual dispatch
 through a base pointer; it does not validate every C++ feature through `-c`.
 
