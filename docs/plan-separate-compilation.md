@@ -29,7 +29,7 @@ undefined symbols are rejected. `make selfhost-test` stays green.
 
 One object per translation unit. No libonyxc auto-link in `-c` mode.
 
-### Versions and weak binding (2026-11-15)
+### Versions and weak binding (2026-11-15, `4845c52`)
 
 ONYO v1 remains the compiler's output. The linker also accepts v2, which
 keeps all table layouts and relocation numbers unchanged and adds symbol

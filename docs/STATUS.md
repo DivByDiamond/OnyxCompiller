@@ -173,7 +173,7 @@ Archive validation on 2026-11-15: 44 regular/ASan/UBSan checks passed;
 the old linker failed 24. Full host suites, selfhost, fmt/Clippy and the
 dead-code guard also passed. These do not establish OC2R behavior.
 
-Weak binding (2026-11-15): the linker accepts ONYO v2 with strong-over-weak
+Weak binding (2026-11-15, `4845c52`): the linker accepts ONYO v2 with strong-over-weak
 resolution, deterministic first-weak selection and zero-valued unresolved
 weak references. Weak references do not demand archive members; entry
 symbols still require definitions. `onyxcc` still emits v1 and does not
