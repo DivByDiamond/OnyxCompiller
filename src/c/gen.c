@@ -33,6 +33,7 @@
 #include "front/parser_priv.h"
 #include "front/parse.h"
 #include "front/decl.h"
+#include "front/designator.h"
 
 gen_func_t g_func;
 
@@ -117,6 +118,7 @@ static void emit_function_epilogue(void) {
 /* Forward declaration for brace initializer parsing. */
 static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type);
 static uint64_t gen_emit_global_init_elided(lexer_t *lx, type_t *type);
+static uint64_t gen_count_brace_elements(lexer_t *lx, type_t *type);
 static void gen_emit_local_braced_init(lexer_t *lx, type_t *type,
                                        int64_t fp_off, int sym_idx);
 static void gen_emit_global_init_scalar(lexer_t *lx, type_t *type);
@@ -1471,7 +1473,14 @@ static val_t parse_primary(lexer_t *lx) {
                 parse_expect(T_RPAREN, "expected ')' after cast");
                 /* Compound literal: (type){ init_list } */
                 if (lx->cur.kind == T_LBRACE) {
-                    /* Allocate stack space for the type. */
+                    /* `(int[]){...}` takes its length from the list. */
+                    if (t->kind == TY_ARRAY && (t->length == 0 || t->is_incomplete)) {
+                        uint64_t count = gen_count_brace_elements(lx, t);
+                        t->length = count;
+                        t->is_incomplete = false;
+                        t->size = count * type_sizeof(t->base);
+                        t->is_complete = true;
+                    }
                     uint64_t sz = type_sizeof(t);
                     uint64_t al = type_alignof(t);
                     g_func.cur_offset += sz;
@@ -1479,44 +1488,12 @@ static val_t parse_primary(lexer_t *lx) {
                     int64_t off = -(int64_t)g_func.cur_offset;
                     if (g_func.cur_offset > g_func.frame_size)
                         g_func.frame_size = g_func.cur_offset;
-                    /* Compute address of stack slot. */
-                    rv_addi_imm(RV_T0, RV_FP, (int)off);
-                    /* Parse initializer list and emit stores. */
-                    lex_next(lx); /* consume '{' */
-                    int field_idx = 0;
-                    while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF) {
-                        val_t elem = parse_assign(lx);
-                        /* Store element at appropriate offset within the struct/array. */
-                        uint64_t elem_off = 0;
-                        if (t->kind == TY_STRUCT || t->kind == TY_UNION) {
-                            /* Walk struct fields to find offset. */
-                            type_t *st = t;
-                            if (st->nfields > 0 && field_idx < st->nfields) {
-                                elem_off = st->fields[field_idx].offset;
-                            }
-                        } else if (t->kind == TY_ARRAY) {
-                            uint64_t elem_sz = type_sizeof(t->base);
-                            elem_off = field_idx * elem_sz;
-                        }
-                        /* Store the element. */
-                        load_value(&elem, RV_T1);
-                        rv_addi_imm(RV_T2, RV_T0, (int64_t)elem_off);
-                        uint64_t elem_sz = type_sizeof(elem.type);
-                        switch (elem_sz) {
-                            case 1: rv_sb(RV_T1, RV_T2, 0); break;
-                            case 2: rv_sh(RV_T1, RV_T2, 0); break;
-                            case 4: rv_sw(RV_T1, RV_T2, 0); break;
-                            default: rv_sd(RV_T1, RV_T2, 0); break;
-                        }
-                        field_idx++;
-                        if (!accept(T_COMMA)) break;
-                    }
-                    parse_expect(T_RBRACE, "expected '}' after compound literal");
+                    gen_emit_local_braced_init(lx, t, off, -1);
                     v.kind = VAL_LVAL;
-                    v.reg = RV_T0;
-                    v.offset = 0;
+                    v.reg = RV_FP;
+                    v.offset = off;
                     v.type = t;
-                    return v;
+                    return parse_postfix(lx, v);
                 }
                 val_t e = parse_unary(lx);
                 convert_scalar(&e, t);
@@ -3514,6 +3491,38 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
     return e;
 }
 
+/* Global data is streamed to g_data; a designator can target an earlier or
+ * later offset, so each slot is emitted at the end and then moved to place. */
+typedef struct { uint32_t end; int n_sym; int n_rodata; } global_mark_t;
+
+static void gen_global_place(global_mark_t mark, uint64_t target) {
+    size_t n = g_data.size - mark.end;
+    if (n == 0 || target == mark.end) return;
+    uint8_t *bytes = malloc(n);
+    if (!bytes) cc_fatal("out of memory");
+    memcpy(bytes, g_data.data + mark.end, n);
+    g_data.size = mark.end;
+    while (g_data.size < target + n) cc_buf_push8(&g_data, 0);
+    memcpy(g_data.data + target, bytes, n);
+    free(bytes);
+    int64_t delta = (int64_t)target - (int64_t)mark.end;
+    for (int i = mark.n_sym; i < g_n_data_sym_fixups; i++)
+        g_data_sym_fixups[i].data_off = (uint32_t)((int64_t)g_data_sym_fixups[i].data_off + delta);
+    for (int i = mark.n_rodata; i < g_n_data_rodata_fixups; i++)
+        g_data_rodata_fixups[i].data_off = (uint32_t)((int64_t)g_data_rodata_fixups[i].data_off + delta);
+}
+
+static void gen_emit_global_init_member(lexer_t *lx, type_t *type, uint64_t target) {
+    while (g_data.size < target) cc_buf_push8(&g_data, 0);
+    global_mark_t mark = { (uint32_t)g_data.size, g_n_data_sym_fixups, g_n_data_rodata_fixups };
+    bool aggregate = type->kind == TY_ARRAY || type->kind == TY_STRUCT ||
+                     type->kind == TY_UNION;
+    if (aggregate && lx->cur.kind == T_LBRACE) gen_handle_braced_init_global(lx, type);
+    else if (aggregate) gen_emit_global_init_elided(lx, type);
+    else gen_emit_global_init_scalar(lx, type);
+    gen_global_place(mark, target);
+}
+
 /* ---- Brace-elided initializer processing (global) --------------------- */
 /* Process a sub-aggregate initializer whose braces are elided.
  * Unlike gen_handle_braced_init_global(), this function does NOT consume
@@ -3526,7 +3535,6 @@ static uint64_t gen_emit_global_init_elided(lexer_t *lx, type_t *type) {
     if (type->kind == TY_ARRAY) {
         type_t *elem = type->base;
         uint64_t elem_sz = type_sizeof(elem);
-        uint64_t max = type->length > 0 ? type->length : UINT64_MAX;
         bool first = true;
 
         /* String literal initializes the whole char array at once,
@@ -3537,24 +3545,10 @@ static uint64_t gen_emit_global_init_elided(lexer_t *lx, type_t *type) {
             return (uint64_t)(g_data.size - start_off);
         }
 
-        for (uint64_t i = 0; i < max; i++) {
-            if (lx->cur.kind == T_RBRACE || lx->cur.kind == T_EOF) break;
-            if (!first) {
-                if (lx->cur.kind != T_COMMA) break;
-                lex_next(lx);
-                if (lx->cur.kind == T_RBRACE) break;
-            }
-            first = false;
-
-            if ((elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) &&
-                lx->cur.kind == T_LBRACE) {
-                gen_handle_braced_init_global(lx, elem);
-            } else if (elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) {
-                gen_emit_global_init_elided(lx, elem);
-            } else {
-                gen_emit_global_init_scalar(lx, elem);
-            }
-        }
+        init_slot_t slot;
+        uint64_t cursor = 0;
+        while (init_next_slot(lx, type, &first, &cursor, &slot))
+            gen_emit_global_init_member(lx, slot.type, start_off + slot.offset);
 
         /* Pad remaining elements with zeros if array size is fixed. */
         if (type->length > 0 && !type->is_incomplete) {
@@ -3566,31 +3560,10 @@ static uint64_t gen_emit_global_init_elided(lexer_t *lx, type_t *type) {
 
     } else if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
         bool first = true;
-        for (int i = 0; i < type->nfields; i++) {
-            struct_field_t *f = &type->fields[i];
-            if (f->is_anon) continue;
-
-            if (!first) {
-                if (lx->cur.kind != T_COMMA) break;
-                lex_next(lx);
-                if (lx->cur.kind == T_RBRACE) break;
-            }
-            first = false;
-
-            /* Emit padding to reach field offset. */
-            while ((uint64_t)(g_data.size - start_off) < f->offset) {
-                cc_buf_push8(&g_data, 0);
-            }
-
-            if ((f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) &&
-                lx->cur.kind == T_LBRACE) {
-                gen_handle_braced_init_global(lx, f->type);
-            } else if (f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) {
-                gen_emit_global_init_elided(lx, f->type);
-            } else {
-                gen_emit_global_init_scalar(lx, f->type);
-            }
-        }
+        init_slot_t slot;
+        uint64_t cursor = 0;
+        while (init_next_slot(lx, type, &first, &cursor, &slot))
+            gen_emit_global_init_member(lx, slot.type, start_off + slot.offset);
 
         /* Fill to struct/union total size. */
         uint64_t total = type_sizeof(type);
@@ -3636,27 +3609,9 @@ static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type) {
             return written;
         }
         uint64_t elem_sz = type_sizeof(elem);
-        uint64_t max = type->length > 0 ? type->length : UINT64_MAX;
-
-        while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF && elem_idx < max) {
-            if (!first) {
-                if (!accept(T_COMMA)) break;
-                if (lx->cur.kind == T_RBRACE) break;
-            }
-            first = false;
-
-            /* If element is aggregate and next token is '{', recurse */
-            if ((elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) &&
-                lx->cur.kind == T_LBRACE) {
-                gen_handle_braced_init_global(lx, elem);
-            } else if (elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) {
-                /* Brace-elided sub-aggregate initializer. */
-                gen_emit_global_init_elided(lx, elem);
-            } else {
-                gen_emit_global_init_scalar(lx, elem);
-            }
-            elem_idx++;
-        }
+        init_slot_t slot;
+        while (init_next_slot(lx, type, &first, &elem_idx, &slot))
+            gen_emit_global_init_member(lx, slot.type, start_off + slot.offset);
 
         /* Pad remaining elements with zeros if array size is fixed. */
         if (type->length > 0 && !type->is_incomplete) {
@@ -3667,30 +3622,9 @@ static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type) {
         }
 
     } else if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
-        for (int i = 0; i < type->nfields; i++) {
-            struct_field_t *f = &type->fields[i];
-            if (f->is_anon) continue; /* skip anonymous fields for now */
-
-            if (!first) {
-                if (!accept(T_COMMA)) break;
-                if (lx->cur.kind == T_RBRACE) break;
-            }
-            first = false;
-
-            /* Emit padding to reach field offset. */
-            while ((uint64_t)(g_data.size - start_off) < f->offset) {
-                cc_buf_push8(&g_data, 0);
-            }
-
-            if ((f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) &&
-                lx->cur.kind == T_LBRACE) {
-                gen_handle_braced_init_global(lx, f->type);
-            } else if (f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) {
-                gen_emit_global_init_elided(lx, f->type);
-            } else {
-                gen_emit_global_init_scalar(lx, f->type);
-            }
-        }
+        init_slot_t slot;
+        while (init_next_slot(lx, type, &first, &elem_idx, &slot))
+            gen_emit_global_init_member(lx, slot.type, start_off + slot.offset);
 
         /* Fill to struct/union total size. */
         uint64_t total = type_sizeof(type);
@@ -3721,6 +3655,7 @@ static uint64_t gen_count_brace_elements(lexer_t *lx, type_t *type) {
     bool saved_has_next = lx->has_next;
 
     uint64_t count = 0;
+    uint64_t position = 0;
     bool first = true;
 
     if (lx->cur.kind != T_LBRACE) {
@@ -3736,6 +3671,13 @@ static uint64_t gen_count_brace_elements(lexer_t *lx, type_t *type) {
         }
         first = false;
 
+        /* `[index] = value` moves the position; `.member` does not. */
+        if (lx->cur.kind == T_LBRACKET) {
+            lex_next(lx);
+            position = (uint64_t)parse_const_expr();
+            if (lx->cur.kind == T_RBRACKET) lex_next(lx);
+        }
+
         /* Skip one element, handling nested parentheses/braces/brackets.
          * String and char literals are single tokens, so no special care needed. */
         int depth = 0;
@@ -3750,7 +3692,7 @@ static uint64_t gen_count_brace_elements(lexer_t *lx, type_t *type) {
             }
             lex_next(lx);
         }
-        count++;
+        if (++position > count) count = position;
     }
 
     lx->pos = saved_pos;
@@ -3771,6 +3713,10 @@ static void gen_emit_local_braced_init(lexer_t *lx, type_t *type,
 static void gen_emit_local_init_recurse(lexer_t *lx, type_t *type,
                                         int64_t fp_off, int64_t field_off);
 
+static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
+                                       int64_t fp_off, int64_t field_off);
+static void gen_emit_local_init_member(lexer_t *lx, type_t *type,
+                                       int64_t fp_off, int64_t off);
 static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
                                        int64_t fp_off, int64_t field_off) {
     if (lx->cur.kind == T_STRING) {
@@ -3818,6 +3764,23 @@ static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
     }
 }
 
+/* One initializer slot: braced aggregate, brace-elided aggregate or scalar. */
+static void gen_emit_local_init_member(lexer_t *lx, type_t *type,
+                                       int64_t fp_off, int64_t off) {
+    bool aggregate = type->kind == TY_ARRAY || type->kind == TY_STRUCT ||
+                     type->kind == TY_UNION;
+    if (aggregate && lx->cur.kind == T_LBRACE) {
+        lex_next(lx);
+        gen_emit_local_init_recurse(lx, type, fp_off, off);
+        if (lx->cur.kind == T_RBRACE) lex_next(lx);
+        else parse_error("expected '}'");
+    } else if (aggregate) {
+        gen_emit_local_init_recurse(lx, type, fp_off, off);
+    } else {
+        gen_emit_local_init_scalar(lx, type, fp_off, off);
+    }
+}
+
 static void gen_emit_local_init_recurse(lexer_t *lx, type_t *type,
                                         int64_t fp_off, int64_t field_off) {
     if (type->kind == TY_ARRAY) {
@@ -3834,59 +3797,17 @@ static void gen_emit_local_init_recurse(lexer_t *lx, type_t *type,
             free(text);
             return;
         }
-        uint64_t elem_sz = type_sizeof(elem);
-        uint64_t max = type->length > 0 ? type->length : UINT64_MAX;
-        uint64_t count = 0;
-        bool first_elem = true;
-
-        while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF && count < max) {
-            if (!first_elem) {
-                if (lx->cur.kind != T_COMMA) break;
-                lex_next(lx);
-                if (lx->cur.kind == T_RBRACE) break;
-            }
-            first_elem = false;
-
-            if ((elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) &&
-                lx->cur.kind == T_LBRACE) {
-                lex_next(lx);
-                gen_emit_local_init_recurse(lx, elem, fp_off, field_off + (int64_t)(count * elem_sz));
-                if (lx->cur.kind == T_RBRACE) lex_next(lx);
-                else parse_error("expected '}'");
-            } else if (elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) {
-                gen_emit_local_init_recurse(lx, elem, fp_off, field_off + (int64_t)(count * elem_sz));
-            } else {
-                gen_emit_local_init_scalar(lx, elem, fp_off, field_off + (int64_t)(count * elem_sz));
-            }
-            count++;
-        }
+        init_slot_t slot;
+        uint64_t cursor = 0;
+        bool first = true;
+        while (init_next_slot(lx, type, &first, &cursor, &slot))
+            gen_emit_local_init_member(lx, slot.type, fp_off, field_off + (int64_t)slot.offset);
     } else if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
-        bool first_field = true;
-        for (int i = 0; i < type->nfields; i++) {
-            struct_field_t *f = &type->fields[i];
-            if (f->is_anon) continue;
-            if (!first_field) {
-                if (lx->cur.kind != T_COMMA) break;
-                lex_next(lx);
-                if (lx->cur.kind == T_RBRACE) break;
-            }
-            first_field = false;
-
-            if ((f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) &&
-                lx->cur.kind == T_LBRACE) {
-                lex_next(lx);
-                gen_emit_local_init_recurse(lx, f->type, fp_off,
-                                           field_off + (int64_t)f->offset);
-                if (lx->cur.kind == T_RBRACE) lex_next(lx);
-                else parse_error("expected '}'");
-            } else if (f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) {
-                gen_emit_local_init_recurse(lx, f->type, fp_off,
-                                           field_off + (int64_t)f->offset);
-            } else {
-                gen_emit_local_init_scalar(lx, f->type, fp_off,
-                                          field_off + (int64_t)f->offset);
-            }
-        }
+        init_slot_t slot;
+        uint64_t cursor = 0;
+        bool first = true;
+        while (init_next_slot(lx, type, &first, &cursor, &slot))
+            gen_emit_local_init_member(lx, slot.type, fp_off, field_off + (int64_t)slot.offset);
     } else {
         /* Scalar in braces: int x = {42}; */
         gen_emit_local_init_scalar(lx, type, fp_off, field_off);
