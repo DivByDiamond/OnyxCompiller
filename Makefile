@@ -20,6 +20,13 @@
 CC      ?= gcc
 CXX     ?= g++
 CFLAGS  ?= -std=c99 -Wall -Wno-stringop-truncation -O2 -g
+# Committed host binaries must be byte-identical no matter which path invokes
+# make (direct worktree or OnyxOS/.vent/repos symlink); only DW_AT_comp_dir
+# otherwise differed and dirtied the tree on every locked build.
+CFLAGS  += -ffile-prefix-map=$(CURDIR)=. -fdebug-prefix-map=$(CURDIR)=.
+# gcc records the logical $PWD (a symlinked checkout) instead of make's
+# physical CURDIR; map both so either invocation yields the same debug info.
+CFLAGS  += -ffile-prefix-map=$(PWD)=. -fdebug-prefix-map=$(PWD)=.
 CXXFLAGS ?= -std=c++17 -Wall -Wno-attributes -O2 -g -Iinclude -Iinclude/cpp -Iinclude/core -Iinclude/front -Iinclude/back -Iinclude/arch -Iinclude/sys
 LDFLAGS ?=
 
