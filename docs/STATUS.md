@@ -237,6 +237,11 @@ Static locals (`c26fa17`) use private backing symbols and scoped aliases;
 compound literals share one slot iterator (`src/c/init/`), including GNU
 ranges and `f:`; data address fixups carry an addend; `tests/init/run.py`.
 
+The tracked `onyxcc`/`onyx-ld` binaries reproduce byte-for-byte from source
+(`6fc1947`): the Makefile maps both `$(CURDIR)` and `$(PWD)` to `.` for debug
+info, so building through the `OnyxOS/.vent/repos` symlink or directly yields
+identical files. A locked build therefore no longer dirties the checkout.
+
 C++ frontend layout:
 
 - `src/cpp/front/decl/class/` — class declarations, layout and vtables;
