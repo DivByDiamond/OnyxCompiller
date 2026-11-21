@@ -9,3 +9,6 @@ tests/*.onx
 
 .claude/
 .clangd
+/onyxcc
+/onyx-ld
+/tools/onx-run
