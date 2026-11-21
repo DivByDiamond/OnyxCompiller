@@ -11,7 +11,11 @@
 #   make selfhost        # full onyxcc self-build → onyxcc_self.onx (experimental)
 #   make check           # frontend, runtime and multi-file driver checks
 #   make check-native    # native ASan/UBSan allocator/libc harnesses
-#   make test            # compile and dump hello.onx header
+#   make build           # alias for all (unified ecosystem entry point)
+#   make test            # alias for check, the full acceptance suite;
+#                        # heavier than selfhost-test but it is the
+#                        # canonical test entry this repo documents
+#   make hello-dump      # compile and dump hello.onx header
 #   make clean
 #
 # Host toolchain: any C compiler (gcc/clang) on Linux.
@@ -92,9 +96,15 @@ RISCV_FLAGS  = --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d -mcmodel=m
 
 SELFHOST_FLAGS = -DCC_FREESTANDING -N -I include -I include/core -I include/front -I include/back -I include/arch -I include/sys
 
-.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld check check-native rust-scaffold
+.PHONY: all build clean test hello-dump libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld check check-native rust-scaffold
 
 all: $(ONYXCC) $(ONYXLD)
+
+# Unified ecosystem entry points (make build / make test in every repo).
+# test delegates to check: the full acceptance suite, the command this
+# repo documents as its test entry. selfhost-test alone covers less.
+build: all
+test: check
 
 # ── onyx-ld — OnyxOS linker ──────────────────────────────────────────
 # Reads .o object files (and .a archives) and produces a .onx binary.
@@ -146,7 +156,7 @@ hello: $(ONYXCC)
 	./$(ONYXCC) -v -I libonyxc/include/core -I libonyxc/include/io -I libonyxc/include/ctype -o tests/hello_full.onx tests/hello_full.c
 
 # Dump .onx header for inspection.
-test: hello
+hello-dump: hello
 	@echo "--- hello_full.onx header ---"
 	@od -A x -t x1z -v -N 64 tests/hello_full.onx
 	@echo "--- file size ---"
@@ -207,4 +217,4 @@ clean-rust:
 rust-scaffold:
 	@test -f src/rust/target.json && echo "=== Rust target scaffold present (not built) ==="
 
-.PHONY: all clean test libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld check check-native rust-scaffold
+.PHONY: all build clean test hello-dump libonyxc hello onyxcc-riscv onyxcc-onx all-targets selfhost-test selfhost test-runner onyx-ld check check-native rust-scaffold
