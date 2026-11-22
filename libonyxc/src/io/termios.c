@@ -3,7 +3,7 @@
  *
  * Thin wrapper over the TCGETS/TCSETS ioctls. The kernel stores a
  * per-process terminal state (ECHO/ICANON/VMIN/VTIME); these helpers
- * read/modify/write it so full-screen programs (oed, osysmon) can switch
+ * read/modify/write it so full-screen programs (vim, otop, obrowse, ...) can switch
  * to raw mode and back.
  */
 #include "onyxc.h"
